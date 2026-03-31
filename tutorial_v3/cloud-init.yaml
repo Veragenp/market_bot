@@ -1,0 +1,116 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - python3
+  - python3-pip
+  - git
+  - rsyslog
+  - logrotate
+  - cron
+
+write_files:
+  - path: /etc/systemd/journald.conf.d/limits.conf
+    permissions: "0644"
+    content: |
+      [Journal]
+      SystemMaxUse=200M
+      SystemKeepFree=500M
+      MaxRetentionSec=7day
+
+  - path: /etc/logrotate.d/custom_logs
+    permissions: "0644"
+    content: |
+      /var/log/syslog /var/log/auth.log {
+          rotate 7
+          daily
+          compress
+          missingok
+          notifempty
+          size 50M
+          create 0640 root adm
+          sharedscripts
+          postrotate
+              systemctl reload rsyslog > /dev/null 2>&1 || true
+          endscript
+      }
+      /var/log/*.log {
+          weekly
+          rotate 4
+          compress
+          missingok
+          notifempty
+      }
+
+  - path: /etc/systemd/system/trading-bot.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Trading Bot Service
+      After=network.target
+
+      [Service]
+      User=root
+      WorkingDirectory=/root/tutorial_v3
+      ExecStart=/usr/bin/python3 /root/tutorial_v3/src/main.py
+      Restart=always
+      RestartSec=5
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /usr/local/bin/cleanup.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      echo "Starting system cleanup..."
+
+      # Очистка системных логов через journalctl
+      journalctl --rotate
+      journalctl --vacuum-time=7d
+      journalctl --vacuum-size=200M
+
+      # Очистка APT кэша и ненужных пакетов
+      apt-get autoremove -y
+      apt-get clean
+
+      # Очистка snap
+      snap set system refresh.retain=2
+      snap remove --purge $(snap list --all | awk '/disabled/{print $1, $2}' | xargs)
+
+      # Очистка /tmp
+      rm -rf /tmp/*
+
+      # Очистка кэша pip
+      rm -rf /root/.cache/pip
+
+      # Очистка старых логов проекта (старше 3 дней)
+      find /root/tutorial_v3/Logs/ -type f -name "*.log*" -mtime +3 -exec rm {} \;
+
+      # Удаление старых сжатых логов
+      find /var/log -type f -name "*.gz" -exec rm {} \;
+      find /var/log -type f -name "*.1" -exec rm {} \;
+
+      echo "System cleanup completed!"
+
+  - path: /etc/cron.d/system-cleanup
+    permissions: "0644"
+    content: |
+      # Ежедневная очистка в 3:00
+      0 3 * * * root /usr/local/bin/cleanup.sh
+      # Принудительная ротация логов раз в неделю
+      0 0 * * 0 root /usr/sbin/logrotate -f /etc/logrotate.conf
+
+runcmd:
+  - systemctl daemon-reexec
+  - systemctl restart systemd-journald
+  - systemctl restart rsyslog
+  - systemctl daemon-reload
+  - systemctl enable trading-bot.service
+  - systemctl enable cron
+  - /usr/sbin/logrotate -f /etc/logrotate.conf
+  - mkdir -p /root/tutorial_v3
+  - cd /root/tutorial_v3 && pip3 install -r requirements.txt || echo "Failed to install requirements, ensure code is copied manually"
+  # systemctl start trading-bot.service — старт вручную

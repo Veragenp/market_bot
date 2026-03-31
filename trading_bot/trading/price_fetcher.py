@@ -1,0 +1,1 @@
+"""Price fetcher (scaffold)."""

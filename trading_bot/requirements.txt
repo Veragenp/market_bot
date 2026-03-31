@@ -1,0 +1,4 @@
+# Dependencies for trading_bot (align with project when wiring).
+tvdatafeed>=1.2.0
+pandas>=2.0.0
+tenacity>=8.0.0

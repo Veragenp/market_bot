@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  main:
+    build: .
+    volumes:
+      - ./src:/app
+      - ./credentials.json:/app/credentials.json
+    command: python main.py
+
+  trade_manager:
+    build: .
+    volumes:
+      - ./src:/app
+      - ./credentials.json:/app/credentials.json
+    command: python trade_manager.py
+
+  trading_engine:
+    build: .
+    volumes:
+      - ./src:/app
+      - ./credentials.json:/app/credentials.json
+    command: python trading_engine.py

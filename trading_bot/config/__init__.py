@@ -1,0 +1,4 @@
+"""Публичный конфиг-пакет."""
+
+from trading_bot.config.settings import *  # noqa: F401,F403
+from trading_bot.config.symbols import *  # noqa: F401,F403

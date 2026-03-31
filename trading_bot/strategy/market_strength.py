@@ -1,0 +1,1 @@
+"""Market strength estimate (scaffold)."""
