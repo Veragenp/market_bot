@@ -178,7 +178,7 @@ def find_pro_levels(
 
 def get_adaptive_params(df: pd.DataFrame) -> dict:
     """
-    Адаптивные параметры под месячную 1m-структуру конкретного инструмента.
+    Универсальная адаптация параметров под волатильность и структуру объема монеты.
     """
     work = df.copy()
     required = {"close", "high", "low", "volume"}
@@ -190,33 +190,35 @@ def get_adaptive_params(df: pd.DataFrame) -> dict:
         raise ValueError("Пустой DataFrame после очистки")
 
     current_price = float(work["close"].iloc[-1])
-    hourly_hi = work["high"].rolling(60, min_periods=1).max()
-    hourly_lo = work["low"].rolling(60, min_periods=1).min()
-    denom = work["close"].replace(0, np.nan).abs()
-    hourly_ranges = ((hourly_hi - hourly_lo) / denom).replace([np.inf, -np.inf], np.nan)
-    avg_hourly_volatility = float(hourly_ranges.mean(skipna=True))
-    if not np.isfinite(avg_hourly_volatility):
-        avg_hourly_volatility = 0.003
+    tick_size = max(current_price * 0.0005, 1e-8)
 
-    vol_mean = float(work["volume"].mean())
-    vol_std = float(work["volume"].std())
-    volume_cv = vol_std / vol_mean if vol_mean > 1e-12 else np.inf
+    work["price_bin"] = (work["close"] / tick_size).round() * tick_size
+    profile_vol = work.groupby("price_bin")["volume"].sum()
+    mean_v = float(profile_vol.mean()) if not profile_vol.empty else 0.0
+    std_v = float(profile_vol.std()) if not profile_vol.empty else 0.0
 
-    valley_threshold = 0.70 if volume_cv < 2.5 else 0.55
-    distance_pct = max(0.005, avg_hourly_volatility * 2.0)
-    tick_size = current_price * 0.0005
+    volume_cv = float(work["volume"].std() / (work["volume"].mean() + 1e-9))
+    sigma_factor = 1.5 if volume_cv < 2.0 else 1.0
+    height_threshold = mean_v + (sigma_factor * std_v)
+    if mean_v > 1e-12:
+        height_mult = float(height_threshold / mean_v)
+    else:
+        height_mult = 1.2
+
+    valley_threshold = 0.65 if volume_cv < 2.0 else 0.55
+    distance_pct = max(0.003, float((work["high"] - work["low"]).mean()) / max(current_price, 1e-9) * 1.5)
 
     return {
         "tick_size": float(tick_size),
         "distance_pct": float(distance_pct),
+        "height_mult": round(float(height_mult), 2),
         "valley_threshold": float(valley_threshold),
-        "height_mult": 2.0,
-        "avg_hourly_volatility": float(avg_hourly_volatility),
-        "volume_cv": float(volume_cv) if np.isfinite(volume_cv) else float("inf"),
+        "volume_cv": round(float(volume_cv), 2),
+        "avg_hourly_volatility": round(float(distance_pct / 1.5), 5),
     }
 
 
-def analyze_coin_zones(df: pd.DataFrame, symbol: str = "ENA/USDT") -> pd.DataFrame:
+def analyze_coin_zones(df: pd.DataFrame, symbol: str = "BTC/USDT") -> pd.DataFrame:
     params = get_adaptive_params(df)
     print(
         f"--- Анализ {symbol} --- "

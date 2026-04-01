@@ -74,8 +74,9 @@ def test_get_adaptive_params_has_expected_keys():
     )
     p = get_adaptive_params(df)
     assert "tick_size" in p and p["tick_size"] > 0
-    assert "distance_pct" in p and p["distance_pct"] >= 0.005
-    assert p["valley_threshold"] in (0.55, 0.70)
+    assert "distance_pct" in p and p["distance_pct"] >= 0.003
+    assert float(p["valley_threshold"]) == 0.65
+    assert "height_mult" in p and float(p["height_mult"]) >= 1.0
 
 
 def test_analyze_coin_zones_runs_with_adaptive_params():
@@ -90,3 +91,21 @@ def test_analyze_coin_zones_runs_with_adaptive_params():
     )
     out = analyze_coin_zones(df, symbol="BTC/USDT")
     assert isinstance(out, pd.DataFrame)
+
+
+def test_get_adaptive_params_alt_branch():
+    n = 300
+    ts = np.arange(1_700_400_000, 1_700_400_000 + n * 60, 60, dtype=np.int64)
+    close = np.linspace(10.0, 11.0, n)
+    high = close * 1.03
+    low = close * 0.97
+    # Рваный объем, чтобы CV был > 2.0
+    volume = np.full(n, 1.0)
+    volume[::25] = 5000.0
+    df = pd.DataFrame(
+        {"timestamp": ts, "close": close, "high": high, "low": low, "volume": volume}
+    )
+    p = get_adaptive_params(df)
+    assert float(p["valley_threshold"]) == 0.55
+    assert float(p["height_mult"]) >= 1.0
+    assert float(p["distance_pct"]) >= 0.003

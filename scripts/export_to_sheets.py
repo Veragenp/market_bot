@@ -40,7 +40,7 @@ SHEET_TITLE = os.getenv("MARKET_AUDIT_SHEET_TITLE", "Market Data Audit")
 CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 SHEET_URL = os.getenv("MARKET_AUDIT_SHEET_URL")
 SHEET_ID = os.getenv("MARKET_AUDIT_SHEET_ID")
-DYNAMIC_ZONES_SYMBOL = os.getenv("DYNAMIC_ZONES_SYMBOL", "ENA/USDT")
+DYNAMIC_ZONES_SYMBOL = os.getenv("DYNAMIC_ZONES_SYMBOL", "BTC/USDT")
 DYNAMIC_ZONES_YEAR = os.getenv("DYNAMIC_ZONES_YEAR")
 DYNAMIC_ZONES_MONTH = os.getenv("DYNAMIC_ZONES_MONTH")
 DYNAMIC_ZONES_BIN_STEP_USDT = os.getenv("DYNAMIC_ZONES_BIN_STEP_USDT")
@@ -475,6 +475,8 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
     tick_size = float(params["tick_size"])
     avg_hourly_volatility = float(params["avg_hourly_volatility"])
     volume_cv = float(params["volume_cv"])
+    real_min_tick = float(params.get("real_min_tick", 0.0))
+    price_band_usdt = float(params.get("price_band_usdt", 0.0))
     base_meta = {
         **base_meta,
         "height_mult": height_mult,
@@ -483,6 +485,8 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         "tick_size": tick_size,
         "avg_hourly_volatility": avg_hourly_volatility,
         "volume_cv": volume_cv,
+        "real_min_tick": real_min_tick,
+        "price_band_usdt": price_band_usdt,
     }
 
     try:
@@ -511,6 +515,8 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
     out["tick_size"] = tick_size
     out["avg_hourly_volatility"] = avg_hourly_volatility
     out["volume_cv"] = volume_cv
+    out["real_min_tick"] = real_min_tick
+    out["price_band_usdt"] = price_band_usdt
     out = out.rename(
         columns={
             "Price": "Цена уровня",
@@ -529,6 +535,8 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         "tick_size",
         "avg_hourly_volatility",
         "volume_cv",
+        "real_min_tick",
+        "price_band_usdt",
         "Цена уровня",
         "Суммарный объем",
         "Время жизни (ч)",
