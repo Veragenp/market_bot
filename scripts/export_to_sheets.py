@@ -475,6 +475,8 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
     tick_size = float(params["tick_size"])
     avg_hourly_volatility = float(params["avg_hourly_volatility"])
     volume_cv = float(params["volume_cv"])
+    top_n = int(params.get("top_n", 10))
+    min_duration_hours = float(params.get("min_duration_hours", 6.0))
     real_min_tick = float(params.get("real_min_tick", 0.0))
     price_band_usdt = float(params.get("price_band_usdt", 0.0))
     base_meta = {
@@ -485,6 +487,8 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         "tick_size": tick_size,
         "avg_hourly_volatility": avg_hourly_volatility,
         "volume_cv": volume_cv,
+        "top_n": top_n,
+        "min_duration_hours": min_duration_hours,
         "real_min_tick": real_min_tick,
         "price_band_usdt": price_band_usdt,
     }
@@ -496,6 +500,8 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
             distance_pct=distance_pct,
             valley_threshold=valley_threshold,
             tick_size=tick_size,
+            top_n=top_n,
+            min_duration_hours=min_duration_hours,
         )
     except RuntimeError as e:
         row = {**base_meta, "note": str(e)}
@@ -515,6 +521,8 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
     out["tick_size"] = tick_size
     out["avg_hourly_volatility"] = avg_hourly_volatility
     out["volume_cv"] = volume_cv
+    out["top_n"] = top_n
+    out["min_duration_hours"] = min_duration_hours
     out["real_min_tick"] = real_min_tick
     out["price_band_usdt"] = price_band_usdt
     out = out.rename(
@@ -535,6 +543,8 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         "tick_size",
         "avg_hourly_volatility",
         "volume_cv",
+        "top_n",
+        "min_duration_hours",
         "real_min_tick",
         "price_band_usdt",
         "Цена уровня",
