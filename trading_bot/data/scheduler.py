@@ -8,9 +8,9 @@ from config import ANALYTIC_SYMBOLS, TRADING_SYMBOLS
 from trading_bot.config.settings import LIQUIDATIONS_UPDATE_INTERVAL, OI_UPDATE_INTERVAL
 from trading_bot.data.data_loader import DataLoaderManager
 from trading_bot.data.collectors import (
-    update_aggregated_indices,
     update_all_futures_data,
     update_binance_ohlcv,
+    update_indices,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ def run_scheduler_forever() -> None:
     """
     Run update scheduler:
       - 1m: every 15 min
-      - 1h: hourly
+      - 1h: hourly (spot + индексы TradingView)
       - 4h: every 4 hours
       - 1d: daily at 01:00 UTC
       - 1w: Sunday 23:00 UTC
@@ -61,7 +61,8 @@ def run_scheduler_forever() -> None:
 
     schedule.every(15).minutes.do(_run_binance_batch, timeframe="1m")
     schedule.every().hour.do(_run_binance_batch, timeframe="1h")
-    schedule.every().hour.do(update_aggregated_indices)
+    # Индексы CRYPTOCAP — TradingView (coingecko_agg отключён).
+    schedule.every().hour.do(update_indices)
     schedule.every(4).hours.do(_run_binance_batch, timeframe="4h")
     schedule.every().day.at("01:00").do(_run_binance_batch, timeframe="1d")
     schedule.every(4).hours.do(update_all_futures_data)

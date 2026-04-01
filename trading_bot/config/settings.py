@@ -8,6 +8,18 @@ import os
 _SETTINGS_FILE = os.path.abspath(__file__)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(_SETTINGS_FILE)))
 
+try:
+    from dotenv import load_dotenv
+
+    _env_tb = os.path.join(BASE_DIR, "trading_bot", ".env")
+    _env_root = os.path.join(BASE_DIR, ".env")
+    if os.path.isfile(_env_tb):
+        load_dotenv(_env_tb, override=False)
+    if os.path.isfile(_env_root):
+        load_dotenv(_env_root, override=True)
+except ImportError:
+    pass
+
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "market_data.db")
 
@@ -105,6 +117,10 @@ TRADINGVIEW_SYMBOLS: dict[str, str] = {
 
 TRADINGVIEW_EXCHANGE = "CRYPTOCAP"
 TRADINGVIEW_MAX_BARS = 10_000
+TRADINGVIEW_USERNAME = os.getenv("TRADINGVIEW_USERNAME", "")
+TRADINGVIEW_PASSWORD = os.getenv("TRADINGVIEW_PASSWORD", "")
+# tvdatafeed по умолчанию ждёт WebSocket всего 5 с — мало для медленных сетей
+TRADINGVIEW_WS_TIMEOUT = int(os.getenv("TRADINGVIEW_WS_TIMEOUT", "60"))
 
 API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY = 2

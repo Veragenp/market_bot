@@ -11,7 +11,7 @@ def _column_names(cursor, table: str) -> set[str]:
 
 
 def init_db() -> None:
-    """Создаёт таблицы и индексы текущей схемы (v4+)."""
+    """Создаёт таблицы и индексы текущей схемы (v5+)."""
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -158,6 +158,52 @@ def init_db() -> None:
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_levels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            price REAL NOT NULL,
+            level_type TEXT NOT NULL,
+            layer TEXT,
+            strength REAL DEFAULT 0.0,
+            volume_peak REAL,
+            touch_count INTEGER DEFAULT 0,
+            last_touch INTEGER,
+            low_volume_zone_above INTEGER DEFAULT 0,
+            low_volume_zone_below INTEGER DEFAULT 0,
+            tier TEXT,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER,
+            is_active INTEGER DEFAULT 1
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pl_symbol_active ON price_levels(symbol, is_active)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pl_symbol_layer ON price_levels(symbol, layer)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pl_strength ON price_levels(symbol, strength DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pl_tier ON price_levels(symbol, tier)")
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS market_context (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            btc_trend_1d TEXT,
+            btc_trend_4h TEXT,
+            btc_trend_1h TEXT,
+            market_strength REAL,
+            fear_greed_index INTEGER,
+            sp500_trend TEXT,
+            dxy_trend TEXT,
+            dominance_btc REAL,
+            others_target TEXT,
+            others_confidence REAL
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mc_timestamp ON market_context(timestamp DESC)")
+
     conn.commit()
     conn.close()
 
@@ -289,7 +335,7 @@ def run_migrations() -> None:
                     timeframe,
                     CASE
                         WHEN symbol IN ('SP500', 'RTY', 'GOLD', 'DXY') THEN 'yfinance'
-                        WHEN symbol IN ('TOTAL', 'TOTAL2', 'TOTAL3', 'BTCD', 'OTHERSD') THEN 'tradingview'
+                        WHEN symbol IN ('TOTAL', 'TOTAL2', 'TOTAL3', 'BTCD', 'OTHERSD', 'OTHERS') THEN 'tradingview'
                         ELSE 'binance'
                     END,
                     last_updated,
@@ -321,6 +367,105 @@ def run_migrations() -> None:
 
         cursor.execute(
             "INSERT INTO db_version (version, applied_at) VALUES (4, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 5:
+        # --- new analytics tables for cluster entry ---
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_levels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                price REAL NOT NULL,
+                level_type TEXT NOT NULL,
+                layer TEXT,
+                strength REAL DEFAULT 0.0,
+                volume_peak REAL,
+                touch_count INTEGER DEFAULT 0,
+                last_touch INTEGER,
+                low_volume_zone_above INTEGER DEFAULT 0,
+                low_volume_zone_below INTEGER DEFAULT 0,
+                tier TEXT,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                is_active INTEGER DEFAULT 1
+            )
+            """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pl_symbol_active ON price_levels(symbol, is_active)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pl_symbol_layer ON price_levels(symbol, layer)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pl_strength ON price_levels(symbol, strength DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pl_tier ON price_levels(symbol, tier)")
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_context (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                btc_trend_1d TEXT,
+                btc_trend_4h TEXT,
+                btc_trend_1h TEXT,
+                market_strength REAL,
+                fear_greed_index INTEGER,
+                sp500_trend TEXT,
+                dxy_trend TEXT,
+                dominance_btc REAL,
+                others_target TEXT,
+                others_confidence REAL
+            )
+            """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mc_timestamp ON market_context(timestamp DESC)")
+
+        # --- trade_levels: add link to analytical level + keep compatibility ---
+        cursor.execute("PRAGMA foreign_keys = OFF")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_levels_v5 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('long', 'short')),
+                entry_price REAL NOT NULL,
+                stop_loss REAL,
+                take_profit REAL,
+                price_level_id INTEGER,
+                generated_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                status TEXT DEFAULT 'active' CHECK (status IN ('active', 'expired', 'cancelled', 'hit', 'filled')),
+                source TEXT DEFAULT 'agent',
+                position_id INTEGER,
+                FOREIGN KEY (price_level_id) REFERENCES price_levels(id)
+            )
+            """
+        )
+
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trade_levels'")
+        if cursor.fetchone() is not None:
+            cursor.execute(
+                """
+                INSERT INTO trade_levels_v5 (
+                    id, symbol, direction, entry_price, stop_loss, take_profit,
+                    price_level_id, generated_at, expires_at, status, source, position_id
+                )
+                SELECT
+                    id, symbol, direction, entry_price, stop_loss, take_profit,
+                    NULL, generated_at, expires_at, status, source, NULL
+                FROM trade_levels
+                """
+            )
+            cursor.execute("DROP TABLE IF EXISTS trade_levels")
+
+        cursor.execute("ALTER TABLE trade_levels_v5 RENAME TO trade_levels")
+        cursor.execute("PRAGMA foreign_keys = ON")
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tl_symbol_status ON trade_levels(symbol, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tl_status_gen ON trade_levels(status, generated_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tl_price_level ON trade_levels(price_level_id)")
+
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (5, ?)",
             (int(time.time()),),
         )
         conn.commit()

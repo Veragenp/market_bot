@@ -75,6 +75,7 @@ class CoinGeckoClient(BaseExchangeClient):
             "btc_market_cap": btc_market_cap,
             "total_market_cap_excluding_btc": total2,
             "btcd": btcd,
+            "market_cap_percentage": market_cap_pct,
         }
         self._daily_cache[key] = result
         return result

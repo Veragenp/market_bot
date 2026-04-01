@@ -20,6 +20,13 @@ from config import (
 )
 from trading_bot.data.db import get_connection
 from trading_bot.data.schema import init_db
+from trading_bot.analytics.dynamic_accumulation_zones import (
+    DEFAULT_CLUSTER_THRESHOLD_PCT,
+    DEFAULT_POC_MERGE_THRESHOLD_PCT,
+    DEFAULT_PRICE_BAND_TICK_MULTIPLIER,
+    DEFAULT_WEIGHTED_MERGE_THRESHOLD_PCT,
+    run_pipeline,
+)
 from trading_bot.data.repositories import get_ohlcv_filled
 from trading_bot.tools.sheets_exporter import SheetsExporter
 
@@ -27,6 +34,15 @@ SHEET_TITLE = os.getenv("MARKET_AUDIT_SHEET_TITLE", "Market Data Audit")
 CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 SHEET_URL = os.getenv("MARKET_AUDIT_SHEET_URL")
 SHEET_ID = os.getenv("MARKET_AUDIT_SHEET_ID")
+DYNAMIC_ZONES_SYMBOL = os.getenv("DYNAMIC_ZONES_SYMBOL", "BTC/USDT")
+DYNAMIC_ZONES_YEAR = os.getenv("DYNAMIC_ZONES_YEAR")
+DYNAMIC_ZONES_MONTH = os.getenv("DYNAMIC_ZONES_MONTH")
+DYNAMIC_ZONES_BIN_STEP_USDT = os.getenv("DYNAMIC_ZONES_BIN_STEP_USDT")
+DYNAMIC_ZONES_POC_THRESHOLD_PCT = os.getenv("DYNAMIC_ZONES_POC_THRESHOLD_PCT")
+DYNAMIC_ZONES_CLUSTER_PCT = os.getenv("DYNAMIC_ZONES_CLUSTER_PCT")
+DYNAMIC_ZONES_TOP_N_PER_BAND = os.getenv("DYNAMIC_ZONES_TOP_N_PER_BAND")
+DYNAMIC_ZONES_PRICE_BAND_USDT = os.getenv("DYNAMIC_ZONES_PRICE_BAND_USDT")
+DYNAMIC_ZONES_WEIGHTED_MERGE_PCT = os.getenv("DYNAMIC_ZONES_WEIGHTED_MERGE_PCT")
 
 
 def _ts_to_iso_utc(ts: int) -> str:
@@ -169,7 +185,7 @@ def _build_audit_log(entries: List[Dict[str, Any]]) -> pd.DataFrame:
 
 def _fetch_indices_agg_sample(limit: int = 200) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    symbols = ["TOTAL", "TOTAL2", "TOTAL3", "BTCD"]
+    symbols = ["TOTAL", "TOTAL2", "TOTAL3", "BTCD", "OTHERS", "OTHERSD"]
     conn = get_connection()
     cur = conn.cursor()
     for symbol in symbols:
@@ -204,6 +220,179 @@ def _fetch_indices_agg_sample(limit: int = 200) -> pd.DataFrame:
             )
     conn.close()
     return pd.DataFrame(rows)
+
+
+def _fetch_all_coingecko_agg() -> pd.DataFrame:
+    """Every row in ohlcv with source=coingecko_agg (full dump for validation)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT symbol, timeframe, timestamp, open, high, low, close, volume, source, extra, updated_at
+        FROM ohlcv
+        WHERE source = 'coingecko_agg'
+        ORDER BY symbol, timeframe, timestamp
+        """
+    )
+    rows: List[Dict[str, Any]] = []
+    for c in cur.fetchall():
+        c = dict(c)
+        rows.append(
+            {
+                "symbol": c.get("symbol"),
+                "timeframe": c.get("timeframe"),
+                "timestamp_utc": _ts_to_iso_utc(int(c["timestamp"])),
+                "open": c.get("open"),
+                "high": c.get("high"),
+                "low": c.get("low"),
+                "close": c.get("close"),
+                "volume": c.get("volume"),
+                "extra": c.get("extra"),
+                "source": c.get("source"),
+                "updated_at": c.get("updated_at"),
+            }
+        )
+    conn.close()
+    return pd.DataFrame(rows)
+
+
+def _default_prev_calendar_month_utc() -> tuple[int, int]:
+    now = datetime.now(timezone.utc)
+    m = now.month - 1
+    y = now.year
+    if m == 0:
+        m = 12
+        y -= 1
+    return y, m
+
+
+def _fetch_dynamic_accumulation_zones_for_sheet(symbol: str) -> pd.DataFrame:
+    """Зоны накопления (1m, календарный месяц UTC) — см. dynamic_accumulation_zones."""
+    conn = get_connection()
+    df = pd.read_sql_query(
+        """
+        SELECT timestamp, open, high, low, close, volume
+        FROM ohlcv
+        WHERE symbol = ? AND timeframe = '1m'
+        ORDER BY timestamp
+        """,
+        conn,
+        params=(symbol,),
+    )
+    conn.close()
+
+    year: int | None = None
+    month: int | None = None
+    if DYNAMIC_ZONES_YEAR and DYNAMIC_ZONES_MONTH:
+        year = int(DYNAMIC_ZONES_YEAR)
+        month = int(DYNAMIC_ZONES_MONTH)
+
+    if year is None or month is None:
+        year, month = _default_prev_calendar_month_utc()
+
+    dz_kwargs: dict = {"rescan": False, "top_n_per_band": 0}
+    wm_thr_used: float = DEFAULT_WEIGHTED_MERGE_THRESHOLD_PCT
+    if DYNAMIC_ZONES_WEIGHTED_MERGE_PCT is not None and str(DYNAMIC_ZONES_WEIGHTED_MERGE_PCT).strip() != "":
+        wm_thr_used = float(DYNAMIC_ZONES_WEIGHTED_MERGE_PCT)
+    dz_kwargs["weighted_merge_threshold_pct"] = wm_thr_used if wm_thr_used > 0 else None
+
+    if DYNAMIC_ZONES_BIN_STEP_USDT:
+        dz_kwargs["zone_bin_step_usdt"] = float(DYNAMIC_ZONES_BIN_STEP_USDT)
+    poc_thr_used = (
+        float(DYNAMIC_ZONES_POC_THRESHOLD_PCT)
+        if DYNAMIC_ZONES_POC_THRESHOLD_PCT
+        else DEFAULT_POC_MERGE_THRESHOLD_PCT
+    )
+    if DYNAMIC_ZONES_POC_THRESHOLD_PCT:
+        dz_kwargs["poc_merge_threshold_pct"] = poc_thr_used
+    cluster_used = (
+        float(DYNAMIC_ZONES_CLUSTER_PCT)
+        if DYNAMIC_ZONES_CLUSTER_PCT
+        else DEFAULT_CLUSTER_THRESHOLD_PCT
+    )
+    if DYNAMIC_ZONES_CLUSTER_PCT:
+        dz_kwargs["cluster_threshold_pct"] = cluster_used
+        dz_kwargs["rescan"] = True
+
+    top_n_used: int | None = 0
+    if DYNAMIC_ZONES_TOP_N_PER_BAND is not None and DYNAMIC_ZONES_TOP_N_PER_BAND != "":
+        v = max(0, int(DYNAMIC_ZONES_TOP_N_PER_BAND))
+        dz_kwargs["top_n_per_band"] = v
+        top_n_used = v
+        if v > 0:
+            dz_kwargs["rescan"] = True
+    band_w_used: float | None = None
+    if DYNAMIC_ZONES_PRICE_BAND_USDT:
+        band_w_used = float(DYNAMIC_ZONES_PRICE_BAND_USDT)
+        dz_kwargs["price_band_usdt"] = band_w_used
+
+    out, bin_step = run_pipeline(
+        df,
+        year=year,
+        month=month,
+        **dz_kwargs,
+    )
+    exported_at = datetime.now(timezone.utc).isoformat()
+
+    if out.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "month_utc": f"{year}-{month:02d}",
+                    "bin_step_usdt": round(float(bin_step), 6) if bin_step else "",
+                    "poc_merge_threshold_pct": poc_thr_used,
+                    "cluster_threshold_pct": cluster_used,
+                    "top_n_per_band": top_n_used if top_n_used is not None else 0,
+                    "price_band_usdt": band_w_used
+                    if band_w_used is not None
+                    else (DEFAULT_PRICE_BAND_TICK_MULTIPLIER * float(bin_step) if bin_step else ""),
+                    "rescan": dz_kwargs.get("rescan", False),
+                    "weighted_merge_threshold_pct": dz_kwargs.get("weighted_merge_threshold_pct") or 0.0,
+                    "note": "Нет зон или нет 1m данных за выбранный месяц",
+                    "exported_at_utc": exported_at,
+                }
+            ]
+        )
+
+    out = out.copy()
+    out.insert(0, "symbol", symbol)
+    out.insert(1, "month_utc", f"{year}-{month:02d}")
+    out["t_start_utc"] = out["t_start_unix"].map(lambda x: _ts_to_iso_utc(int(x)))
+    out["t_end_utc"] = out["t_end_unix"].map(lambda x: _ts_to_iso_utc(int(x)))
+    out["bin_step_usdt"] = round(float(bin_step), 6)
+    out["poc_merge_threshold_pct"] = poc_thr_used
+    out["cluster_threshold_pct"] = cluster_used
+    if band_w_used is not None:
+        band_meta = band_w_used
+    else:
+        band_meta = DEFAULT_PRICE_BAND_TICK_MULTIPLIER * float(bin_step)
+    out["top_n_per_band"] = top_n_used if top_n_used is not None else 0
+    out["price_band_usdt"] = round(float(band_meta), 4)
+    out["rescan"] = bool(dz_kwargs.get("rescan", False))
+    out["weighted_merge_threshold_pct"] = float(dz_kwargs.get("weighted_merge_threshold_pct") or 0.0)
+    out["exported_at_utc"] = exported_at
+    cols = [
+        "symbol",
+        "month_utc",
+        "exported_at_utc",
+        "bin_step_usdt",
+        "poc_merge_threshold_pct",
+        "cluster_threshold_pct",
+        "rescan",
+        "top_n_per_band",
+        "price_band_usdt",
+        "weighted_merge_threshold_pct",
+        "Цена уровня",
+        "Суммарный объем",
+        "Время жизни (ч)",
+        "Сила (Tier)",
+        "t_start_utc",
+        "t_end_utc",
+        "t_start_unix",
+        "t_end_unix",
+    ]
+    return out[[c for c in cols if c in out.columns]]
 
 
 def main() -> None:
@@ -271,6 +460,44 @@ def main() -> None:
             "source": "coingecko_agg",
             "worksheet": "indices_agg_sample",
             "rows": len(df_indices_agg),
+            "last_exported_at_utc": exported_at,
+        }
+    )
+
+    df_cg_full = _fetch_all_coingecko_agg()
+    exporter.export_dataframe_to_sheet(df_cg_full, SHEET_TITLE, "coingecko_agg_all")
+    audit_entries.append(
+        {
+            "source": "coingecko_agg",
+            "worksheet": "coingecko_agg_all",
+            "rows": len(df_cg_full),
+            "last_exported_at_utc": exported_at,
+        }
+    )
+
+    df_val_candles = _fetch_ohlcv_sample(
+        symbols=["BTC/USDT", "ETH/USDT", "SP500"],
+        timeframes=["1h", "4h", "1d"],
+        limit=10,
+        fill_weekends=FILL_MISSING_WEEKENDS,
+    )
+    exporter.export_dataframe_to_sheet(df_val_candles, SHEET_TITLE, "validation_candles_1h_4h_1d")
+    audit_entries.append(
+        {
+            "source": "validation",
+            "worksheet": "validation_candles_1h_4h_1d",
+            "rows": len(df_val_candles),
+            "last_exported_at_utc": exported_at,
+        }
+    )
+
+    df_dyn_zones = _fetch_dynamic_accumulation_zones_for_sheet(DYNAMIC_ZONES_SYMBOL)
+    exporter.export_dataframe_to_sheet(df_dyn_zones, SHEET_TITLE, "dynamic_accumulation_zones")
+    audit_entries.append(
+        {
+            "source": "dynamic_accumulation_zones",
+            "worksheet": "dynamic_accumulation_zones",
+            "rows": len(df_dyn_zones),
             "last_exported_at_utc": exported_at,
         }
     )

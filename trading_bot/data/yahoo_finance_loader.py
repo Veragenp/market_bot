@@ -130,7 +130,8 @@ class YahooFinanceDataLoader(BaseDataLoader):
                     df_1h.index = df_1h.index.tz_convert("UTC")
 
                 df_4h = (
-                    # pandas expects lower-case 'h' in offset aliases
+                    # Keep 4h labels on bucket start (12:00, 16:00, 20:00, ... UTC),
+                    # which matches the expected audit verification grid.
                     df_1h.resample("4h", label="left", closed="left")
                     .agg(
                         {

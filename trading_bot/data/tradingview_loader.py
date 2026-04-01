@@ -9,13 +9,19 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
+
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from trading_bot.config.settings import (
     DEFAULT_SOURCE_TRADINGVIEW,
     TRADINGVIEW_EXCHANGE,
     TRADINGVIEW_MAX_BARS,
+    TRADINGVIEW_PASSWORD,
     TRADINGVIEW_SYMBOLS,
+    TRADINGVIEW_USERNAME,
+    TRADINGVIEW_WS_TIMEOUT,
 )
 from trading_bot.data.base_loader import BaseDataLoader
 
@@ -58,6 +64,18 @@ def _normalize_to_month_start(dt: pd.Timestamp) -> pd.Timestamp:
     )
 
 
+def _patch_tvdatafeed_websocket_timeout(seconds: int) -> None:
+    """tvDatafeed использует __ws_timeout = 5 с на классе — увеличиваем до seconds."""
+    try:
+        import tvDatafeed.main as tvm  # type: ignore
+
+        sec = max(5, int(seconds))
+        setattr(tvm.TvDatafeed, "_TvDatafeed__ws_timeout", sec)
+        logger.debug("tvDatafeed WebSocket timeout set to %ss", sec)
+    except Exception as exc:
+        logger.warning("Could not patch tvDatafeed ws timeout: %s", exc)
+
+
 _TIMEFRAME_TV = {
     "1m": {"normalize": _normalize_to_minute_start},
     "4h": {"normalize": _normalize_to_4h_start},
@@ -81,9 +99,25 @@ class TradingViewDataLoader(BaseDataLoader):
                 "tvDatafeed is required. Install with `pip install tvdatafeed`."
             ) from exc
 
+        _patch_tvdatafeed_websocket_timeout(TRADINGVIEW_WS_TIMEOUT)
+
         self._Interval = Interval
         self._TvDatafeed = TvDatafeed
-        self._tv = TvDatafeed()
+        if TRADINGVIEW_USERNAME and TRADINGVIEW_PASSWORD:
+            self._tv = TvDatafeed(username=TRADINGVIEW_USERNAME, password=TRADINGVIEW_PASSWORD)
+            if getattr(self._tv, "token", None) == "unauthorized_user_token":
+                logger.warning(
+                    "TradingView: вход через tvdatafeed не удалился (часто из‑за 2FA, email vs логин, "
+                    "или смены API signin на стороне TradingView). Идём в nologin + увеличенный WS timeout."
+                )
+            else:
+                logger.info("TradingView: получен auth_token (tvDatafeed)")
+        else:
+            self._tv = TvDatafeed()
+            logger.warning(
+                "TradingView: TRADINGVIEW_USERNAME/PASSWORD not set — nologin (limited data). "
+                "Put them in .env at project root or export in the shell."
+            )
         self._symbol_map = dict(symbol_map or TRADINGVIEW_SYMBOLS)
         self._exchange = exchange
         self._n_bars_cap = n_bars_cap
@@ -142,7 +176,18 @@ class TradingViewDataLoader(BaseDataLoader):
         interval = self._interval_for_timeframe(tf)
         n_bars = self._estimate_bars(tf, start_ts, end_ts)
 
-        df = self._tv.get_hist(symbol=tv_sym, exchange=self._exchange, interval=interval, n_bars=n_bars)
+        @retry(
+            reraise=True,
+            stop=stop_after_attempt(4),
+            wait=wait_exponential(multiplier=1, min=2, max=45),
+            retry=retry_if_exception_type((TimeoutError, OSError, ConnectionError)),
+        )
+        def _get_hist() -> pd.DataFrame:
+            return self._tv.get_hist(
+                symbol=tv_sym, exchange=self._exchange, interval=interval, n_bars=n_bars
+            )
+
+        df = _get_hist()
         if df is None or df.empty:
             return []
 
@@ -160,12 +205,13 @@ class TradingViewDataLoader(BaseDataLoader):
         df.index = df.index.map(norm_fn)
         df = df[~df.index.duplicated(keep="first")]
 
-        unix_index = df.index.view("int64") // 10**9
+        # Не использовать .view("int64") на tz-aware DatetimeIndex — в pandas 2.x даёт неверные секунды.
+        idx_unix = np.array([int(pd.Timestamp(x).timestamp()) for x in df.index], dtype=np.int64)
         if start_ts is not None:
-            df = df[unix_index >= int(start_ts)]
-            unix_index = df.index.view("int64") // 10**9
+            df = df[idx_unix >= int(start_ts)]
+            idx_unix = np.array([int(pd.Timestamp(x).timestamp()) for x in df.index], dtype=np.int64)
         if end_ts is not None:
-            df = df[unix_index <= int(end_ts)]
+            df = df[idx_unix <= int(end_ts)]
 
         df = df.sort_index()
 

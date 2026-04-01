@@ -179,15 +179,26 @@ def update_yfinance_ohlcv(symbol: str, timeframe: str, days_back: int = None) ->
         logger.info("No new yfinance range for %s %s (since=%s)", symbol, tf, since)
         return
 
-    client = get_exchange_client(SOURCE_YFINANCE)
     try:
-        records = client.fetch_ohlcv(
-            symbol=symbol,
-            timeframe=tf,
-            start=since,
-            end=now_ts,
-        )
+        if tf == "4h":
+            from trading_bot.data.yahoo_finance_loader import YahooFinanceDataLoader
+
+            records = YahooFinanceDataLoader().fetch_ohlcv(
+                symbol=symbol,
+                timeframe=tf,
+                start_ts=since,
+                end_ts=now_ts,
+            )
+        else:
+            client = get_exchange_client(SOURCE_YFINANCE)
+            records = client.fetch_ohlcv(
+                symbol=symbol,
+                timeframe=tf,
+                start=since,
+                end=now_ts,
+            )
         if tf == "1w" and not records:
+            client = get_exchange_client(SOURCE_YFINANCE)
             daily_records = client.fetch_ohlcv(
                 symbol=symbol,
                 timeframe="1d",
@@ -331,10 +342,15 @@ def update_aggregated_indices(limit: int = 500, timeframe: str = "1h") -> None:
     Build TOTAL/TOTAL2/TOTAL3/BTCD from CoinGecko top market caps and store into ohlcv.
     """
     tf = _normalize_timeframe(timeframe)
-    if tf not in {"1h", "1d"}:
-        raise ValueError("Aggregated indices timeframe must be '1h' or '1d'.")
+    if tf not in {"1m", "1h", "1d"}:
+        raise ValueError("Aggregated indices timeframe must be '1m', '1h' or '1d'.")
 
     client = get_exchange_client(SOURCE_COINGECKO)
+    if hasattr(client, "delay_seconds"):
+        try:
+            client.delay_seconds = 0
+        except Exception:
+            pass
     try:
         df = client.fetch_top_market_cap(limit=limit)
     except Exception as exc:
@@ -351,10 +367,12 @@ def update_aggregated_indices(limit: int = 500, timeframe: str = "1h") -> None:
     total2 = total - btc_cap
     total3 = total - btc_cap - eth_cap
     btcd = (btc_cap / total * 100.0) if total > 0 else 0.0
+    others = total - btc_cap
+    othersd = (others / total * 100.0) if total > 0 else 0.0
     total_volume = float(df["total_volume"].sum())
 
     now_ts = int(time.time())
-    tf_seconds = 3600 if tf == "1h" else 86400
+    tf_seconds = 60 if tf == "1m" else (3600 if tf == "1h" else 86400)
     bucket_ts = (now_ts // tf_seconds) * tf_seconds
 
     values = {
@@ -362,6 +380,8 @@ def update_aggregated_indices(limit: int = 500, timeframe: str = "1h") -> None:
         "TOTAL2": total2,
         "TOTAL3": total3,
         "BTCD": btcd,
+        "OTHERS": others,
+        "OTHERSD": othersd,
     }
     extra = json.dumps(
         {
@@ -380,7 +400,7 @@ def update_aggregated_indices(limit: int = 500, timeframe: str = "1h") -> None:
             "high": value,
             "low": value,
             "close": value,
-            "volume": total_volume if symbol != "BTCD" else 0.0,
+            "volume": total_volume if symbol not in {"BTCD", "OTHERSD"} else 0.0,
             "source": SOURCE_COINGECKO_AGG,
             "extra": extra,
         }
@@ -391,6 +411,118 @@ def update_aggregated_indices(limit: int = 500, timeframe: str = "1h") -> None:
         else:
             db_client.update_metadata(symbol, tf, bucket_ts, source=SOURCE_COINGECKO_AGG)
 
+
+def backfill_aggregated_indices_daily_weekly(start_ts: int = _HISTORY_START_TS, end_ts: int = None) -> None:
+    """
+    Backfill computed indices (coingecko_agg) for 1d and 1w from CoinGecko global history.
+    """
+    client = get_exchange_client(SOURCE_COINGECKO)
+    end_ts = int(time.time()) if end_ts is None else int(end_ts)
+    start_ts = int(start_ts)
+    if start_ts > end_ts:
+        return
+
+    metrics = client.fetch_global_range(start=start_ts, end=end_ts)
+    if not metrics:
+        logger.warning("No CoinGecko global history rows for backfill.")
+        return
+
+    daily_by_symbol: Dict[str, List[Dict[str, Any]]] = {
+        "TOTAL": [],
+        "TOTAL2": [],
+        "TOTAL3": [],
+        "BTCD": [],
+        "OTHERS": [],
+        "OTHERSD": [],
+    }
+
+    for m in metrics:
+        total = float(m.get("total_market_cap") or 0.0)
+        btcd = float(m.get("btcd") or 0.0)
+        btc_cap = total * btcd / 100.0 if total > 0 else 0.0
+        # CoinGecko global history usually has ETH share in percentage payload.
+        ethd = float((m.get("market_cap_percentage") or {}).get("eth") or 0.0)
+        eth_cap = total * ethd / 100.0 if total > 0 else 0.0
+
+        total2 = total - btc_cap
+        total3 = total - btc_cap - eth_cap
+        others = total2
+        othersd = (others / total * 100.0) if total > 0 else 0.0
+
+        ts = int(m.get("timestamp") or 0)
+        if ts <= 0:
+            continue
+        extra = json.dumps(
+            {
+                "market_cap_total": total,
+                "market_cap_btc": btc_cap,
+                "market_cap_eth": eth_cap,
+                "btcd": btcd,
+                "ethd": ethd,
+            },
+            ensure_ascii=True,
+        )
+
+        values = {
+            "TOTAL": total,
+            "TOTAL2": total2,
+            "TOTAL3": total3,
+            "BTCD": btcd,
+            "OTHERS": others,
+            "OTHERSD": othersd,
+        }
+        for symbol, value in values.items():
+            daily_by_symbol[symbol].append(
+                {
+                    "timestamp": ts,
+                    "open": value,
+                    "high": value,
+                    "low": value,
+                    "close": value,
+                    "volume": 0.0 if symbol in {"BTCD", "OTHERSD"} else total,
+                    "source": SOURCE_COINGECKO_AGG,
+                    "extra": extra,
+                }
+            )
+
+    for symbol, daily_rows in daily_by_symbol.items():
+        if not daily_rows:
+            continue
+        daily_rows = sorted(daily_rows, key=lambda r: int(r["timestamp"]))
+        db_client.save_ohlcv(symbol, "1d", daily_rows)
+        max_daily_ts = max(int(r["timestamp"]) for r in daily_rows)
+        last_daily = db_client.get_last_update(symbol, "1d", source=SOURCE_COINGECKO_AGG)
+        if last_daily is None:
+            db_client.update_metadata(symbol, "1d", max_daily_ts, max_daily_ts, source=SOURCE_COINGECKO_AGG)
+        else:
+            db_client.update_metadata(symbol, "1d", max_daily_ts, source=SOURCE_COINGECKO_AGG)
+
+        df = pd.DataFrame(daily_rows)
+        df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+        df["week_start"] = df["dt"].dt.normalize() - pd.to_timedelta(df["dt"].dt.weekday, unit="D")
+        weekly_rows: List[Dict[str, Any]] = []
+        for wk, grp in df.groupby("week_start", sort=True):
+            grp = grp.sort_values("dt")
+            weekly_rows.append(
+                {
+                    "timestamp": int(pd.Timestamp(wk).timestamp()),
+                    "open": float(grp.iloc[0]["open"]),
+                    "high": float(grp["high"].max()),
+                    "low": float(grp["low"].min()),
+                    "close": float(grp.iloc[-1]["close"]),
+                    "volume": float(grp["volume"].sum()),
+                    "source": SOURCE_COINGECKO_AGG,
+                    "extra": grp.iloc[-1]["extra"],
+                }
+            )
+        if weekly_rows:
+            db_client.save_ohlcv(symbol, "1w", weekly_rows)
+            max_weekly_ts = max(int(r["timestamp"]) for r in weekly_rows)
+            last_weekly = db_client.get_last_update(symbol, "1w", source=SOURCE_COINGECKO_AGG)
+            if last_weekly is None:
+                db_client.update_metadata(symbol, "1w", max_weekly_ts, max_weekly_ts, source=SOURCE_COINGECKO_AGG)
+            else:
+                db_client.update_metadata(symbol, "1w", max_weekly_ts, source=SOURCE_COINGECKO_AGG)
 
 def update_futures_open_interest(symbol: str, period: str = "4h", days_back: int = 30) -> None:
     """

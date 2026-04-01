@@ -33,6 +33,8 @@ def test_tables_exist(clean_db):
         "trade_levels",
         "level_hits",
         "trade_decisions",
+        "price_levels",
+        "market_context",
     }
     assert expected.issubset(tables)
     conn.close()
@@ -54,6 +56,14 @@ def test_indices_exist(clean_db):
         "idx_oi_source",
         "idx_metadata_source",
         "idx_instruments_exchange",
+        "idx_pl_symbol_active",
+        "idx_pl_symbol_layer",
+        "idx_pl_strength",
+        "idx_pl_tier",
+        "idx_mc_timestamp",
+        "idx_tl_symbol_status",
+        "idx_tl_status_gen",
+        "idx_tl_price_level",
     }
     assert expected.issubset(indices)
     conn.close()

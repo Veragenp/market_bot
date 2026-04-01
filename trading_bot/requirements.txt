@@ -1,4 +1,5 @@
 # Dependencies for trading_bot (align with project when wiring).
+python-dotenv>=1.0.0
 tvdatafeed>=1.2.0
 pandas>=2.0.0
 tenacity>=8.0.0
