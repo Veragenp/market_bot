@@ -65,6 +65,8 @@ PRO_LEVELS_INCLUDE_ALL_TIERS = os.getenv("PRO_LEVELS_INCLUDE_ALL_TIERS")
 PRO_LEVELS_FINAL_MERGE_PCT = os.getenv("PRO_LEVELS_FINAL_MERGE_PCT")
 PRO_LEVELS_VALLEY_MERGE_THRESHOLD = os.getenv("PRO_LEVELS_VALLEY_MERGE_THRESHOLD")
 PRO_LEVELS_ENABLE_VALLEY_MERGE = os.getenv("PRO_LEVELS_ENABLE_VALLEY_MERGE", "true")
+PRO_LEVELS_DEDUP_ROUND_PCT = os.getenv("PRO_LEVELS_DEDUP_ROUND_PCT")
+PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD = os.getenv("PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD")
 
 
 def _ts_to_iso_utc(ts: int) -> str:
@@ -438,6 +440,14 @@ def _fetch_dynamic_accumulation_zones_for_sheet(symbol: str) -> pd.DataFrame:
 
 def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
     """Пики профиля объёма (1m, тот же календарный месяц UTC, что и dynamic_accumulation_zones)."""
+    symbols = [s.strip() for s in str(symbol).split(",") if s.strip()]
+    if len(symbols) > 1:
+        frames = [_fetch_volume_peak_levels_for_sheet(s) for s in symbols]
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+    symbol = symbols[0] if symbols else str(symbol).strip()
+
     conn = get_connection()
     df = pd.read_sql_query(
         """
@@ -469,7 +479,7 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         return pd.DataFrame([row])
 
     params = get_adaptive_params(work)
-    height_mult = float(PRO_LEVELS_HEIGHT_MULT) if PRO_LEVELS_HEIGHT_MULT else float(params["height_mult"])
+    height_mult: float | None = float(PRO_LEVELS_HEIGHT_MULT) if PRO_LEVELS_HEIGHT_MULT else None
     distance_pct = (
         float(PRO_LEVELS_DISTANCE_PCT) if PRO_LEVELS_DISTANCE_PCT else float(params["distance_pct"])
     )
@@ -498,6 +508,15 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
     if PRO_LEVELS_VALLEY_MERGE_THRESHOLD is not None and str(PRO_LEVELS_VALLEY_MERGE_THRESHOLD).strip() != "":
         valley_merge_threshold = float(PRO_LEVELS_VALLEY_MERGE_THRESHOLD)
     enable_valley_merge = str(PRO_LEVELS_ENABLE_VALLEY_MERGE).strip().lower() == "true"
+    dedup_round_pct = float(params.get("dedup_round_pct", 0.001))
+    if PRO_LEVELS_DEDUP_ROUND_PCT is not None and str(PRO_LEVELS_DEDUP_ROUND_PCT).strip() != "":
+        dedup_round_pct = float(PRO_LEVELS_DEDUP_ROUND_PCT)
+    final_merge_valley_threshold: float | None = params.get("final_merge_valley_threshold")
+    if (
+        PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD is not None
+        and str(PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD).strip() != ""
+    ):
+        final_merge_valley_threshold = float(PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD)
     real_min_tick = float(params.get("real_min_tick", 0.0))
     price_band_usdt = float(params.get("price_band_usdt", 0.0))
     base_meta = {
@@ -515,6 +534,10 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         "final_merge_pct": "" if final_merge_pct is None else final_merge_pct,
         "valley_merge_threshold": valley_merge_threshold,
         "enable_valley_merge": enable_valley_merge,
+        "dedup_round_pct": dedup_round_pct,
+        "final_merge_valley_threshold": (
+            "" if final_merge_valley_threshold is None else final_merge_valley_threshold
+        ),
         "real_min_tick": real_min_tick,
         "price_band_usdt": price_band_usdt,
     }
@@ -533,7 +556,28 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
             final_merge_pct=final_merge_pct,
             valley_merge_threshold=valley_merge_threshold,
             enable_valley_merge=enable_valley_merge,
+            allow_stage_b_overlap=True,
+            dedup_round_pct=dedup_round_pct,
+            final_merge_valley_threshold=final_merge_valley_threshold,
             return_raw=True,
+        )
+        dedup_levels = find_pro_levels(
+            work,
+            height_mult=height_mult,
+            distance_pct=distance_pct,
+            valley_threshold=valley_threshold,
+            tick_size=tick_size,
+            top_n=top_n,
+            min_duration_hours=min_duration_hours,
+            max_levels=max_levels,
+            include_all_tiers=include_all_tiers,
+            final_merge_pct=final_merge_pct,
+            valley_merge_threshold=valley_merge_threshold,
+            enable_valley_merge=enable_valley_merge,
+            allow_stage_b_overlap=True,
+            dedup_round_pct=dedup_round_pct,
+            final_merge_valley_threshold=final_merge_valley_threshold,
+            return_dedup=True,
         )
         final_levels = find_pro_levels(
             work,
@@ -548,9 +592,12 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
             final_merge_pct=final_merge_pct,
             valley_merge_threshold=valley_merge_threshold,
             enable_valley_merge=enable_valley_merge,
+            allow_stage_b_overlap=True,
+            dedup_round_pct=dedup_round_pct,
+            final_merge_valley_threshold=final_merge_valley_threshold,
         )
         print(
-            f"[{symbol} {month_label}] levels raw={len(raw_levels)} final={len(final_levels)} "
+            f"[{symbol} {month_label}] levels raw={len(raw_levels)} dedup={len(dedup_levels)} final={len(final_levels)} "
             f"merge_pct={final_merge_pct} valley_merge={enable_valley_merge} vm_thr={valley_merge_threshold}"
         )
     except RuntimeError as e:
@@ -578,6 +625,10 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
     out["final_merge_pct"] = "" if final_merge_pct is None else final_merge_pct
     out["valley_merge_threshold"] = valley_merge_threshold
     out["enable_valley_merge"] = enable_valley_merge
+    out["dedup_round_pct"] = dedup_round_pct
+    out["final_merge_valley_threshold"] = (
+        "" if final_merge_valley_threshold is None else final_merge_valley_threshold
+    )
     out["real_min_tick"] = real_min_tick
     out["price_band_usdt"] = price_band_usdt
     out = out.rename(
@@ -605,6 +656,8 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         "final_merge_pct",
         "valley_merge_threshold",
         "enable_valley_merge",
+        "dedup_round_pct",
+        "final_merge_valley_threshold",
         "real_min_tick",
         "price_band_usdt",
         "Цена уровня",

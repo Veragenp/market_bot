@@ -25,6 +25,8 @@ def _merge_close_level_rows(
     tier2_h: float,
     df_original: pd.DataFrame,
     distance_pct: float,
+    profile: Optional[pd.Series] = None,
+    final_merge_valley_threshold: Optional[float] = None,
 ) -> list[dict]:
     if len(rows) <= 1 or merge_pct <= 0:
         return rows
@@ -35,7 +37,16 @@ def _merge_close_level_rows(
         p1 = float(prev["Price"])
         p2 = float(r["Price"])
         ref = max(min(abs(p1), abs(p2)), 1e-9)
-        if abs(p2 - p1) / ref <= merge_pct:
+        can_merge = abs(p2 - p1) / ref <= merge_pct
+        if can_merge and profile is not None and final_merge_valley_threshold is not None:
+            i1 = int(profile.index.get_indexer([p1], method="nearest")[0])
+            i2 = int(profile.index.get_indexer([p2], method="nearest")[0])
+            lo, hi = (i1, i2) if i1 <= i2 else (i2, i1)
+            if hi > lo:
+                valley_min = float(profile.iloc[lo : hi + 1].min())
+                peak_min = float(min(profile.iloc[i1], profile.iloc[i2]))
+                can_merge = valley_min >= peak_min * float(final_merge_valley_threshold)
+        if can_merge:
             groups[-1].append(r)
         else:
             groups.append([r])
@@ -125,6 +136,32 @@ def merge_by_valley(
         poc_price = float(prices[int(np.argmax(volumes))])
         final_levels.append({"Price": round(poc_price, 2), "Volume": round(v_sum, 2)})
     return final_levels
+
+
+def _dedup_level_rows(
+    rows: list[dict],
+    *,
+    tick_size: float,
+    current_price: float,
+    dedup_round_pct: float,
+) -> list[dict]:
+    if not rows:
+        return []
+    dedup_round = max(float(tick_size), float(current_price) * max(float(dedup_round_pct), 1e-6))
+    buckets: dict[float, dict] = {}
+    for r in rows:
+        price = float(r["Price"])
+        key = round(price / dedup_round) * dedup_round
+        prev = buckets.get(key)
+        if prev is None:
+            buckets[key] = r
+            continue
+        if float(r["Volume"]) > float(prev["Volume"]) or (
+            float(r["Volume"]) == float(prev["Volume"])
+            and float(r["Duration_Hrs"]) > float(prev["Duration_Hrs"])
+        ):
+            buckets[key] = r
+    return sorted(buckets.values(), key=lambda x: float(x["Volume"]), reverse=True)
 
 
 def greedy_level_selection(
@@ -231,8 +268,12 @@ def find_pro_levels(
     valley_merge_threshold: Optional[float] = None,
     enable_valley_merge: bool = True,
     return_raw: bool = False,
+    return_dedup: bool = False,
     height_percentile_strong: float = 0.85,
     height_percentile_weak: float = 0.65,
+    allow_stage_b_overlap: bool = True,
+    dedup_round_pct: float = 0.001,
+    final_merge_valley_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     smoothing_window: окно сглаживания профиля (рекомендуемо 5-7).
@@ -286,18 +327,19 @@ def find_pro_levels(
         )
 
     mean_sm = float(volume_sm.mean()) if float(volume_sm.mean()) > 0 else 1e-18
-    if height_mult is not None:
-        height_thr = mean_sm * max(float(height_mult), 1.0)
-    else:
-        q = min(max(float(height_percentile), 0.5), 0.99)
-        height_thr = float(volume_sm.quantile(q))
-        if not np.isfinite(height_thr) or height_thr <= 0:
-            height_thr = mean_sm
+    # Base threshold by percentile (less sensitive to outliers).
+    q = min(max(float(height_percentile), 0.5), 0.99)
+    height_thr = float(volume_sm.quantile(q))
+    if not np.isfinite(height_thr) or height_thr <= 0:
+        height_thr = mean_sm
 
     # Stage A/B: strong and weak candidate pools.
     q_strong = min(max(float(height_percentile_strong), 0.55), 0.99)
     q_weak = min(max(float(height_percentile_weak), 0.5), q_strong)
     strong_thr = max(height_thr, float(volume_sm.quantile(q_strong)))
+    if height_mult is not None:
+        # Explicit override for strong stage only.
+        strong_thr = max(strong_thr, mean_sm * max(float(height_mult), 1.0))
     weak_thr = float(volume_sm.quantile(q_weak))
     strong_profile = volume_sm[volume_sm >= strong_thr].sort_values(ascending=False)
     weak_profile = volume_sm[volume_sm >= weak_thr].sort_values(ascending=False)
@@ -327,10 +369,11 @@ def find_pro_levels(
     if eff_top_n <= 0:
         eff_top_n = max(len(strong_profile), len(weak_profile))
 
+    select_distance_pct = max(float(distance_pct) * 0.5, 0.001)
     selected_strong = greedy_level_selection(
         strong_profile,
         work,
-        distance_pct=float(distance_pct),
+        distance_pct=select_distance_pct,
         top_n=eff_top_n,
         min_duration_hours=float(min_duration_hours),
         use_normalized_score=True,
@@ -340,12 +383,12 @@ def find_pro_levels(
         selected_weak = greedy_level_selection(
             weak_profile,
             work,
-            distance_pct=float(distance_pct),
+            distance_pct=select_distance_pct,
             top_n=eff_top_n * 2,
             min_duration_hours=float(min_duration_hours),
             use_normalized_score=True,
         )
-        if not selected_weak.empty and not selected_strong.empty:
+        if not allow_stage_b_overlap and not selected_weak.empty and not selected_strong.empty:
             strong_prices = selected_strong["Price"].to_numpy(dtype=np.float64)
             keep_mask = []
             for p in selected_weak["Price"].to_numpy(dtype=np.float64):
@@ -422,6 +465,14 @@ def find_pro_levels(
         )
     if return_raw:
         return pd.DataFrame(levels).sort_values("Volume", ascending=False).reset_index(drop=True)
+    levels = _dedup_level_rows(
+        levels,
+        tick_size=tick_size_eff,
+        current_price=current_price,
+        dedup_round_pct=float(dedup_round_pct),
+    )
+    if return_dedup:
+        return pd.DataFrame(levels).sort_values("Volume", ascending=False).reset_index(drop=True)
     if final_merge_pct is not None:
         merge_pct = float(final_merge_pct)
     else:
@@ -443,6 +494,8 @@ def find_pro_levels(
         tier2_h=tier2_h,
         df_original=work,
         distance_pct=float(distance_pct),
+        profile=volume_sm,
+        final_merge_valley_threshold=final_merge_valley_threshold,
     )
     return pd.DataFrame(levels).sort_values("Volume", ascending=False).reset_index(drop=True)
 
@@ -485,6 +538,7 @@ def get_adaptive_params(df: pd.DataFrame) -> dict:
         "height_percentile_weak": 0.65,
         "smoothing_window": 5,
         "merge_distance_pct": 0.001,
+        "dedup_round_pct": 0.001,
         "duration_thresholds": (48.0, 12.0),
         "min_duration_hours": 6.0,
         "top_n": 10,
@@ -493,6 +547,7 @@ def get_adaptive_params(df: pd.DataFrame) -> dict:
             max(0.003, float((work["high"] - work["low"]).mean()) / max(current_price, 1e-9) * 1.5),
             0.01,
         ),
+        "final_merge_valley_threshold": 0.5,
         "valley_merge_threshold": 0.4,
         "enable_valley_merge": True,
         "valley_threshold": float(valley_threshold),
@@ -509,6 +564,7 @@ def analyze_coin_zones(df: pd.DataFrame, symbol: str = "BTC/USDT") -> pd.DataFra
         f"--- Анализ {symbol} --- "
         f"Dist: {params['distance_pct']:.4f}, Valley: {params['valley_threshold']}"
     )
+    hm = params.get("height_mult")
     return find_pro_levels(
         df,
         smoothing_window=int(params.get("smoothing_window", 5)),
@@ -520,11 +576,18 @@ def analyze_coin_zones(df: pd.DataFrame, symbol: str = "BTC/USDT") -> pd.DataFra
         merge_distance_pct=float(params.get("merge_distance_pct", 0.001)),
         duration_thresholds=params.get("duration_thresholds", (48.0, 12.0)),
         tick_size=float(params["tick_size"]),
-        height_mult=float(params["height_mult"]),
+        height_mult=float(hm) if hm is not None else None,
         top_n=int(params.get("top_n", 10)),
         min_duration_hours=float(params.get("min_duration_hours", 6.0)),
         max_levels=params.get("max_levels"),
         final_merge_pct=float(params.get("dynamic_merge_pct")) if params.get("dynamic_merge_pct") is not None else None,
         valley_merge_threshold=float(params.get("valley_merge_threshold", 0.5)),
         enable_valley_merge=bool(params.get("enable_valley_merge", True)),
+        allow_stage_b_overlap=True,
+        dedup_round_pct=float(params.get("dedup_round_pct", 0.001)),
+        final_merge_valley_threshold=(
+            float(params.get("final_merge_valley_threshold"))
+            if params.get("final_merge_valley_threshold") is not None
+            else None
+        ),
     )
