@@ -18,7 +18,13 @@ __all__ = [
 
 
 def _merge_close_level_rows(
-    rows: list[dict], *, merge_pct: float, tier1_h: float, tier2_h: float
+    rows: list[dict],
+    *,
+    merge_pct: float,
+    tier1_h: float,
+    tier2_h: float,
+    df_original: pd.DataFrame,
+    distance_pct: float,
 ) -> list[dict]:
     if len(rows) <= 1 or merge_pct <= 0:
         return rows
@@ -36,9 +42,26 @@ def _merge_close_level_rows(
 
     out: list[dict] = []
     for g in groups:
-        anchor = max(g, key=lambda x: float(x["Volume"]))
-        vol_sum = float(sum(float(x["Volume"]) for x in g))
-        dur_h = float(max(float(x["Duration_Hrs"]) for x in g))
+        p_min = min(float(x["Price"]) for x in g)
+        p_max = max(float(x["Price"]) for x in g)
+        lower = p_min * (1.0 - float(distance_pct))
+        upper = p_max * (1.0 + float(distance_pct))
+        sub = df_original[(df_original["close"] >= lower) & (df_original["close"] <= upper)]
+        if sub.empty:
+            continue
+        poc_idx = sub["volume"].idxmax()
+        poc_price = float(sub.loc[poc_idx, "close"])
+        vol_sum = float(sub["volume"].sum())
+        if "timestamp" in sub.columns:
+            ts = np.sort(sub["timestamp"].to_numpy(dtype=np.int64))
+            step_seconds = float(np.median(np.diff(ts))) if ts.size >= 2 else 60.0
+            dur_h = float(sub.shape[0]) * max(step_seconds, 1.0) / 3600.0
+            start_utc = pd.Timestamp(int(sub["timestamp"].min()), unit="s", tz="UTC").isoformat()
+            end_utc = pd.Timestamp(int(sub["timestamp"].max()), unit="s", tz="UTC").isoformat()
+        else:
+            dur_h = float(sub.shape[0]) / 60.0
+            start_utc = ""
+            end_utc = ""
         if dur_h > tier1_h:
             tier = "Tier 1 (Бетон)"
         elif dur_h > tier2_h:
@@ -47,12 +70,12 @@ def _merge_close_level_rows(
             tier = "Tier 3 (Локальный)"
         out.append(
             {
-                "Price": round(float(anchor["Price"]), 2),
+                "Price": round(float(poc_price), 2),
                 "Volume": round(vol_sum, 2),
                 "Duration_Hrs": round(dur_h, 1),
                 "Tier": tier,
-                "start_utc": anchor.get("start_utc", ""),
-                "end_utc": anchor.get("end_utc", ""),
+                "start_utc": start_utc,
+                "end_utc": end_utc,
             }
         )
     return sorted(out, key=lambda r: float(r["Volume"]), reverse=True)
@@ -111,6 +134,7 @@ def greedy_level_selection(
     distance_pct: float = 0.01,
     top_n: int = 5,
     min_duration_hours: float = 1.0,
+    use_normalized_score: bool = True,
 ) -> pd.DataFrame:
     if "timestamp" in df_original.columns:
         ts = np.sort(df_original["timestamp"].to_numpy(dtype=np.int64))
@@ -137,6 +161,14 @@ def greedy_level_selection(
                     "score": float(volume) * float(duration),
                 }
             )
+
+    if candidates and use_normalized_score:
+        vols = np.array([float(c["volume"]) for c in candidates], dtype=np.float64)
+        durs = np.array([float(c["duration"]) for c in candidates], dtype=np.float64)
+        med_v = float(np.median(vols)) if np.isfinite(np.median(vols)) and np.median(vols) > 1e-12 else 1.0
+        med_d = float(np.median(durs)) if np.isfinite(np.median(durs)) and np.median(durs) > 1e-12 else 1.0
+        for c in candidates:
+            c["score"] = (float(c["volume"]) / med_v) * (float(c["duration"]) / med_d)
 
     candidates_sorted = sorted(candidates, key=lambda x: x["score"], reverse=True)
     selected = []
@@ -173,6 +205,7 @@ def greedy_level_selection(
                 "Price": round(poc_price, 2),
                 "Volume": round(total_volume, 2),
                 "Duration_Hrs": round(duration, 2),
+                "Score": round(float(s["score"]), 6),
                 "start_ts": t0,
                 "end_ts": t1,
             }
@@ -193,6 +226,13 @@ def find_pro_levels(
     top_n: int = 10,
     min_duration_hours: float = 1.0,
     final_merge_pct: Optional[float] = None,
+    max_levels: Optional[int] = None,
+    include_all_tiers: bool = True,
+    valley_merge_threshold: Optional[float] = None,
+    enable_valley_merge: bool = True,
+    return_raw: bool = False,
+    height_percentile_strong: float = 0.85,
+    height_percentile_weak: float = 0.65,
 ) -> pd.DataFrame:
     """
     smoothing_window: окно сглаживания профиля (рекомендуемо 5-7).
@@ -254,14 +294,69 @@ def find_pro_levels(
         if not np.isfinite(height_thr) or height_thr <= 0:
             height_thr = mean_sm
 
-    filtered_profile = volume_sm[volume_sm >= height_thr].sort_values(ascending=False)
-    selected_df = greedy_level_selection(
-        filtered_profile,
+    # Stage A/B: strong and weak candidate pools.
+    q_strong = min(max(float(height_percentile_strong), 0.55), 0.99)
+    q_weak = min(max(float(height_percentile_weak), 0.5), q_strong)
+    strong_thr = max(height_thr, float(volume_sm.quantile(q_strong)))
+    weak_thr = float(volume_sm.quantile(q_weak))
+    strong_profile = volume_sm[volume_sm >= strong_thr].sort_values(ascending=False)
+    weak_profile = volume_sm[volume_sm >= weak_thr].sort_values(ascending=False)
+    if strong_profile.empty and weak_profile.empty:
+        return pd.DataFrame(
+            columns=["Price", "Volume", "Duration_Hrs", "Tier", "start_utc", "end_utc"]
+        )
+    # Доп. этап: склеиваем пики с неглубокой долиной до жадного отбора.
+    vm_thr = float(valley_merge_threshold) if valley_merge_threshold is not None else float(valley_threshold)
+    vm_dist = min(max(float(merge_distance_pct), 0.0), 0.005)
+    if enable_valley_merge:
+        def _valley_merge_series(s: pd.Series) -> pd.Series:
+            if s.empty:
+                return s
+            peak_positions = np.array([int(volume_sm.index.get_loc(p)) for p in s.index], dtype=int)
+            valley_merged = merge_by_valley(
+                volume_sm, peak_positions, threshold=vm_thr, merge_distance_pct=vm_dist
+            )
+            if not valley_merged:
+                return s
+            return pd.Series({float(x["Price"]): float(x["Volume"]) for x in valley_merged}).sort_values(ascending=False)
+
+        strong_profile = _valley_merge_series(strong_profile)
+        weak_profile = _valley_merge_series(weak_profile)
+
+    eff_top_n = int(max_levels) if max_levels is not None else (len(strong_profile) + len(weak_profile))
+    if eff_top_n <= 0:
+        eff_top_n = max(len(strong_profile), len(weak_profile))
+
+    selected_strong = greedy_level_selection(
+        strong_profile,
         work,
         distance_pct=float(distance_pct),
-        top_n=int(top_n),
+        top_n=eff_top_n,
         min_duration_hours=float(min_duration_hours),
+        use_normalized_score=True,
     )
+    selected_df = selected_strong.copy()
+    if not weak_profile.empty:
+        selected_weak = greedy_level_selection(
+            weak_profile,
+            work,
+            distance_pct=float(distance_pct),
+            top_n=eff_top_n * 2,
+            min_duration_hours=float(min_duration_hours),
+            use_normalized_score=True,
+        )
+        if not selected_weak.empty and not selected_strong.empty:
+            strong_prices = selected_strong["Price"].to_numpy(dtype=np.float64)
+            keep_mask = []
+            for p in selected_weak["Price"].to_numpy(dtype=np.float64):
+                ref = np.maximum(np.minimum(np.abs(strong_prices), np.abs(p)), 1e-9)
+                near = np.any(np.abs(strong_prices - p) / ref <= float(distance_pct))
+                keep_mask.append(not near)
+            selected_weak = selected_weak.loc[keep_mask]
+        selected_df = pd.concat([selected_strong, selected_weak], ignore_index=True)
+        if not selected_df.empty:
+            selected_df = selected_df.sort_values("Score", ascending=False).head(eff_top_n).reset_index(drop=True)
+
     if selected_df.empty:
         return pd.DataFrame(
             columns=["Price", "Volume", "Duration_Hrs", "Tier", "start_utc", "end_utc"]
@@ -289,6 +384,8 @@ def find_pro_levels(
             tier = "Tier 2 (Сильный)"
         else:
             tier = "Tier 3 (Локальный)"
+        if not include_all_tiers and tier == "Tier 3 (Локальный)":
+            continue
 
         start_utc = ""
         end_utc = ""
@@ -323,8 +420,30 @@ def find_pro_levels(
                 "end_utc",
             ]
         )
-    merge_pct = float(final_merge_pct) if final_merge_pct is not None else max(0.005, float(distance_pct) * 2.0)
-    levels = _merge_close_level_rows(levels, merge_pct=merge_pct, tier1_h=tier1_h, tier2_h=tier2_h)
+    if return_raw:
+        return pd.DataFrame(levels).sort_values("Volume", ascending=False).reset_index(drop=True)
+    if final_merge_pct is not None:
+        merge_pct = float(final_merge_pct)
+    else:
+        if len(levels) >= 2:
+            ps = sorted(float(x["Price"]) for x in levels)
+            gaps = [
+                abs(ps[i + 1] - ps[i]) / max(min(abs(ps[i + 1]), abs(ps[i])), 1e-9)
+                for i in range(len(ps) - 1)
+            ]
+            med_gap = float(np.median(gaps)) if gaps else 0.0
+            merge_pct = max(0.01, med_gap * 1.5)
+        else:
+            merge_pct = max(0.01, float(distance_pct) * 2.0)
+    merge_pct = min(max(float(merge_pct), 0.003), 0.01)
+    levels = _merge_close_level_rows(
+        levels,
+        merge_pct=merge_pct,
+        tier1_h=tier1_h,
+        tier2_h=tier2_h,
+        df_original=work,
+        distance_pct=float(distance_pct),
+    )
     return pd.DataFrame(levels).sort_values("Volume", ascending=False).reset_index(drop=True)
 
 
@@ -354,7 +473,7 @@ def get_adaptive_params(df: pd.DataFrame) -> dict:
         height_mult = 1.2
 
     volume_cv = float(work["volume"].std() / (work["volume"].mean() + 1e-9))
-    valley_threshold = 0.60
+    valley_threshold = 0.40
     distance_pct = 0.003
 
     return {
@@ -362,11 +481,20 @@ def get_adaptive_params(df: pd.DataFrame) -> dict:
         "distance_pct": float(distance_pct),
         "height_mult": round(float(height_mult), 2),
         "height_percentile": 0.8,
+        "height_percentile_strong": 0.85,
+        "height_percentile_weak": 0.65,
         "smoothing_window": 5,
         "merge_distance_pct": 0.001,
         "duration_thresholds": (48.0, 12.0),
         "min_duration_hours": 6.0,
         "top_n": 10,
+        "max_levels": None,
+        "dynamic_merge_pct": min(
+            max(0.003, float((work["high"] - work["low"]).mean()) / max(current_price, 1e-9) * 1.5),
+            0.01,
+        ),
+        "valley_merge_threshold": 0.4,
+        "enable_valley_merge": True,
         "valley_threshold": float(valley_threshold),
         "volume_cv": round(float(volume_cv), 2),
         "avg_hourly_volatility": round(
@@ -385,6 +513,8 @@ def analyze_coin_zones(df: pd.DataFrame, symbol: str = "BTC/USDT") -> pd.DataFra
         df,
         smoothing_window=int(params.get("smoothing_window", 5)),
         height_percentile=float(params.get("height_percentile", 0.8)),
+        height_percentile_strong=float(params.get("height_percentile_strong", 0.85)),
+        height_percentile_weak=float(params.get("height_percentile_weak", 0.65)),
         distance_pct=float(params["distance_pct"]),
         valley_threshold=float(params["valley_threshold"]),
         merge_distance_pct=float(params.get("merge_distance_pct", 0.001)),
@@ -393,4 +523,8 @@ def analyze_coin_zones(df: pd.DataFrame, symbol: str = "BTC/USDT") -> pd.DataFra
         height_mult=float(params["height_mult"]),
         top_n=int(params.get("top_n", 10)),
         min_duration_hours=float(params.get("min_duration_hours", 6.0)),
+        max_levels=params.get("max_levels"),
+        final_merge_pct=float(params.get("dynamic_merge_pct")) if params.get("dynamic_merge_pct") is not None else None,
+        valley_merge_threshold=float(params.get("valley_merge_threshold", 0.5)),
+        enable_valley_merge=bool(params.get("enable_valley_merge", True)),
     )

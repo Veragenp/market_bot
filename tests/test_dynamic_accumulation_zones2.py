@@ -75,7 +75,7 @@ def test_get_adaptive_params_has_expected_keys():
     p = get_adaptive_params(df)
     assert "tick_size" in p and p["tick_size"] > 0
     assert "distance_pct" in p and float(p["distance_pct"]) == 0.003
-    assert float(p["valley_threshold"]) == 0.6
+    assert float(p["valley_threshold"]) == 0.4
     assert "height_mult" in p and float(p["height_mult"]) >= 1.0
 
 
@@ -106,6 +106,6 @@ def test_get_adaptive_params_alt_branch():
         {"timestamp": ts, "close": close, "high": high, "low": low, "volume": volume}
     )
     p = get_adaptive_params(df)
-    assert float(p["valley_threshold"]) == 0.6
+    assert float(p["valley_threshold"]) == 0.4
     assert float(p["height_mult"]) >= 1.0
     assert float(p["distance_pct"]) == 0.003

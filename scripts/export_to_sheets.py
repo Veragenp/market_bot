@@ -59,6 +59,12 @@ VOLUME_PEAK_LEVELS_WORKSHEET = os.getenv(
 PRO_LEVELS_HEIGHT_MULT = os.getenv("PRO_LEVELS_HEIGHT_MULT")
 PRO_LEVELS_DISTANCE_PCT = os.getenv("PRO_LEVELS_DISTANCE_PCT")
 PRO_LEVELS_VALLEY_THRESHOLD = os.getenv("PRO_LEVELS_VALLEY_THRESHOLD")
+PRO_LEVELS_MIN_DURATION_HOURS = os.getenv("PRO_LEVELS_MIN_DURATION_HOURS")
+PRO_LEVELS_MAX_LEVELS = os.getenv("PRO_LEVELS_MAX_LEVELS")
+PRO_LEVELS_INCLUDE_ALL_TIERS = os.getenv("PRO_LEVELS_INCLUDE_ALL_TIERS")
+PRO_LEVELS_FINAL_MERGE_PCT = os.getenv("PRO_LEVELS_FINAL_MERGE_PCT")
+PRO_LEVELS_VALLEY_MERGE_THRESHOLD = os.getenv("PRO_LEVELS_VALLEY_MERGE_THRESHOLD")
+PRO_LEVELS_ENABLE_VALLEY_MERGE = os.getenv("PRO_LEVELS_ENABLE_VALLEY_MERGE", "true")
 
 
 def _ts_to_iso_utc(ts: int) -> str:
@@ -477,6 +483,21 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
     volume_cv = float(params["volume_cv"])
     top_n = int(params.get("top_n", 10))
     min_duration_hours = float(params.get("min_duration_hours", 6.0))
+    max_levels: int | None = params.get("max_levels")
+    if PRO_LEVELS_MIN_DURATION_HOURS is not None and str(PRO_LEVELS_MIN_DURATION_HOURS).strip() != "":
+        min_duration_hours = float(PRO_LEVELS_MIN_DURATION_HOURS)
+    if PRO_LEVELS_MAX_LEVELS is not None and str(PRO_LEVELS_MAX_LEVELS).strip() != "":
+        max_levels = int(PRO_LEVELS_MAX_LEVELS)
+    include_all_tiers = True
+    if PRO_LEVELS_INCLUDE_ALL_TIERS is not None and str(PRO_LEVELS_INCLUDE_ALL_TIERS).strip() != "":
+        include_all_tiers = str(PRO_LEVELS_INCLUDE_ALL_TIERS).strip().lower() not in ("0", "false", "no", "off")
+    final_merge_pct: float | None = params.get("dynamic_merge_pct")
+    if PRO_LEVELS_FINAL_MERGE_PCT is not None and str(PRO_LEVELS_FINAL_MERGE_PCT).strip() != "":
+        final_merge_pct = float(PRO_LEVELS_FINAL_MERGE_PCT)
+    valley_merge_threshold = float(params.get("valley_merge_threshold", 0.5))
+    if PRO_LEVELS_VALLEY_MERGE_THRESHOLD is not None and str(PRO_LEVELS_VALLEY_MERGE_THRESHOLD).strip() != "":
+        valley_merge_threshold = float(PRO_LEVELS_VALLEY_MERGE_THRESHOLD)
+    enable_valley_merge = str(PRO_LEVELS_ENABLE_VALLEY_MERGE).strip().lower() == "true"
     real_min_tick = float(params.get("real_min_tick", 0.0))
     price_band_usdt = float(params.get("price_band_usdt", 0.0))
     base_meta = {
@@ -489,12 +510,17 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         "volume_cv": volume_cv,
         "top_n": top_n,
         "min_duration_hours": min_duration_hours,
+        "max_levels": "" if max_levels is None else max_levels,
+        "include_all_tiers": include_all_tiers,
+        "final_merge_pct": "" if final_merge_pct is None else final_merge_pct,
+        "valley_merge_threshold": valley_merge_threshold,
+        "enable_valley_merge": enable_valley_merge,
         "real_min_tick": real_min_tick,
         "price_band_usdt": price_band_usdt,
     }
 
     try:
-        raw = find_pro_levels(
+        raw_levels = find_pro_levels(
             work,
             height_mult=height_mult,
             distance_pct=distance_pct,
@@ -502,16 +528,40 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
             tick_size=tick_size,
             top_n=top_n,
             min_duration_hours=min_duration_hours,
+            max_levels=max_levels,
+            include_all_tiers=include_all_tiers,
+            final_merge_pct=final_merge_pct,
+            valley_merge_threshold=valley_merge_threshold,
+            enable_valley_merge=enable_valley_merge,
+            return_raw=True,
+        )
+        final_levels = find_pro_levels(
+            work,
+            height_mult=height_mult,
+            distance_pct=distance_pct,
+            valley_threshold=valley_threshold,
+            tick_size=tick_size,
+            top_n=top_n,
+            min_duration_hours=min_duration_hours,
+            max_levels=max_levels,
+            include_all_tiers=include_all_tiers,
+            final_merge_pct=final_merge_pct,
+            valley_merge_threshold=valley_merge_threshold,
+            enable_valley_merge=enable_valley_merge,
+        )
+        print(
+            f"[{symbol} {month_label}] levels raw={len(raw_levels)} final={len(final_levels)} "
+            f"merge_pct={final_merge_pct} valley_merge={enable_valley_merge} vm_thr={valley_merge_threshold}"
         )
     except RuntimeError as e:
         row = {**base_meta, "note": str(e)}
         return pd.DataFrame([row])
 
-    if raw.empty:
+    if final_levels.empty:
         row = {**base_meta, "note": "Нет пиков по заданным height_mult / distance_pct"}
         return pd.DataFrame([row])
 
-    out = raw.copy()
+    out = final_levels.copy()
     out.insert(0, "symbol", symbol)
     out.insert(1, "month_utc", month_label)
     out["exported_at_utc"] = exported_at
@@ -523,6 +573,11 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
     out["volume_cv"] = volume_cv
     out["top_n"] = top_n
     out["min_duration_hours"] = min_duration_hours
+    out["max_levels"] = "" if max_levels is None else max_levels
+    out["include_all_tiers"] = include_all_tiers
+    out["final_merge_pct"] = "" if final_merge_pct is None else final_merge_pct
+    out["valley_merge_threshold"] = valley_merge_threshold
+    out["enable_valley_merge"] = enable_valley_merge
     out["real_min_tick"] = real_min_tick
     out["price_band_usdt"] = price_band_usdt
     out = out.rename(
@@ -545,6 +600,11 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         "volume_cv",
         "top_n",
         "min_duration_hours",
+        "max_levels",
+        "include_all_tiers",
+        "final_merge_pct",
+        "valley_merge_threshold",
+        "enable_valley_merge",
         "real_min_tick",
         "price_band_usdt",
         "Цена уровня",
