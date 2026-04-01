@@ -11,6 +11,7 @@ from trading_bot.analytics.dynamic_accumulation_zones import (
     assign_tiers_by_original_spec,
     find_accumulation_zones,
     hour_volume_profile,
+    cluster_merge_zones,
     merge_close_zones_weighted,
     poc_from_profile,
     rescan_to_master_levels,
@@ -140,29 +141,74 @@ def test_take_top_n_per_price_band():
     assert set(prices_72k) == {72_000.0, 72_100.0}
 
 
-def test_merge_close_zones_weighted_example():
-    """66689/66891 ~0.3%% < 0.5%%; взвешенная цена и суммарный объём."""
+def test_cluster_merge_zones_weighted_by_time_chain():
+    """Порядок по времени; коридор 1.5%%; взвешенная цена и объём."""
     z = [
         AccumulationZone(66_689.0, 1580.0, 10.0, 100, 200),
-        AccumulationZone(66_891.0, 1084.0, 8.0, 150, 250),
+        AccumulationZone(66_891.0, 1084.0, 8.0, 210, 290),
     ]
-    out = merge_close_zones_weighted(z, merge_threshold_pct=0.005)
+    out = cluster_merge_zones(z, max_gap_pct=0.015, max_time_gap_hours=None)
     assert len(out) == 1
     exp_p = (66_689.0 * 1580.0 + 66_891.0 * 1084.0) / (1580.0 + 1084.0)
     assert abs(out[0].poc_price - round(exp_p, 2)) < 0.02
     assert out[0].total_volume == 1580.0 + 1084.0
     assert out[0].duration_hours == 18.0
     assert out[0].t_start == 100
-    assert out[0].t_end == 250
+    assert out[0].t_end == 290
 
 
-def test_merge_close_zones_weighted_no_merge_when_far():
+def test_cluster_merge_zones_no_merge_when_price_far():
     z = [
-        AccumulationZone(100.0, 10.0, 1.0, 0, 1),
-        AccumulationZone(110.0, 10.0, 1.0, 0, 1),
+        AccumulationZone(100.0, 10.0, 1.0, 0, 100),
+        AccumulationZone(110.0, 10.0, 1.0, 101, 200),
+    ]
+    out = cluster_merge_zones(z, max_gap_pct=0.015, max_time_gap_hours=None)
+    assert len(out) == 2
+
+
+def test_cluster_merge_zones_time_gap_splits_despite_close_price():
+    """Разрыв между интервалами больше лимита — не склеиваем, даже при близкой цене."""
+    z = [
+        AccumulationZone(70_000.0, 100.0, 4.0, 1_000_000, 1_000_100),
+        AccumulationZone(70_100.0, 100.0, 4.0, 5_000_000, 5_000_100),
+    ]
+    out = cluster_merge_zones(z, max_gap_pct=0.015, max_time_gap_hours=24.0)
+    assert len(out) == 2
+
+
+def test_cluster_merge_transitive_outer_levels_close_middle_breaks_greedy():
+    """70387 и 70674 близки по цене; посередине «чужая» цена — жадная цепочка бы разорвала, граф склеит края."""
+    z = [
+        AccumulationZone(70_387.0, 50.0, 4.0, 1000, 1100),
+        AccumulationZone(80_000.0, 50.0, 4.0, 1200, 1300),
+        AccumulationZone(70_674.0, 50.0, 4.0, 1400, 1500),
+    ]
+    out = cluster_merge_zones(z, max_gap_pct=0.02, max_time_gap_hours=24.0)
+    assert len(out) == 2
+    prices = sorted(z.poc_price for z in out)
+    assert min(prices) < 71_000.0
+    assert max(prices) > 79_000.0
+
+
+def test_user_example_68284_69636_merges_at_two_percent():
+    z = [
+        AccumulationZone(68_284.48, 100.0, 4.0, 100, 200),
+        AccumulationZone(69_636.51, 100.0, 4.0, 250, 350),
+    ]
+    out = cluster_merge_zones(z, max_gap_pct=0.02, max_time_gap_hours=None)
+    assert len(out) == 1
+    out015 = cluster_merge_zones(z, max_gap_pct=0.015, max_time_gap_hours=None)
+    assert len(out015) == 2
+
+
+def test_merge_close_zones_weighted_legacy_price_sorted():
+    """Старое слияние по соседству на отсортированной цене (совместимость)."""
+    z = [
+        AccumulationZone(66_689.0, 1580.0, 10.0, 100, 200),
+        AccumulationZone(66_891.0, 1084.0, 8.0, 150, 250),
     ]
     out = merge_close_zones_weighted(z, merge_threshold_pct=0.005)
-    assert len(out) == 2
+    assert len(out) == 1
 
 
 def test_take_top_n_per_price_band_detailed_explains_drop():

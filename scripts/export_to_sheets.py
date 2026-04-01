@@ -21,11 +21,17 @@ from config import (
 from trading_bot.data.db import get_connection
 from trading_bot.data.schema import init_db
 from trading_bot.analytics.dynamic_accumulation_zones import (
+    DEFAULT_CLUSTER_MERGE_MAX_GAP_PCT,
+    DEFAULT_CLUSTER_MERGE_MAX_TIME_GAP_HOURS,
     DEFAULT_CLUSTER_THRESHOLD_PCT,
     DEFAULT_POC_MERGE_THRESHOLD_PCT,
     DEFAULT_PRICE_BAND_TICK_MULTIPLIER,
-    DEFAULT_WEIGHTED_MERGE_THRESHOLD_PCT,
     run_pipeline,
+    slice_calendar_month_utc,
+)
+from trading_bot.analytics.volume_profile_peaks import (
+    find_pro_levels,
+    get_adaptive_params,
 )
 from trading_bot.data.repositories import get_ohlcv_filled
 from trading_bot.tools.sheets_exporter import SheetsExporter
@@ -34,7 +40,7 @@ SHEET_TITLE = os.getenv("MARKET_AUDIT_SHEET_TITLE", "Market Data Audit")
 CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 SHEET_URL = os.getenv("MARKET_AUDIT_SHEET_URL")
 SHEET_ID = os.getenv("MARKET_AUDIT_SHEET_ID")
-DYNAMIC_ZONES_SYMBOL = os.getenv("DYNAMIC_ZONES_SYMBOL", "BTC/USDT")
+DYNAMIC_ZONES_SYMBOL = os.getenv("DYNAMIC_ZONES_SYMBOL", "ENA/USDT")
 DYNAMIC_ZONES_YEAR = os.getenv("DYNAMIC_ZONES_YEAR")
 DYNAMIC_ZONES_MONTH = os.getenv("DYNAMIC_ZONES_MONTH")
 DYNAMIC_ZONES_BIN_STEP_USDT = os.getenv("DYNAMIC_ZONES_BIN_STEP_USDT")
@@ -42,11 +48,31 @@ DYNAMIC_ZONES_POC_THRESHOLD_PCT = os.getenv("DYNAMIC_ZONES_POC_THRESHOLD_PCT")
 DYNAMIC_ZONES_CLUSTER_PCT = os.getenv("DYNAMIC_ZONES_CLUSTER_PCT")
 DYNAMIC_ZONES_TOP_N_PER_BAND = os.getenv("DYNAMIC_ZONES_TOP_N_PER_BAND")
 DYNAMIC_ZONES_PRICE_BAND_USDT = os.getenv("DYNAMIC_ZONES_PRICE_BAND_USDT")
+DYNAMIC_ZONES_CLUSTER_MERGE_GAP_PCT = os.getenv("DYNAMIC_ZONES_CLUSTER_MERGE_GAP_PCT")
+DYNAMIC_ZONES_CLUSTER_MERGE_TIME_GAP_HOURS = os.getenv("DYNAMIC_ZONES_CLUSTER_MERGE_TIME_GAP_HOURS")
+# Совместимость со старым именем (коридор цены для пост-склейки)
 DYNAMIC_ZONES_WEIGHTED_MERGE_PCT = os.getenv("DYNAMIC_ZONES_WEIGHTED_MERGE_PCT")
+# Вкладка с пиками профиля объёма (старое имя DBSCAN_ZONES_WORKSHEET сохраняем для совместимости)
+VOLUME_PEAK_LEVELS_WORKSHEET = os.getenv(
+    "VOLUME_PEAK_LEVELS_WORKSHEET"
+) or os.getenv("DBSCAN_ZONES_WORKSHEET", "dynamic_accumulation_zones_dbscan")
+PRO_LEVELS_HEIGHT_MULT = os.getenv("PRO_LEVELS_HEIGHT_MULT")
+PRO_LEVELS_DISTANCE_PCT = os.getenv("PRO_LEVELS_DISTANCE_PCT")
+PRO_LEVELS_VALLEY_THRESHOLD = os.getenv("PRO_LEVELS_VALLEY_THRESHOLD")
 
 
 def _ts_to_iso_utc(ts: int) -> str:
     return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+
+
+def _parse_cluster_merge_time_gap_hours(raw: str | None) -> float | None:
+    """Пусто → дефолт из модуля; none/off → без лимита разрыва по времени."""
+    if raw is None or str(raw).strip() == "":
+        return float(DEFAULT_CLUSTER_MERGE_MAX_TIME_GAP_HOURS)
+    s = str(raw).strip().lower()
+    if s in ("none", "off", "false", "-1"):
+        return None
+    return float(s)
 
 
 def _fetch_ohlcv_sample(
@@ -291,10 +317,15 @@ def _fetch_dynamic_accumulation_zones_for_sheet(symbol: str) -> pd.DataFrame:
         year, month = _default_prev_calendar_month_utc()
 
     dz_kwargs: dict = {"rescan": False, "top_n_per_band": 0}
-    wm_thr_used: float = DEFAULT_WEIGHTED_MERGE_THRESHOLD_PCT
-    if DYNAMIC_ZONES_WEIGHTED_MERGE_PCT is not None and str(DYNAMIC_ZONES_WEIGHTED_MERGE_PCT).strip() != "":
-        wm_thr_used = float(DYNAMIC_ZONES_WEIGHTED_MERGE_PCT)
-    dz_kwargs["weighted_merge_threshold_pct"] = wm_thr_used if wm_thr_used > 0 else None
+    gap_used: float = float(DEFAULT_CLUSTER_MERGE_MAX_GAP_PCT)
+    if DYNAMIC_ZONES_CLUSTER_MERGE_GAP_PCT is not None and str(DYNAMIC_ZONES_CLUSTER_MERGE_GAP_PCT).strip() != "":
+        gap_used = float(DYNAMIC_ZONES_CLUSTER_MERGE_GAP_PCT)
+    elif DYNAMIC_ZONES_WEIGHTED_MERGE_PCT is not None and str(DYNAMIC_ZONES_WEIGHTED_MERGE_PCT).strip() != "":
+        gap_used = float(DYNAMIC_ZONES_WEIGHTED_MERGE_PCT)
+    dz_kwargs["cluster_merge_max_gap_pct"] = gap_used if gap_used > 0 else None
+    dz_kwargs["cluster_merge_max_time_gap_hours"] = _parse_cluster_merge_time_gap_hours(
+        DYNAMIC_ZONES_CLUSTER_MERGE_TIME_GAP_HOURS
+    )
 
     if DYNAMIC_ZONES_BIN_STEP_USDT:
         dz_kwargs["zone_bin_step_usdt"] = float(DYNAMIC_ZONES_BIN_STEP_USDT)
@@ -348,7 +379,8 @@ def _fetch_dynamic_accumulation_zones_for_sheet(symbol: str) -> pd.DataFrame:
                     if band_w_used is not None
                     else (DEFAULT_PRICE_BAND_TICK_MULTIPLIER * float(bin_step) if bin_step else ""),
                     "rescan": dz_kwargs.get("rescan", False),
-                    "weighted_merge_threshold_pct": dz_kwargs.get("weighted_merge_threshold_pct") or 0.0,
+                    "cluster_merge_max_gap_pct": dz_kwargs.get("cluster_merge_max_gap_pct") or 0.0,
+                    "cluster_merge_max_time_gap_hours": dz_kwargs.get("cluster_merge_max_time_gap_hours"),
                     "note": "Нет зон или нет 1m данных за выбранный месяц",
                     "exported_at_utc": exported_at,
                 }
@@ -370,7 +402,9 @@ def _fetch_dynamic_accumulation_zones_for_sheet(symbol: str) -> pd.DataFrame:
     out["top_n_per_band"] = top_n_used if top_n_used is not None else 0
     out["price_band_usdt"] = round(float(band_meta), 4)
     out["rescan"] = bool(dz_kwargs.get("rescan", False))
-    out["weighted_merge_threshold_pct"] = float(dz_kwargs.get("weighted_merge_threshold_pct") or 0.0)
+    out["cluster_merge_max_gap_pct"] = float(dz_kwargs.get("cluster_merge_max_gap_pct") or 0.0)
+    _tg = dz_kwargs.get("cluster_merge_max_time_gap_hours")
+    out["cluster_merge_max_time_gap_hours"] = "" if _tg is None else float(_tg)
     out["exported_at_utc"] = exported_at
     cols = [
         "symbol",
@@ -382,7 +416,8 @@ def _fetch_dynamic_accumulation_zones_for_sheet(symbol: str) -> pd.DataFrame:
         "rescan",
         "top_n_per_band",
         "price_band_usdt",
-        "weighted_merge_threshold_pct",
+        "cluster_merge_max_gap_pct",
+        "cluster_merge_max_time_gap_hours",
         "Цена уровня",
         "Суммарный объем",
         "Время жизни (ч)",
@@ -391,6 +426,115 @@ def _fetch_dynamic_accumulation_zones_for_sheet(symbol: str) -> pd.DataFrame:
         "t_end_utc",
         "t_start_unix",
         "t_end_unix",
+    ]
+    return out[[c for c in cols if c in out.columns]]
+
+
+def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
+    """Пики профиля объёма (1m, тот же календарный месяц UTC, что и dynamic_accumulation_zones)."""
+    conn = get_connection()
+    df = pd.read_sql_query(
+        """
+        SELECT timestamp, open, high, low, close, volume
+        FROM ohlcv
+        WHERE symbol = ? AND timeframe = '1m'
+        ORDER BY timestamp
+        """,
+        conn,
+        params=(symbol,),
+    )
+    conn.close()
+
+    year: int | None = None
+    month: int | None = None
+    if DYNAMIC_ZONES_YEAR and DYNAMIC_ZONES_MONTH:
+        year = int(DYNAMIC_ZONES_YEAR)
+        month = int(DYNAMIC_ZONES_MONTH)
+    if year is None or month is None:
+        year, month = _default_prev_calendar_month_utc()
+
+    exported_at = datetime.now(timezone.utc).isoformat()
+    month_label = f"{year}-{month:02d}"
+    base_meta = {"symbol": symbol, "month_utc": month_label, "exported_at_utc": exported_at}
+
+    work = slice_calendar_month_utc(df, year, month)
+    if work.empty:
+        row = {**base_meta, "note": "Нет 1m данных за выбранный месяц"}
+        return pd.DataFrame([row])
+
+    params = get_adaptive_params(work)
+    height_mult = float(PRO_LEVELS_HEIGHT_MULT) if PRO_LEVELS_HEIGHT_MULT else float(params["height_mult"])
+    distance_pct = (
+        float(PRO_LEVELS_DISTANCE_PCT) if PRO_LEVELS_DISTANCE_PCT else float(params["distance_pct"])
+    )
+    valley_threshold = (
+        float(PRO_LEVELS_VALLEY_THRESHOLD)
+        if PRO_LEVELS_VALLEY_THRESHOLD
+        else float(params["valley_threshold"])
+    )
+    tick_size = float(params["tick_size"])
+    avg_hourly_volatility = float(params["avg_hourly_volatility"])
+    volume_cv = float(params["volume_cv"])
+    base_meta = {
+        **base_meta,
+        "height_mult": height_mult,
+        "distance_pct": distance_pct,
+        "valley_threshold": valley_threshold,
+        "tick_size": tick_size,
+        "avg_hourly_volatility": avg_hourly_volatility,
+        "volume_cv": volume_cv,
+    }
+
+    try:
+        raw = find_pro_levels(
+            work,
+            height_mult=height_mult,
+            distance_pct=distance_pct,
+            valley_threshold=valley_threshold,
+            tick_size=tick_size,
+        )
+    except RuntimeError as e:
+        row = {**base_meta, "note": str(e)}
+        return pd.DataFrame([row])
+
+    if raw.empty:
+        row = {**base_meta, "note": "Нет пиков по заданным height_mult / distance_pct"}
+        return pd.DataFrame([row])
+
+    out = raw.copy()
+    out.insert(0, "symbol", symbol)
+    out.insert(1, "month_utc", month_label)
+    out["exported_at_utc"] = exported_at
+    out["height_mult"] = height_mult
+    out["distance_pct"] = distance_pct
+    out["valley_threshold"] = valley_threshold
+    out["tick_size"] = tick_size
+    out["avg_hourly_volatility"] = avg_hourly_volatility
+    out["volume_cv"] = volume_cv
+    out = out.rename(
+        columns={
+            "Price": "Цена уровня",
+            "Volume": "Суммарный объем",
+            "Duration_Hrs": "Время жизни (ч)",
+            "Tier": "Сила (Tier)",
+        }
+    )
+    cols = [
+        "symbol",
+        "month_utc",
+        "exported_at_utc",
+        "height_mult",
+        "distance_pct",
+        "valley_threshold",
+        "tick_size",
+        "avg_hourly_volatility",
+        "volume_cv",
+        "Цена уровня",
+        "Суммарный объем",
+        "Время жизни (ч)",
+        "Сила (Tier)",
+        "start_utc",
+        "end_utc",
     ]
     return out[[c for c in cols if c in out.columns]]
 
@@ -498,6 +642,19 @@ def main() -> None:
             "source": "dynamic_accumulation_zones",
             "worksheet": "dynamic_accumulation_zones",
             "rows": len(df_dyn_zones),
+            "last_exported_at_utc": exported_at,
+        }
+    )
+
+    df_peak_levels = _fetch_volume_peak_levels_for_sheet(DYNAMIC_ZONES_SYMBOL)
+    exporter.export_dataframe_to_sheet(
+        df_peak_levels, SHEET_TITLE, VOLUME_PEAK_LEVELS_WORKSHEET
+    )
+    audit_entries.append(
+        {
+            "source": "volume_profile_peaks",
+            "worksheet": VOLUME_PEAK_LEVELS_WORKSHEET,
+            "rows": len(df_peak_levels),
             "last_exported_at_utc": exported_at,
         }
     )

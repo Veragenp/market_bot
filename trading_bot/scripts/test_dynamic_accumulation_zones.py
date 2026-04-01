@@ -16,9 +16,10 @@ from typing import Optional
 import pandas as pd
 
 from trading_bot.analytics.dynamic_accumulation_zones import (
+    DEFAULT_CLUSTER_MERGE_MAX_GAP_PCT,
+    DEFAULT_CLUSTER_MERGE_MAX_TIME_GAP_HOURS,
     DEFAULT_CLUSTER_THRESHOLD_PCT,
     DEFAULT_POC_MERGE_THRESHOLD_PCT,
-    DEFAULT_WEIGHTED_MERGE_THRESHOLD_PCT,
     run_pipeline,
 )
 from trading_bot.config.settings import DB_PATH
@@ -98,17 +99,26 @@ def main() -> None:
         help="Ширина ценовой полосы USDT для top-N (default: 50 × tick_step)",
     )
     p.add_argument(
-        "--no-weighted-merge",
+        "--no-cluster-merge",
         action="store_true",
-        help="Отключить взвешенное слияние близких по цене зон после скана",
+        help="Отключить пост-склейку зон по времени и коридору цены",
     )
     p.add_argument(
-        "--weighted-merge-pct",
+        "--cluster-merge-gap-pct",
         type=float,
         default=None,
         help=(
-            "Порог слияния соседних по цене зон: (p_high−p_low)/p_lower "
-            f"(default {DEFAULT_WEIGHTED_MERGE_THRESHOLD_PCT} = 0.5%%); 0 — отключить"
+            "Коридор цены |Δp|/|p_cluster| при склейке по цепочке времени "
+            f"(default {DEFAULT_CLUSTER_MERGE_MAX_GAP_PCT} = 2%%); 0 — отключить"
+        ),
+    )
+    p.add_argument(
+        "--cluster-merge-time-gap-hours",
+        type=float,
+        default=None,
+        help=(
+            "Макс. разрыв (ч) между t_end кластера и t_start следующей зоны; "
+            f"default {DEFAULT_CLUSTER_MERGE_MAX_TIME_GAP_HOURS} ч; -1 — не ограничивать"
         ),
     )
     args = p.parse_args()
@@ -143,25 +153,35 @@ def main() -> None:
         rp_kw["top_n_per_band"] = max(0, args.top_n_per_band)
     if args.price_band_usdt is not None:
         rp_kw["price_band_usdt"] = args.price_band_usdt
-    if args.no_weighted_merge:
-        rp_kw["weighted_merge_threshold_pct"] = None
-    elif args.weighted_merge_pct is not None:
-        rp_kw["weighted_merge_threshold_pct"] = (
-            args.weighted_merge_pct if args.weighted_merge_pct > 0 else None
+    if args.no_cluster_merge:
+        rp_kw["cluster_merge_max_gap_pct"] = None
+    elif args.cluster_merge_gap_pct is not None:
+        rp_kw["cluster_merge_max_gap_pct"] = (
+            args.cluster_merge_gap_pct if args.cluster_merge_gap_pct > 0 else None
         )
+    if args.cluster_merge_time_gap_hours is not None:
+        if args.cluster_merge_time_gap_hours < 0:
+            rp_kw["cluster_merge_max_time_gap_hours"] = None
+        else:
+            rp_kw["cluster_merge_max_time_gap_hours"] = args.cluster_merge_time_gap_hours
 
     out, step = run_pipeline(df, year=year, month=month, **rp_kw)
 
     thr = args.poc_threshold_pct if args.poc_threshold_pct is not None else DEFAULT_POC_MERGE_THRESHOLD_PCT
     cl = args.cluster_pct if args.cluster_pct is not None else DEFAULT_CLUSTER_THRESHOLD_PCT
-    if "weighted_merge_threshold_pct" not in rp_kw:
-        wm_disp: float | None = DEFAULT_WEIGHTED_MERGE_THRESHOLD_PCT
+    if "cluster_merge_max_gap_pct" not in rp_kw:
+        gap_disp: float | None = DEFAULT_CLUSTER_MERGE_MAX_GAP_PCT
     else:
-        wm_disp = rp_kw["weighted_merge_threshold_pct"]
-    wm_s = "off" if wm_disp is None else f"{wm_disp} ({100 * float(wm_disp):.3f}%)"
+        gap_disp = rp_kw["cluster_merge_max_gap_pct"]
+    gap_s = "off" if gap_disp is None else f"{gap_disp} ({100 * float(gap_disp):.3f}%)"
+    if "cluster_merge_max_time_gap_hours" not in rp_kw:
+        tg_disp: float | None = DEFAULT_CLUSTER_MERGE_MAX_TIME_GAP_HOURS
+    else:
+        tg_disp = rp_kw["cluster_merge_max_time_gap_hours"]
+    tg_s = "no_limit" if tg_disp is None else f"{tg_disp}h"
     print(
         f"tick_step: {step:g}; merge_threshold: {thr} ({100 * thr:.3f}%); "
-        f"rescan: {args.rescan}; cluster_pct: {cl}; weighted_merge: {wm_s}"
+        f"rescan: {args.rescan}; cluster_pct: {cl}; cluster_merge_gap: {gap_s}; time_gap: {tg_s}"
     )
     print(f"zones found: {len(out)}")
     if out.empty:

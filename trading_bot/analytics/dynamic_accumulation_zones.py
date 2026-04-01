@@ -10,9 +10,9 @@
 4) Сила: Tier 1 — длительность > 48 ч и объём > 3× среднего объёма по всем зонам месяца;
    Tier 2 — длительность > 12 ч; Tier 3 — от 4 до 12 ч (включительно по верхней границе).
 
-После первичного списка зон (и опционально rescan / top-N): слияние близких по цене уровней
-взвешенно по объёму — см. merge_close_zones_weighted (порог по умолчанию 0.5%% между соседями
-по отсортированной цене).
+После первичного списка зон (и опционально rescan / top-N): **cluster_merge_zones** — транзитивно
+(union-find): пара зон объединяем, если симметричный коридор по цене и (опционально) зазор между
+интервалами по времени не больше лимита; см. DEFAULT_CLUSTER_MERGE_MAX_GAP_PCT / MAX_TIME_GAP_HOURS.
 
 Дополнительно (не по умолчанию): кластеризация первичных зон, Master POC, отбор top-N
 по ценовым полосам — см. run_pipeline(rescan=True, ...).
@@ -33,7 +33,13 @@ DEFAULT_POC_MERGE_THRESHOLD_PCT = 0.001
 DEFAULT_CLUSTER_THRESHOLD_PCT = 0.01
 DEFAULT_TOP_N_PER_BAND = 3
 DEFAULT_PRICE_BAND_TICK_MULTIPLIER = 50
-# Слияние соседних по цене зон: |p2−p1|/p_lower ≤ порога (по умолчанию 0.5%%)
+# Пост-склейка: |Δp|/min(p1,p2). 2%% склеивало далёкие по смыслу POC (~1.98%%) в один уровень;
+# 1.5%% оставляет отдельными сильные близкие, но не идентичные зоны.
+DEFAULT_CLUSTER_MERGE_MAX_GAP_PCT = 0.015
+# Макс. зазор между интервалами (ч). 24ч — мало; 240ч — слишком сильная транзитивная склейка.
+# 5 суток — компромисс для месячных данных.
+DEFAULT_CLUSTER_MERGE_MAX_TIME_GAP_HOURS = 120.0
+# Устарело: старое слияние по соседству на отсортированной цене (оставлено для совместимости)
 DEFAULT_WEIGHTED_MERGE_THRESHOLD_PCT = 0.005
 # Устаревшее имя: явный фиксированный шаг USDT, если не задавать — берётся max(10, 0.02%%)
 DEFAULT_ZONE_BIN_STEP_USDT: Optional[float] = None
@@ -46,6 +52,9 @@ __all__ = [
     "DEFAULT_TOP_N_PER_BAND",
     "DEFAULT_PRICE_BAND_TICK_MULTIPLIER",
     "DEFAULT_WEIGHTED_MERGE_THRESHOLD_PCT",
+    "DEFAULT_CLUSTER_MERGE_MAX_GAP_PCT",
+    "DEFAULT_CLUSTER_MERGE_MAX_TIME_GAP_HOURS",
+    "cluster_merge_zones",
     "merge_close_zones_weighted",
     "take_top_n_per_price_band",
     "take_top_n_per_price_band_detailed",
@@ -406,13 +415,115 @@ def take_top_n_per_price_band(
     return kept
 
 
+def _interval_separation_seconds(t0_a: int, t1_a: int, t0_b: int, t1_b: int) -> float:
+    """Минимальный зазор между двумя отрезками [t0,t1] по unix; 0 если пересекаются или касаются."""
+    a0, a1 = int(t0_a), int(t1_a)
+    b0, b1 = int(t0_b), int(t1_b)
+    if a1 < b0:
+        return float(b0 - a1)
+    if b1 < a0:
+        return float(a0 - b1)
+    return 0.0
+
+
+def cluster_merge_zones(
+    zones: List[AccumulationZone],
+    *,
+    max_gap_pct: float = DEFAULT_CLUSTER_MERGE_MAX_GAP_PCT,
+    max_time_gap_hours: Optional[float] = DEFAULT_CLUSTER_MERGE_MAX_TIME_GAP_HOURS,
+) -> List[AccumulationZone]:
+    """
+    Транзитивное слияние (union-find по парам зон):
+
+    - Симметричный коридор цены: |p_i − p_j| / max(min(|p_i|, |p_j|), ε) ≤ max_gap_pct.
+    - Время: если задан max_time_gap_hours, между интервалами [t_start,t_end] зазор (как между
+      отрезками) не больше этого лимита; при перекрытии зазор 0. Если лимит None — по времени
+      между парой не режем (осторожно на длинных дистанциях).
+
+    Компонента схлопывается в одну зону: цена взвешена по объёму, объём и часы суммируются,
+    t_start/t_end — min/max по всем участникам.
+
+    Так убираем «разрыв жадной цепочки»: две близкие по цене зоны с разным POC посередине
+    по времени всё равно не склеятся, если с середины до каждой из них разрыв > лимита; но
+    если крайние близки по цене и между их интервалами зазор в пределах лимита — склеятся.
+    """
+    if max_gap_pct <= 0.0:
+        return list(zones)
+    if len(zones) <= 1:
+        return list(zones)
+
+    zs = list(zones)
+    n = len(zs)
+    parent = list(range(n))
+
+    def uf_find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def uf_union(a: int, b: int) -> None:
+        ra, rb = uf_find(a), uf_find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    max_sec = float(max_time_gap_hours) * 3600.0 if max_time_gap_hours is not None else None
+
+    for i in range(n):
+        pi = float(zs[i].poc_price)
+        for j in range(i + 1, n):
+            pj = float(zs[j].poc_price)
+            p_lo = min(abs(pi), abs(pj))
+            denom = p_lo if p_lo > 1e-9 else 1.0
+            if abs(pi - pj) / denom > max_gap_pct:
+                continue
+            if max_sec is not None:
+                sep = _interval_separation_seconds(
+                    zs[i].t_start,
+                    zs[i].t_end,
+                    zs[j].t_start,
+                    zs[j].t_end,
+                )
+                if sep > max_sec:
+                    continue
+            uf_union(i, j)
+
+    groups: Dict[int, List[int]] = {}
+    for i in range(n):
+        r = uf_find(i)
+        groups.setdefault(r, []).append(i)
+
+    out: List[AccumulationZone] = []
+    for _root, idxs in sorted(groups.items(), key=lambda x: min(zs[k].t_start for k in x[1])):
+        members = [zs[k] for k in idxs]
+        vtot = sum(float(z.total_volume) for z in members)
+        if vtot > 0.0:
+            p_new = sum(float(z.poc_price) * float(z.total_volume) for z in members) / vtot
+        else:
+            p_new = sum(float(z.poc_price) for z in members) / max(len(members), 1)
+        dtot = sum(float(z.duration_hours) for z in members)
+        t0 = min(int(z.t_start) for z in members)
+        t1 = max(int(z.t_end) for z in members)
+        out.append(
+            AccumulationZone(
+                poc_price=round(float(p_new), 2),
+                total_volume=float(vtot),
+                duration_hours=float(dtot),
+                t_start=t0,
+                t_end=t1,
+                tier="",
+            )
+        )
+    return out
+
+
 def merge_close_zones_weighted(
     zones: List[AccumulationZone],
     *,
     merge_threshold_pct: float = DEFAULT_WEIGHTED_MERGE_THRESHOLD_PCT,
 ) -> List[AccumulationZone]:
     """
-    Сортируем зоны по цене POC; пока за проход находится пара соседей с
+    Устаревший режим: сортируем зоны по цене POC; пока за проход находится пара соседей с
     |p2 − p1| / p_lower ≤ merge_threshold_pct — объединяем:
 
     - новая цена = (p1*V1 + p2*V2) / (V1+V2);
@@ -542,12 +653,14 @@ def run_pipeline(
     price_band_usdt: Optional[float] = None,
     price_band_tick_multiplier: float = DEFAULT_PRICE_BAND_TICK_MULTIPLIER,
     month_slice: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
-    weighted_merge_threshold_pct: Optional[float] = DEFAULT_WEIGHTED_MERGE_THRESHOLD_PCT,
+    cluster_merge_max_gap_pct: Optional[float] = DEFAULT_CLUSTER_MERGE_MAX_GAP_PCT,
+    cluster_merge_max_time_gap_hours: Optional[float] = DEFAULT_CLUSTER_MERGE_MAX_TIME_GAP_HOURS,
 ) -> Tuple[pd.DataFrame, float]:
     """
-    По умолчанию — первичный скан, взвешенное слияние близких уровней (0.5%%), Tier по ТЗ.
-    rescan=True: кластер + Master POC; top_n_per_band>0 — отбор по ценовым полосам.
-    weighted_merge_threshold_pct=None или ≤0 — пропустить merge_close_zones_weighted.
+    По умолчанию — первичный скан, cluster_merge_zones (коридор 1.5%%, транзитивно; зазор интервалов ≤120 ч), Tier по ТЗ.
+    rescan=True: кластер первичных + Master POC; top_n_per_band>0 — отбор по ценовым полосам.
+    cluster_merge_max_gap_pct=None или ≤0 — пропустить пост-склейку.
+    cluster_merge_max_time_gap_hours=None — не ограничивать разрыв по времени (только цена).
     """
     work = df_1m.copy()
     if year is not None and month is not None:
@@ -586,9 +699,11 @@ def run_pipeline(
         band_w = float(price_band_usdt) if price_band_usdt is not None else float(price_band_tick_multiplier) * step
         final = take_top_n_per_price_band(final, band_width_usdt=band_w, top_n=int(top_n_per_band))
 
-    if weighted_merge_threshold_pct is not None and float(weighted_merge_threshold_pct) > 0.0:
-        final = merge_close_zones_weighted(
-            final, merge_threshold_pct=float(weighted_merge_threshold_pct)
+    if cluster_merge_max_gap_pct is not None and float(cluster_merge_max_gap_pct) > 0.0:
+        final = cluster_merge_zones(
+            final,
+            max_gap_pct=float(cluster_merge_max_gap_pct),
+            max_time_gap_hours=cluster_merge_max_time_gap_hours,
         )
 
     assign_tiers_by_original_spec(final)
