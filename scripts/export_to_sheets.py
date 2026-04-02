@@ -41,6 +41,15 @@ CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 SHEET_URL = os.getenv("MARKET_AUDIT_SHEET_URL")
 SHEET_ID = os.getenv("MARKET_AUDIT_SHEET_ID")
 DYNAMIC_ZONES_SYMBOL = os.getenv("DYNAMIC_ZONES_SYMBOL", "BTC/USDT")
+# Список пар для листов volume profile (через запятую); если пусто — три пары по умолчанию.
+VOLUME_PEAK_SYMBOLS = os.getenv("VOLUME_PEAK_SYMBOLS")
+DEFAULT_VOLUME_PEAK_SYMBOLS = "BTC/USDT,SOL/USDT,AAVE/USDT"
+
+
+def resolve_volume_peak_export_symbols() -> str:
+    if VOLUME_PEAK_SYMBOLS and str(VOLUME_PEAK_SYMBOLS).strip():
+        return str(VOLUME_PEAK_SYMBOLS).strip()
+    return DEFAULT_VOLUME_PEAK_SYMBOLS
 DYNAMIC_ZONES_YEAR = os.getenv("DYNAMIC_ZONES_YEAR")
 DYNAMIC_ZONES_MONTH = os.getenv("DYNAMIC_ZONES_MONTH")
 DYNAMIC_ZONES_BIN_STEP_USDT = os.getenv("DYNAMIC_ZONES_BIN_STEP_USDT")
@@ -56,6 +65,9 @@ DYNAMIC_ZONES_WEIGHTED_MERGE_PCT = os.getenv("DYNAMIC_ZONES_WEIGHTED_MERGE_PCT")
 VOLUME_PEAK_LEVELS_WORKSHEET = os.getenv(
     "VOLUME_PEAK_LEVELS_WORKSHEET"
 ) or os.getenv("DBSCAN_ZONES_WORKSHEET", "dynamic_accumulation_zones_dbscan")
+VOLUME_PEAK_ANALYSIS_WORKSHEET = os.getenv(
+    "VOLUME_PEAK_ANALYSIS_WORKSHEET", "volume_profile_peaks_analysis"
+)
 PRO_LEVELS_HEIGHT_MULT = os.getenv("PRO_LEVELS_HEIGHT_MULT")
 PRO_LEVELS_DISTANCE_PCT = os.getenv("PRO_LEVELS_DISTANCE_PCT")
 PRO_LEVELS_VALLEY_THRESHOLD = os.getenv("PRO_LEVELS_VALLEY_THRESHOLD")
@@ -67,6 +79,16 @@ PRO_LEVELS_VALLEY_MERGE_THRESHOLD = os.getenv("PRO_LEVELS_VALLEY_MERGE_THRESHOLD
 PRO_LEVELS_ENABLE_VALLEY_MERGE = os.getenv("PRO_LEVELS_ENABLE_VALLEY_MERGE", "true")
 PRO_LEVELS_DEDUP_ROUND_PCT = os.getenv("PRO_LEVELS_DEDUP_ROUND_PCT")
 PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD = os.getenv("PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD")
+PRO_LEVELS_LEGACY_WEAK_MERGE = os.getenv("PRO_LEVELS_LEGACY_WEAK_MERGE", "false")
+PRO_LEVELS_RUN_SOFT_PASS = os.getenv("PRO_LEVELS_RUN_SOFT_PASS", "true")
+PRO_LEVELS_STRICT_HEIGHT_WEAK = os.getenv("PRO_LEVELS_STRICT_HEIGHT_WEAK")
+PRO_LEVELS_STRICT_HEIGHT_MULT = os.getenv("PRO_LEVELS_STRICT_HEIGHT_MULT")
+PRO_LEVELS_SOFT_HEIGHT_STRONG = os.getenv("PRO_LEVELS_SOFT_HEIGHT_STRONG")
+PRO_LEVELS_SOFT_HEIGHT_WEAK = os.getenv("PRO_LEVELS_SOFT_HEIGHT_WEAK")
+PRO_LEVELS_SOFT_HEIGHT_MULT = os.getenv("PRO_LEVELS_SOFT_HEIGHT_MULT")
+PRO_LEVELS_SOFT_FINAL_MERGE_PCT = os.getenv("PRO_LEVELS_SOFT_FINAL_MERGE_PCT")
+PRO_LEVELS_EXCLUDE_RESERVED_PCT = os.getenv("PRO_LEVELS_EXCLUDE_RESERVED_PCT")
+PRO_LEVELS_WEAK_MIN_DURATION = os.getenv("PRO_LEVELS_WEAK_MIN_DURATION")
 
 
 def _ts_to_iso_utc(ts: int) -> str:
@@ -438,16 +460,28 @@ def _fetch_dynamic_accumulation_zones_for_sheet(symbol: str) -> pd.DataFrame:
     return out[[c for c in cols if c in out.columns]]
 
 
-def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
-    """Пики профиля объёма (1m, тот же календарный месяц UTC, что и dynamic_accumulation_zones)."""
+def _fetch_volume_peak_levels_for_sheet(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Пики профиля объёма (1m) + таблица аудита (raw/dedup/final, тиры) для листа анализа."""
     symbols = [s.strip() for s in str(symbol).split(",") if s.strip()]
     if len(symbols) > 1:
-        frames = [_fetch_volume_peak_levels_for_sheet(s) for s in symbols]
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
-    symbol = symbols[0] if symbols else str(symbol).strip()
+        dfs: List[pd.DataFrame] = []
+        auds: List[pd.DataFrame] = []
+        for s in symbols:
+            d_l, d_a = _fetch_volume_peak_levels_for_sheet(s)
+            dfs.append(d_l)
+            auds.append(d_a)
+        return (
+            pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(),
+            pd.concat(auds, ignore_index=True) if auds else pd.DataFrame(),
+        )
+    sym = symbols[0] if symbols else str(symbol).strip()
+    if not sym:
+        return pd.DataFrame([{"note": "Не указан символ"}]), pd.DataFrame()
+    return _volume_peak_levels_one(sym)
 
+
+def _volume_peak_levels_one(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Один символ: уровни для листа + одна строка аудита."""
     conn = get_connection()
     df = pd.read_sql_query(
         """
@@ -476,7 +510,26 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
     work = slice_calendar_month_utc(df, year, month)
     if work.empty:
         row = {**base_meta, "note": "Нет 1m данных за выбранный месяц"}
-        return pd.DataFrame([row])
+        audit = pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "month_utc": month_label,
+                    "exported_at_utc": exported_at,
+                    "strict_raw_n": 0,
+                    "strict_dedup_n": 0,
+                    "final_levels_n": 0,
+                    "tier1_beton_n": 0,
+                    "tier2_n": 0,
+                    "tier3_n": 0,
+                    "two_pass_mode": "",
+                    "run_soft_pass": "",
+                    "legacy_weak_merge": "",
+                    "note": row["note"],
+                }
+            ]
+        )
+        return pd.DataFrame([row]), audit
 
     params = get_adaptive_params(work)
     height_mult: float | None = float(PRO_LEVELS_HEIGHT_MULT) if PRO_LEVELS_HEIGHT_MULT else None
@@ -517,6 +570,38 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         and str(PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD).strip() != ""
     ):
         final_merge_valley_threshold = float(PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD)
+
+    legacy_weak_merge = str(PRO_LEVELS_LEGACY_WEAK_MERGE).strip().lower() in ("1", "true", "yes", "on")
+    run_soft_pass = str(PRO_LEVELS_RUN_SOFT_PASS).strip().lower() not in ("0", "false", "no", "off")
+    strict_height_percentile_weak: float | None = None
+    if PRO_LEVELS_STRICT_HEIGHT_WEAK is not None and str(PRO_LEVELS_STRICT_HEIGHT_WEAK).strip() != "":
+        strict_height_percentile_weak = float(PRO_LEVELS_STRICT_HEIGHT_WEAK)
+    strict_height_mult: float | None = None
+    if PRO_LEVELS_STRICT_HEIGHT_MULT is not None and str(PRO_LEVELS_STRICT_HEIGHT_MULT).strip() != "":
+        strict_height_mult = float(PRO_LEVELS_STRICT_HEIGHT_MULT)
+    soft_height_percentile_strong = 0.6
+    soft_height_percentile_weak = 0.55
+    if PRO_LEVELS_SOFT_HEIGHT_STRONG is not None and str(PRO_LEVELS_SOFT_HEIGHT_STRONG).strip() != "":
+        soft_height_percentile_strong = float(PRO_LEVELS_SOFT_HEIGHT_STRONG)
+    if PRO_LEVELS_SOFT_HEIGHT_WEAK is not None and str(PRO_LEVELS_SOFT_HEIGHT_WEAK).strip() != "":
+        soft_height_percentile_weak = float(PRO_LEVELS_SOFT_HEIGHT_WEAK)
+    soft_height_mult: float | None = None
+    if PRO_LEVELS_SOFT_HEIGHT_MULT is not None and str(PRO_LEVELS_SOFT_HEIGHT_MULT).strip() != "":
+        soft_height_mult = float(PRO_LEVELS_SOFT_HEIGHT_MULT)
+    soft_final_merge_pct: float | None = None
+    if PRO_LEVELS_SOFT_FINAL_MERGE_PCT is not None and str(PRO_LEVELS_SOFT_FINAL_MERGE_PCT).strip() != "":
+        soft_final_merge_pct = float(PRO_LEVELS_SOFT_FINAL_MERGE_PCT)
+    exclude_reserved_pct: float | None = None
+    if PRO_LEVELS_EXCLUDE_RESERVED_PCT is not None and str(PRO_LEVELS_EXCLUDE_RESERVED_PCT).strip() != "":
+        exclude_reserved_pct = float(PRO_LEVELS_EXCLUDE_RESERVED_PCT)
+    soft_min_duration_hours = 4.0
+    if PRO_LEVELS_WEAK_MIN_DURATION is not None and str(PRO_LEVELS_WEAK_MIN_DURATION).strip() != "":
+        soft_min_duration_hours = float(PRO_LEVELS_WEAK_MIN_DURATION)
+
+    height_percentile_strong = float(params.get("height_percentile_strong", 0.85))
+    height_percentile_weak = float(params.get("height_percentile_weak", 0.65))
+    two_pass_mode = not legacy_weak_merge
+
     real_min_tick = float(params.get("real_min_tick", 0.0))
     price_band_usdt = float(params.get("price_band_usdt", 0.0))
     base_meta = {
@@ -538,13 +623,27 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         "final_merge_valley_threshold": (
             "" if final_merge_valley_threshold is None else final_merge_valley_threshold
         ),
+        "legacy_weak_merge": legacy_weak_merge,
+        "run_soft_pass": run_soft_pass,
+        "two_pass_mode": two_pass_mode,
+        "height_percentile_strong": height_percentile_strong,
+        "height_percentile_weak": height_percentile_weak,
+        "strict_height_percentile_weak": (
+            "" if strict_height_percentile_weak is None else strict_height_percentile_weak
+        ),
+        "strict_height_mult": "" if strict_height_mult is None else strict_height_mult,
+        "soft_height_percentile_strong": soft_height_percentile_strong,
+        "soft_height_percentile_weak": soft_height_percentile_weak,
+        "soft_height_mult": "" if soft_height_mult is None else soft_height_mult,
+        "soft_min_duration_hours": soft_min_duration_hours,
+        "soft_final_merge_pct": "" if soft_final_merge_pct is None else soft_final_merge_pct,
+        "exclude_reserved_pct": "" if exclude_reserved_pct is None else exclude_reserved_pct,
         "real_min_tick": real_min_tick,
         "price_band_usdt": price_band_usdt,
     }
 
     try:
-        raw_levels = find_pro_levels(
-            work,
+        common_kw = dict(
             height_mult=height_mult,
             distance_pct=distance_pct,
             valley_threshold=valley_threshold,
@@ -559,54 +658,72 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
             allow_stage_b_overlap=True,
             dedup_round_pct=dedup_round_pct,
             final_merge_valley_threshold=final_merge_valley_threshold,
-            return_raw=True,
+            legacy_weak_merge=legacy_weak_merge,
+            two_pass_mode=two_pass_mode,
+            run_soft_pass=run_soft_pass,
+            height_percentile_strong=height_percentile_strong,
+            height_percentile_weak=height_percentile_weak,
+            strict_height_percentile_weak=strict_height_percentile_weak,
+            strict_height_mult=strict_height_mult,
+            exclude_reserved_pct=exclude_reserved_pct,
+            soft_height_percentile_strong=soft_height_percentile_strong,
+            soft_height_percentile_weak=soft_height_percentile_weak,
+            soft_height_mult=soft_height_mult,
+            soft_min_duration_hours=soft_min_duration_hours,
+            soft_final_merge_pct=soft_final_merge_pct,
         )
-        dedup_levels = find_pro_levels(
-            work,
-            height_mult=height_mult,
-            distance_pct=distance_pct,
-            valley_threshold=valley_threshold,
-            tick_size=tick_size,
-            top_n=top_n,
-            min_duration_hours=min_duration_hours,
-            max_levels=max_levels,
-            include_all_tiers=include_all_tiers,
-            final_merge_pct=final_merge_pct,
-            valley_merge_threshold=valley_merge_threshold,
-            enable_valley_merge=enable_valley_merge,
-            allow_stage_b_overlap=True,
-            dedup_round_pct=dedup_round_pct,
-            final_merge_valley_threshold=final_merge_valley_threshold,
-            return_dedup=True,
-        )
-        final_levels = find_pro_levels(
-            work,
-            height_mult=height_mult,
-            distance_pct=distance_pct,
-            valley_threshold=valley_threshold,
-            tick_size=tick_size,
-            top_n=top_n,
-            min_duration_hours=min_duration_hours,
-            max_levels=max_levels,
-            include_all_tiers=include_all_tiers,
-            final_merge_pct=final_merge_pct,
-            valley_merge_threshold=valley_merge_threshold,
-            enable_valley_merge=enable_valley_merge,
-            allow_stage_b_overlap=True,
-            dedup_round_pct=dedup_round_pct,
-            final_merge_valley_threshold=final_merge_valley_threshold,
-        )
+        raw_levels = find_pro_levels(work, **common_kw, return_raw=True)
+        dedup_levels = find_pro_levels(work, **common_kw, return_dedup=True)
+        final_levels = find_pro_levels(work, **common_kw)
         print(
             f"[{symbol} {month_label}] levels raw={len(raw_levels)} dedup={len(dedup_levels)} final={len(final_levels)} "
             f"merge_pct={final_merge_pct} valley_merge={enable_valley_merge} vm_thr={valley_merge_threshold}"
         )
     except RuntimeError as e:
         row = {**base_meta, "note": str(e)}
-        return pd.DataFrame([row])
+        audit = pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "month_utc": month_label,
+                    "exported_at_utc": exported_at,
+                    "strict_raw_n": 0,
+                    "strict_dedup_n": 0,
+                    "final_levels_n": 0,
+                    "tier1_beton_n": 0,
+                    "tier2_n": 0,
+                    "tier3_n": 0,
+                    "two_pass_mode": two_pass_mode,
+                    "run_soft_pass": run_soft_pass,
+                    "legacy_weak_merge": legacy_weak_merge,
+                    "note": str(e),
+                }
+            ]
+        )
+        return pd.DataFrame([row]), audit
 
     if final_levels.empty:
         row = {**base_meta, "note": "Нет пиков по заданным height_mult / distance_pct"}
-        return pd.DataFrame([row])
+        audit = pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "month_utc": month_label,
+                    "exported_at_utc": exported_at,
+                    "strict_raw_n": len(raw_levels),
+                    "strict_dedup_n": len(dedup_levels),
+                    "final_levels_n": 0,
+                    "tier1_beton_n": 0,
+                    "tier2_n": 0,
+                    "tier3_n": 0,
+                    "two_pass_mode": two_pass_mode,
+                    "run_soft_pass": run_soft_pass,
+                    "legacy_weak_merge": legacy_weak_merge,
+                    "note": row["note"],
+                }
+            ]
+        )
+        return pd.DataFrame([row]), audit
 
     out = final_levels.copy()
     out.insert(0, "symbol", symbol)
@@ -629,6 +746,21 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
     out["final_merge_valley_threshold"] = (
         "" if final_merge_valley_threshold is None else final_merge_valley_threshold
     )
+    out["legacy_weak_merge"] = legacy_weak_merge
+    out["run_soft_pass"] = run_soft_pass
+    out["two_pass_mode"] = two_pass_mode
+    out["height_percentile_strong"] = height_percentile_strong
+    out["height_percentile_weak"] = height_percentile_weak
+    out["strict_height_percentile_weak"] = (
+        "" if strict_height_percentile_weak is None else strict_height_percentile_weak
+    )
+    out["strict_height_mult"] = "" if strict_height_mult is None else strict_height_mult
+    out["soft_height_percentile_strong"] = soft_height_percentile_strong
+    out["soft_height_percentile_weak"] = soft_height_percentile_weak
+    out["soft_height_mult"] = "" if soft_height_mult is None else soft_height_mult
+    out["soft_min_duration_hours"] = soft_min_duration_hours
+    out["soft_final_merge_pct"] = "" if soft_final_merge_pct is None else soft_final_merge_pct
+    out["exclude_reserved_pct"] = "" if exclude_reserved_pct is None else exclude_reserved_pct
     out["real_min_tick"] = real_min_tick
     out["price_band_usdt"] = price_band_usdt
     out = out.rename(
@@ -658,6 +790,19 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         "enable_valley_merge",
         "dedup_round_pct",
         "final_merge_valley_threshold",
+        "legacy_weak_merge",
+        "run_soft_pass",
+        "two_pass_mode",
+        "height_percentile_strong",
+        "height_percentile_weak",
+        "strict_height_percentile_weak",
+        "strict_height_mult",
+        "soft_height_percentile_strong",
+        "soft_height_percentile_weak",
+        "soft_height_mult",
+        "soft_min_duration_hours",
+        "soft_final_merge_pct",
+        "exclude_reserved_pct",
         "real_min_tick",
         "price_band_usdt",
         "Цена уровня",
@@ -667,7 +812,97 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> pd.DataFrame:
         "start_utc",
         "end_utc",
     ]
-    return out[[c for c in cols if c in out.columns]]
+    out = out[[c for c in cols if c in out.columns]]
+    if not final_levels.empty and "Tier" in final_levels.columns:
+        t1 = int((final_levels["Tier"] == "Tier 1 (Бетон)").sum())
+        ser = final_levels["Tier"].astype(str)
+        t2 = int(ser.str.contains("Tier 2", na=False).sum())
+        t3 = int(ser.str.contains("Tier 3", na=False).sum())
+    else:
+        t1 = t2 = t3 = 0
+    audit = pd.DataFrame(
+        [
+            {
+                "symbol": symbol,
+                "month_utc": month_label,
+                "exported_at_utc": exported_at,
+                "strict_raw_n": len(raw_levels),
+                "strict_dedup_n": len(dedup_levels),
+                "final_levels_n": len(final_levels),
+                "tier1_beton_n": t1,
+                "tier2_n": t2,
+                "tier3_n": t3,
+                "two_pass_mode": two_pass_mode,
+                "run_soft_pass": run_soft_pass,
+                "legacy_weak_merge": legacy_weak_merge,
+                "dedup_round_pct": dedup_round_pct,
+                "distance_pct": distance_pct,
+                "final_merge_pct": "" if final_merge_pct is None else final_merge_pct,
+                "note": "",
+            }
+        ]
+    )
+    return out, audit
+
+
+def _build_volume_peaks_analysis_sheet(audit_df: pd.DataFrame) -> pd.DataFrame:
+    """Человекочитаемая сводка для отдельного листа Google Sheets."""
+    if audit_df.empty:
+        return pd.DataFrame(
+            [{"Раздел": "Анализ уровней (volume profile)", "Содержание": "Нет строк аудита."}]
+        )
+
+    def _interpret(row: pd.Series) -> str:
+        note = str(row.get("note") or "").strip()
+        if note:
+            return note
+        fr, fd, fn = int(row.get("strict_raw_n") or 0), int(row.get("strict_dedup_n") or 0), int(
+            row.get("final_levels_n") or 0
+        )
+        t1, t2, t3 = int(row.get("tier1_beton_n") or 0), int(row.get("tier2_n") or 0), int(
+            row.get("tier3_n") or 0
+        )
+        parts = [
+            f"Жёсткий проход: raw={fr} → dedup={fd} (стадии по одному символу/месяцу).",
+            f"Финальный вывод: {fn} уровн.; Tier1 (бетон)={t1}, Tier2={t2}, Tier3={t3}.",
+        ]
+        if row.get("two_pass_mode") is True and t1 == 0 and fn > 0:
+            parts.append(
+                "Двухпроходный режим без Tier1 в жёстком dedup: в финале в основном мягкие уровни."
+            )
+        elif row.get("two_pass_mode") is True and t1 > 0:
+            parts.append("Есть зафиксированные сильные зоны (Tier1 из жёсткого dedup).")
+        if row.get("legacy_weak_merge") is True:
+            parts.append("Использован legacy single-pass (legacy_weak_merge).")
+        drop = fr - fd
+        if drop > 0:
+            parts.append(f"Дедупликация по цене убрала {drop} дублей относительно raw.")
+        if fn < fd:
+            parts.append("Финальный merge дополнительно сократил число близких уровней.")
+        return " ".join(parts)
+
+    out = audit_df.copy()
+    out["Интерпретация"] = out.apply(_interpret, axis=1)
+    return out.rename(
+        columns={
+            "symbol": "Символ",
+            "month_utc": "Месяц_UTC",
+            "exported_at_utc": "Экспорт_UTC",
+            "strict_raw_n": "Жёсткий_raw",
+            "strict_dedup_n": "Жёсткий_dedup",
+            "final_levels_n": "Финал_уровней",
+            "tier1_beton_n": "Tier1_бетон",
+            "tier2_n": "Tier2",
+            "tier3_n": "Tier3",
+            "two_pass_mode": "Два_прохода",
+            "run_soft_pass": "Мягкий_проход",
+            "legacy_weak_merge": "Legacy_merge",
+            "dedup_round_pct": "dedup_round_pct",
+            "distance_pct": "distance_pct",
+            "final_merge_pct": "final_merge_pct",
+            "note": "Примечание",
+        }
+    )
 
 
 def main() -> None:
@@ -777,15 +1012,28 @@ def main() -> None:
         }
     )
 
-    df_peak_levels = _fetch_volume_peak_levels_for_sheet(DYNAMIC_ZONES_SYMBOL)
+    peak_symbols = resolve_volume_peak_export_symbols()
+    df_peak_levels, df_peak_audit = _fetch_volume_peak_levels_for_sheet(peak_symbols)
     exporter.export_dataframe_to_sheet(
         df_peak_levels, SHEET_TITLE, VOLUME_PEAK_LEVELS_WORKSHEET
+    )
+    df_peak_analysis = _build_volume_peaks_analysis_sheet(df_peak_audit)
+    exporter.export_dataframe_to_sheet(
+        df_peak_analysis, SHEET_TITLE, VOLUME_PEAK_ANALYSIS_WORKSHEET
     )
     audit_entries.append(
         {
             "source": "volume_profile_peaks",
             "worksheet": VOLUME_PEAK_LEVELS_WORKSHEET,
             "rows": len(df_peak_levels),
+            "last_exported_at_utc": exported_at,
+        }
+    )
+    audit_entries.append(
+        {
+            "source": "volume_profile_peaks_analysis",
+            "worksheet": VOLUME_PEAK_ANALYSIS_WORKSHEET,
+            "rows": len(df_peak_analysis),
             "last_exported_at_utc": exported_at,
         }
     )

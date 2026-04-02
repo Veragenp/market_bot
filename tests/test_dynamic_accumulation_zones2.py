@@ -28,7 +28,14 @@ def test_find_pro_levels_detects_central_hvn():
     df = pd.DataFrame(
         {"timestamp": ts, "close": prices, "volume": vol},
     )
-    out = find_pro_levels(df, height_mult=1.2, distance_pct=0.002)
+    # При two_pass=True в финал из жёсткого только Tier 1; на короткой синтетике
+    # часто нет Tier 1 после отбора — для этого теста проверяем один проход.
+    out = find_pro_levels(
+        df,
+        height_mult=1.2,
+        distance_pct=0.002,
+        two_pass_mode=False,
+    )
     assert not out.empty
     assert (out["Price"] >= 49_950).all() and (out["Price"] <= 50_050).all()
 
@@ -54,10 +61,18 @@ def test_find_pro_levels_valley_merge_reduces_nearby_peaks():
     df = pd.DataFrame({"timestamp": ts, "close": prices, "volume": vol})
 
     out_no_merge = find_pro_levels(
-        df, height_mult=1.1, distance_pct=0.001, valley_threshold=0.95
+        df,
+        height_mult=1.1,
+        distance_pct=0.001,
+        valley_threshold=0.95,
+        two_pass_mode=False,
     )
     out_merge = find_pro_levels(
-        df, height_mult=1.1, distance_pct=0.001, valley_threshold=0.5
+        df,
+        height_mult=1.1,
+        distance_pct=0.001,
+        valley_threshold=0.5,
+        two_pass_mode=False,
     )
     assert len(out_merge) <= len(out_no_merge)
 
