@@ -35,6 +35,7 @@ def test_tables_exist(clean_db):
         "trade_decisions",
         "price_levels",
         "market_context",
+        "level_events",
     }
     assert expected.issubset(tables)
     conn.close()
@@ -64,6 +65,9 @@ def test_indices_exist(clean_db):
         "idx_tl_symbol_status",
         "idx_tl_status_gen",
         "idx_tl_price_level",
+        "idx_le_touch",
+        "idx_le_symbol_touch",
+        "idx_le_stable",
     }
     assert expected.issubset(indices)
     conn.close()

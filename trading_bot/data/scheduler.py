@@ -17,6 +17,8 @@ from trading_bot.data.collectors import (
     update_indices,
     update_yfinance_macro_all,
 )
+from trading_bot.analytics.level_events import build_level_events
+from trading_bot.data.repositories import LevelEventsRepository
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,12 @@ def _run_binance_batch(timeframe: str) -> None:
         time.sleep(0.2)
 
 
+def _run_level_events_analytics_batch() -> None:
+    events = build_level_events()
+    n = LevelEventsRepository().save_batch(events)
+    logger.info("Level events analytics batch: saved=%s", n)
+
+
 def _is_sunday_23_utc() -> bool:
     now = datetime.now(timezone.utc)
     # Monday=0, Sunday=6
@@ -62,6 +70,7 @@ def run_scheduler_forever() -> None:
       - 4h: every 4 hours
       - 1d: daily at 01:00 UTC
       - instruments (Bybit + ATR по spot 1d): daily at 01:30 UTC
+      - level events analytics (1m + ATR): daily at 03:10 UTC
       - 1w: Sunday 23:00 UTC
       - 1M: first day 00:00 UTC
       - macro (yfinance): daily at 02:30 UTC
@@ -85,6 +94,7 @@ def run_scheduler_forever() -> None:
     schedule.every().day.at("01:00").do(_run_binance_batch, timeframe="1d")
     schedule.every().day.at("01:30").do(manager.update_instruments_daily)
     schedule.every().day.at("02:30").do(_run_macro_yfinance_batch)
+    schedule.every().day.at("03:10").do(_run_level_events_analytics_batch)
     schedule.every(4).hours.do(update_all_futures_data)
 
     # Weekly and monthly rules expressed as hourly guards in UTC.

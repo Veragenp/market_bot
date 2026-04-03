@@ -190,6 +190,38 @@ def init_db() -> None:
 
     cursor.execute(
         """
+        CREATE TABLE IF NOT EXISTS level_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            stable_level_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            month_utc TEXT,
+            level_type TEXT,
+            layer TEXT,
+            tier TEXT,
+            level_price REAL NOT NULL,
+            volume_peak REAL,
+            duration_hours REAL,
+            atr_daily REAL,
+            dist_start_atr REAL,
+            touch_time INTEGER NOT NULL,
+            return_time INTEGER,
+            penetration_atr REAL,
+            rebound_pure_atr REAL,
+            rebound_after_return_atr REAL,
+            cluster_size INTEGER,
+            window_start INTEGER,
+            window_end INTEGER,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_le_touch ON level_events(touch_time)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_le_symbol_touch ON level_events(symbol, touch_time)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_le_stable ON level_events(stable_level_id)")
+
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS market_context (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp INTEGER NOT NULL,
@@ -500,6 +532,44 @@ def run_migrations() -> None:
 
         cursor.execute(
             "INSERT INTO db_version (version, applied_at) VALUES (7, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 8:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS level_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                stable_level_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                month_utc TEXT,
+                level_type TEXT,
+                layer TEXT,
+                tier TEXT,
+                level_price REAL NOT NULL,
+                volume_peak REAL,
+                duration_hours REAL,
+                atr_daily REAL,
+                dist_start_atr REAL,
+                touch_time INTEGER NOT NULL,
+                return_time INTEGER,
+                penetration_atr REAL,
+                rebound_pure_atr REAL,
+                rebound_after_return_atr REAL,
+                cluster_size INTEGER,
+                window_start INTEGER,
+                window_end INTEGER,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_le_touch ON level_events(touch_time)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_le_symbol_touch ON level_events(symbol, touch_time)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_le_stable ON level_events(stable_level_id)")
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (8, ?)",
             (int(time.time()),),
         )
         conn.commit()

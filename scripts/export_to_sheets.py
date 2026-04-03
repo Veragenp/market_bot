@@ -33,7 +33,7 @@ from trading_bot.analytics.volume_profile_peaks import (
     find_pro_levels,
     get_adaptive_params,
 )
-from trading_bot.data.repositories import get_ohlcv_filled
+from trading_bot.data.repositories import get_level_events_since, get_ohlcv_filled
 from trading_bot.data.volume_profile_peaks_db import LEVEL_TYPE_VOLUME_PROFILE_PEAKS
 from trading_bot.tools.sheets_exporter import SheetsExporter
 
@@ -69,6 +69,7 @@ VOLUME_PEAK_LEVELS_WORKSHEET = os.getenv(
 VOLUME_PEAK_ANALYSIS_WORKSHEET = os.getenv(
     "VOLUME_PEAK_ANALYSIS_WORKSHEET", "volume_profile_peaks_analysis"
 )
+LEVEL_EVENTS_WORKSHEET = os.getenv("LEVEL_EVENTS_WORKSHEET", "level_events")
 
 # Важно: пики volume_profile_peaks в Google Sheets теперь выгружаются
 # строго из SQLite `price_levels` (посчитанные и сохраненные скриптом rebuild).
@@ -698,6 +699,42 @@ def _build_volume_peaks_analysis_sheet(audit_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _fetch_level_events_for_sheet(lookback_days: int = 30) -> pd.DataFrame:
+    start_ts = int(datetime.now(timezone.utc).timestamp()) - int(lookback_days * 86400)
+    rows = get_level_events_since(start_ts)
+    if not rows:
+        return pd.DataFrame([{"note": "Нет событий уровней за выбранный период."}])
+    out = pd.DataFrame(rows)
+    for c in ("touch_time", "return_time", "window_start", "window_end", "created_at"):
+        if c in out.columns:
+            name = f"{c}_utc"
+            out[name] = out[c].apply(
+                lambda v: _ts_to_iso_utc(int(v)) if pd.notna(v) else ""
+            )
+    cols = [
+        "event_id",
+        "stable_level_id",
+        "symbol",
+        "month_utc",
+        "tier",
+        "layer",
+        "level_price",
+        "volume_peak",
+        "duration_hours",
+        "atr_daily",
+        "dist_start_atr",
+        "touch_time_utc",
+        "return_time_utc",
+        "penetration_atr",
+        "rebound_pure_atr",
+        "rebound_after_return_atr",
+        "cluster_size",
+        "window_start_utc",
+        "window_end_utc",
+    ]
+    return out[[c for c in cols if c in out.columns]]
+
+
 def main() -> None:
     init_db()
     exporter = SheetsExporter(
@@ -838,6 +875,17 @@ def main() -> None:
             "source": "binance_futures",
             "worksheet": "coinglass_sample",
             "rows": len(df_coinglass),
+            "last_exported_at_utc": exported_at,
+        }
+    )
+
+    df_level_events = _fetch_level_events_for_sheet(lookback_days=30)
+    exporter.export_dataframe_to_sheet(df_level_events, SHEET_TITLE, LEVEL_EVENTS_WORKSHEET)
+    audit_entries.append(
+        {
+            "source": "level_events",
+            "worksheet": LEVEL_EVENTS_WORKSHEET,
+            "rows": len(df_level_events),
             "last_exported_at_utc": exported_at,
         }
     )

@@ -375,6 +375,90 @@ def clean_old_minute_data(retention_days: int) -> None:
     conn.close()
 
 
+def save_level_events(events: List[Dict[str, Any]]) -> int:
+    if not events:
+        return 0
+    _ensure_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = int(time.time())
+    for e in events:
+        cursor.execute(
+            """
+            INSERT INTO level_events (
+                event_id, stable_level_id, symbol, month_utc, level_type, layer, tier,
+                level_price, volume_peak, duration_hours, atr_daily, dist_start_atr,
+                touch_time, return_time, penetration_atr, rebound_pure_atr, rebound_after_return_atr,
+                cluster_size, window_start, window_end, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                stable_level_id = excluded.stable_level_id,
+                symbol = excluded.symbol,
+                month_utc = excluded.month_utc,
+                level_type = excluded.level_type,
+                layer = excluded.layer,
+                tier = excluded.tier,
+                level_price = excluded.level_price,
+                volume_peak = excluded.volume_peak,
+                duration_hours = excluded.duration_hours,
+                atr_daily = excluded.atr_daily,
+                dist_start_atr = excluded.dist_start_atr,
+                touch_time = excluded.touch_time,
+                return_time = excluded.return_time,
+                penetration_atr = excluded.penetration_atr,
+                rebound_pure_atr = excluded.rebound_pure_atr,
+                rebound_after_return_atr = excluded.rebound_after_return_atr,
+                cluster_size = excluded.cluster_size,
+                window_start = excluded.window_start,
+                window_end = excluded.window_end,
+                created_at = excluded.created_at
+            """,
+            (
+                e.get("event_id"),
+                e.get("stable_level_id"),
+                e.get("symbol"),
+                e.get("month_utc"),
+                e.get("level_type"),
+                e.get("layer"),
+                e.get("tier"),
+                e.get("level_price"),
+                e.get("volume_peak"),
+                e.get("duration_hours"),
+                e.get("atr_daily"),
+                e.get("dist_start_atr"),
+                e.get("touch_time"),
+                e.get("return_time"),
+                e.get("penetration_atr"),
+                e.get("rebound_pure_atr"),
+                e.get("rebound_after_return_atr"),
+                e.get("cluster_size"),
+                e.get("window_start"),
+                e.get("window_end"),
+                now,
+            ),
+        )
+    conn.commit()
+    conn.close()
+    return len(events)
+
+
+def get_level_events_since(start_ts: int) -> List[Dict[str, Any]]:
+    _ensure_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT * FROM level_events
+        WHERE touch_time >= ?
+        ORDER BY touch_time DESC, symbol ASC
+        """,
+        (int(start_ts),),
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
 class OHLCVRepository:
     def save_batch(self, symbol: str, timeframe: str, records: List[Dict[str, Any]]) -> None:
         save_ohlcv(symbol, timeframe, records)
@@ -506,3 +590,11 @@ class LiquidationsRepository:
         row = cursor.fetchone()
         conn.close()
         return int(row[0]) if row and row[0] is not None else None
+
+
+class LevelEventsRepository:
+    def save_batch(self, events: List[Dict[str, Any]]) -> int:
+        return save_level_events(events)
+
+    def get_since(self, start_ts: int) -> List[Dict[str, Any]]:
+        return get_level_events_since(start_ts)
