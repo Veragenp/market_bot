@@ -144,6 +144,7 @@ def init_db() -> None:
             tick_size REAL,
             min_qty REAL,
             avg_volume_24h REAL,
+            atr REAL,
             commission_open REAL,
             commission_close REAL,
             updated_at INTEGER,
@@ -168,6 +169,9 @@ def init_db() -> None:
             layer TEXT,
             strength REAL DEFAULT 0.0,
             volume_peak REAL,
+            duration_hours REAL,
+            t_start_unix INTEGER,
+            t_end_unix INTEGER,
             touch_count INTEGER DEFAULT 0,
             last_touch INTEGER,
             low_volume_zone_above INTEGER DEFAULT 0,
@@ -383,6 +387,9 @@ def run_migrations() -> None:
                 layer TEXT,
                 strength REAL DEFAULT 0.0,
                 volume_peak REAL,
+                duration_hours REAL,
+                t_start_unix INTEGER,
+                t_end_unix INTEGER,
                 touch_count INTEGER DEFAULT 0,
                 last_touch INTEGER,
                 low_volume_zone_above INTEGER DEFAULT 0,
@@ -466,6 +473,33 @@ def run_migrations() -> None:
 
         cursor.execute(
             "INSERT INTO db_version (version, applied_at) VALUES (5, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 6:
+        # --- price_levels: add timing columns for volume-profile zones ---
+        pl_cols = _column_names(cursor, "price_levels")
+        if "duration_hours" not in pl_cols:
+            cursor.execute("ALTER TABLE price_levels ADD COLUMN duration_hours REAL")
+        if "t_start_unix" not in pl_cols:
+            cursor.execute("ALTER TABLE price_levels ADD COLUMN t_start_unix INTEGER")
+        if "t_end_unix" not in pl_cols:
+            cursor.execute("ALTER TABLE price_levels ADD COLUMN t_end_unix INTEGER")
+
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (6, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 7:
+        inst_cols = _column_names(cursor, "instruments")
+        if "atr" not in inst_cols:
+            cursor.execute("ALTER TABLE instruments ADD COLUMN atr REAL")
+
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (7, ?)",
             (int(time.time()),),
         )
         conn.commit()

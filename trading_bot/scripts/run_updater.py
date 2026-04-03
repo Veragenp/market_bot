@@ -12,6 +12,12 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+    log = logging.getLogger(__name__)
+    log.warning(
+        "run_updater дублирует Bybit OI/ликвидации с run_scheduler.py. "
+        "Для нормальной заливки используйте scripts/run_scheduler.py; "
+        "этот скрипт оставлен для отладки изолированного Bybit-цикла."
+    )
 
     manager = DataLoaderManager()
 

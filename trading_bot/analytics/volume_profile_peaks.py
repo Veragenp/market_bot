@@ -11,11 +11,125 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import numpy as np
 import pandas as pd
+from decimal import Decimal, InvalidOperation
 from typing import Optional, Tuple
 
 TIER1_LABEL = "Tier 1 (Бетон)"
+
+logger = logging.getLogger(__name__)
+
+# Максимум знаков после запятой для цены уровня (защита от «микро-тика» из float).
+MAX_PRICE_DECIMALS = 8
+
+
+def _decimal_places_from_tick(tick: float, *, max_places: int = MAX_PRICE_DECIMALS) -> int:
+    """Число знаков после запятой, достаточное для отображения шага биржи (tick size)."""
+    t = abs(float(tick))
+    if not math.isfinite(t) or t <= 0:
+        return 2
+    try:
+        d = Decimal(str(t)).normalize()
+    except (InvalidOperation, ValueError):
+        return 2
+    exp = int(d.as_tuple().exponent)
+    if exp >= 0:
+        return 0
+    return min(max_places, -exp)
+
+
+def _round_level_price(x: float, decimals: int) -> float:
+    return round(float(x), int(decimals))
+
+
+def _try_binance_spot_tick_size(symbol: str) -> Optional[float]:
+    """PRICE_FILTER.tickSize с Binance spot через ccxt (кэш markets на клиенте)."""
+    try:
+        from trading_bot.config.settings import SOURCE_BINANCE
+        from trading_bot.provider.exchange_factory import get_exchange_client
+    except Exception:
+        return None
+    try:
+        client = get_exchange_client(SOURCE_BINANCE)
+        ex = getattr(client, "exchange", None)
+        if ex is None:
+            return None
+        ex.load_markets()
+        m = ex.market(symbol)
+        info = m.get("info") if isinstance(m, dict) else None
+        filters = info.get("filters") if isinstance(info, dict) else None
+        if isinstance(filters, list):
+            for f in filters:
+                if isinstance(f, dict) and f.get("filterType") == "PRICE_FILTER":
+                    ts = f.get("tickSize")
+                    if ts is not None:
+                        return float(ts)
+        prec = (m.get("precision") or {}).get("price") if isinstance(m, dict) else None
+        if prec is not None:
+            try:
+                p = int(prec)
+                if p >= 0:
+                    return float(10 ** (-p))
+            except (TypeError, ValueError):
+                pass
+    except Exception as exc:
+        logger.debug("Binance tick size lookup failed for %s: %s", symbol, exc)
+    return None
+
+
+def _try_bybit_instruments_tick_size(symbol_internal: str) -> Optional[float]:
+    """Запасной tick из SQLite `instruments` (Bybit linear), символ вида BTCUSDT."""
+    try:
+        from trading_bot.data.repositories import get_instrument
+    except Exception:
+        return None
+    bybit_sym = symbol_internal.replace("/", "").upper()
+    row = get_instrument(bybit_sym, "bybit_futures")
+    if not row:
+        return None
+    ts = row.get("tick_size")
+    if ts is None:
+        return None
+    try:
+        t = float(ts)
+    except (TypeError, ValueError):
+        return None
+    return t if t > 0 else None
+
+
+def _profile_tick_size_eff(explicit_tick: Optional[float], current_price: float) -> float:
+    """Шаг бинирования профиля (как в исходной логике до доработок отображения)."""
+    if explicit_tick is not None:
+        return max(float(explicit_tick), 1e-8)
+    return max(float(current_price) * 0.0005, 1e-8)
+
+
+def resolve_display_tick_size(symbol: Optional[str]) -> Optional[float]:
+    """
+    Только биржевой tick для формата цены в выводе (не для построения профиля).
+    Binance spot → instruments (Bybit).
+    """
+    sym = (symbol or "").strip() or None
+    if not sym:
+        return None
+    t = _try_binance_spot_tick_size(sym)
+    if t is not None and math.isfinite(t) and t > 0:
+        return t
+    t2 = _try_bybit_instruments_tick_size(sym)
+    if t2 is not None and math.isfinite(t2) and t2 > 0:
+        return t2
+    return None
+
+
+def _price_decimals_for_output(symbol: Optional[str]) -> int:
+    """Знаки после запятой в поле Price: по биржевому tick, иначе как раньше — 2."""
+    ex = resolve_display_tick_size(symbol)
+    if ex is not None:
+        return _decimal_places_from_tick(ex)
+    return 2
 
 # Финальная склейка соседних уровней (доля |Δцена|/цена). Доли процента дают «лесенку»;
 # целевой разнос итоговых зон — порядка нескольких процентов (см. комментарий у _cluster_level_row_groups).
@@ -143,6 +257,7 @@ def _level_row_from_ohlcv_band(
     tier2_h: float,
     *,
     tick_size: float,
+    price_decimals: int = 2,
     tier_override: Optional[str] = None,
 ) -> Optional[dict]:
     """Один уровень по полосе цен: суммарный объём, POC по бинам, Tier по длительности."""
@@ -165,7 +280,7 @@ def _level_row_from_ohlcv_band(
     else:
         tier = "Tier 3 (Локальный)"
     return {
-        "Price": round(float(poc_price), 2),
+        "Price": _round_level_price(poc_price, price_decimals),
         "Volume": round(vol_sum, 2),
         "Duration_Hrs": round(dur_h, 1),
         "Tier": tier,
@@ -182,6 +297,7 @@ def _refine_level_row_smart_band(
     tier2_h: float,
     tick_size: float,
     *,
+    price_decimals: int = 2,
     tier_override: Optional[str] = None,
 ) -> dict:
     """Пересчёт одной строки уровня тем же коридором ±distance_pct вокруг её цены."""
@@ -195,6 +311,7 @@ def _refine_level_row_smart_band(
         tier1_h,
         tier2_h,
         tick_size=float(tick_size),
+        price_decimals=int(price_decimals),
         tier_override=tier_override,
     )
     return got if got is not None else dict(row)
@@ -206,6 +323,7 @@ __all__ = [
     "greedy_level_selection",
     "get_adaptive_params",
     "analyze_coin_zones",
+    "resolve_display_tick_size",
 ]
 
 
@@ -218,6 +336,7 @@ def _merge_close_level_rows(
     df_original: pd.DataFrame,
     distance_pct: float,
     tick_size_eff: float,
+    price_decimals: int = 2,
     profile: Optional[pd.Series] = None,
     final_merge_valley_threshold: Optional[float] = None,
     preserve_tier1_from_group: bool = False,
@@ -225,7 +344,13 @@ def _merge_close_level_rows(
     if merge_pct <= 0:
         refined = [
             _refine_level_row_smart_band(
-                r, df_original, distance_pct, tier1_h, tier2_h, float(tick_size_eff)
+                r,
+                df_original,
+                distance_pct,
+                tier1_h,
+                tier2_h,
+                float(tick_size_eff),
+                price_decimals=int(price_decimals),
             )
             for r in rows
         ]
@@ -253,6 +378,7 @@ def _merge_close_level_rows(
             tier1_h,
             tier2_h,
             tick_size=float(tick_size_eff),
+            price_decimals=int(price_decimals),
             tier_override=TIER1_LABEL if any_t1 else None,
         )
         if row is not None:
@@ -265,6 +391,8 @@ def merge_by_valley(
     peaks: np.ndarray,
     threshold: float = 0.5,
     merge_distance_pct: float = 0.0,
+    *,
+    price_decimals: int = 2,
 ) -> list[dict]:
     """
     Склеивает соседние пики, если "долина" между ними неглубокая:
@@ -302,7 +430,9 @@ def merge_by_valley(
         if v_sum <= 0:
             continue
         poc_price = float(prices[int(np.argmax(volumes))])
-        final_levels.append({"Price": round(poc_price, 2), "Volume": round(v_sum, 2)})
+        final_levels.append(
+            {"Price": _round_level_price(poc_price, price_decimals), "Volume": round(v_sum, 2)}
+        )
     return final_levels
 
 
@@ -353,6 +483,7 @@ def greedy_level_selection(
     df_original: pd.DataFrame,
     *,
     tick_size: float,
+    price_decimals: int = 2,
     distance_pct: float = 0.01,
     top_n: int = 5,
     min_duration_hours: float = 1.0,
@@ -425,7 +556,7 @@ def greedy_level_selection(
         poc_price, total_volume, duration, t0, t1 = snap
         result.append(
             {
-                "Price": round(poc_price, 2),
+                "Price": _round_level_price(poc_price, price_decimals),
                 "Volume": round(total_volume, 2),
                 "Duration_Hrs": round(duration, 2),
                 "Score": round(float(s["score"]), 6),
@@ -489,6 +620,7 @@ def _find_pro_levels_single_pass(
     reserved_prices: Optional[list[float]] = None,
     exclude_reserved_pct: Optional[float] = None,
     skip_final_merge_clamp: bool = False,
+    price_decimals: int = 2,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """
     Один полный проход: raw → dedup → merge.
@@ -520,7 +652,11 @@ def _find_pro_levels_single_pass(
                 return s
             peak_positions = np.array([int(volume_sm.index.get_loc(p)) for p in s.index], dtype=int)
             valley_merged = merge_by_valley(
-                volume_sm, peak_positions, threshold=vm_thr, merge_distance_pct=vm_dist
+                volume_sm,
+                peak_positions,
+                threshold=vm_thr,
+                merge_distance_pct=vm_dist,
+                price_decimals=int(price_decimals),
             )
             if not valley_merged:
                 return s
@@ -543,6 +679,7 @@ def _find_pro_levels_single_pass(
         strong_profile,
         work,
         tick_size=float(tick_size_eff),
+        price_decimals=int(price_decimals),
         distance_pct=select_distance_pct,
         top_n=eff_top_n,
         min_duration_hours=float(min_duration_hours),
@@ -555,6 +692,7 @@ def _find_pro_levels_single_pass(
             weak_profile,
             work,
             tick_size=float(tick_size_eff),
+            price_decimals=int(price_decimals),
             distance_pct=select_distance_pct,
             top_n=eff_top_n * 2,
             min_duration_hours=float(min_duration_hours),
@@ -608,7 +746,7 @@ def _find_pro_levels_single_pass(
 
         levels.append(
             {
-                "Price": round(price_level, 2),
+                "Price": _round_level_price(price_level, price_decimals),
                 "Volume": round(float(row_match["Volume"]), 2),
                 "Duration_Hrs": round(duration_hrs, 1),
                 "Tier": tier,
@@ -643,6 +781,7 @@ def _find_pro_levels_single_pass(
         df_original=work,
         distance_pct=float(distance_pct),
         tick_size_eff=float(tick_size_eff),
+        price_decimals=int(price_decimals),
         profile=volume_sm,
         final_merge_valley_threshold=final_merge_valley_threshold,
     )
@@ -686,6 +825,7 @@ def find_pro_levels(
     soft_final_merge_pct: Optional[float] = None,
     include_weak: bool = True,
     weak_fallback_threshold: Optional[float] = None,
+    symbol: str | None = None,
 ) -> pd.DataFrame:
     """
     two_pass_mode=True (по умолчанию): жёсткий проход фиксирует резерв (strict_full),
@@ -698,6 +838,9 @@ def find_pro_levels(
     two_pass_mode=False: один проход без второго.
     return_raw / return_dedup при two_pass относятся к жёсткому проходу.
     weak_fallback_threshold: зарезервировано под совместимость (пока не используется).
+    symbol: например «ADA/USDT» — влияет **только** на округление поля `Price` в ответе
+        (берётся биржевой tick для числа знаков). Построение профиля и отбор уровней
+        используют `tick_size` и эвристику `current_price * 0.0005`, как раньше.
     """
     if return_raw and return_dedup:
         raise ValueError("Задайте только один из return_raw или return_dedup")
@@ -717,10 +860,9 @@ def find_pro_levels(
         return empty
 
     current_price = float(work["close"].iloc[-1])
-    if tick_size is None:
-        tick_size_eff = max(current_price * 0.0005, 1e-8)
-    else:
-        tick_size_eff = max(float(tick_size), 1e-8)
+    sym = (symbol or "").strip() or None
+    tick_size_eff = _profile_tick_size_eff(tick_size, current_price)
+    price_decimals = _price_decimals_for_output(sym)
 
     work["price_bin"] = (work["close"] / tick_size_eff).round() * tick_size_eff
     profile = work.groupby("price_bin", sort=True)["volume"].sum()
@@ -766,6 +908,7 @@ def find_pro_levels(
             final_merge_valley_threshold=final_merge_valley_threshold,
             reserved_prices=None,
             exclude_reserved_pct=None,
+            price_decimals=int(price_decimals),
         )
         if return_raw:
             return pd.DataFrame(raw_s).sort_values("Volume", ascending=False).reset_index(drop=True)
@@ -788,6 +931,7 @@ def find_pro_levels(
                 tier1_h,
                 tier2_h,
                 float(tick_size_eff),
+                price_decimals=int(price_decimals),
                 tier_override=TIER1_LABEL,
             )
             for r in strict_full
@@ -841,6 +985,7 @@ def find_pro_levels(
             reserved_prices=reserved_prices,
             exclude_reserved_pct=ex_pct,
             skip_final_merge_clamp=skip_soft_clamp,
+            price_decimals=int(price_decimals),
         )
         tier1_prices = [float(r["Price"]) for r in tier1_strict]
         soft_kept: list[dict] = []
@@ -867,6 +1012,7 @@ def find_pro_levels(
             df_original=work,
             distance_pct=float(distance_pct),
             tick_size_eff=float(tick_size_eff),
+            price_decimals=int(price_decimals),
             profile=volume_sm,
             final_merge_valley_threshold=final_merge_valley_threshold,
             preserve_tier1_from_group=True,
@@ -899,6 +1045,7 @@ def find_pro_levels(
         dedup_round_pct=float(dedup_round_pct),
         final_merge_pct=final_merge_pct,
         final_merge_valley_threshold=final_merge_valley_threshold,
+        price_decimals=int(price_decimals),
     )
     if return_raw:
         return pd.DataFrame(raw_l).sort_values("Volume", ascending=False).reset_index(drop=True)
@@ -907,9 +1054,11 @@ def find_pro_levels(
     return pd.DataFrame(final_l).sort_values("Volume", ascending=False).reset_index(drop=True)
 
 
-def get_adaptive_params(df: pd.DataFrame) -> dict:
+def get_adaptive_params(df: pd.DataFrame, symbol: str | None = None) -> dict:
     """
     Универсальная адаптация параметров под волатильность и структуру объема монеты.
+    `symbol` оставлен для совместимости вызовов; на `tick_size` в словаре не влияет
+    (шаг профиля — эвристика `current_price * 0.0005`, как изначально).
     """
     work = df.copy()
     required = {"close", "high", "low", "volume"}
@@ -921,6 +1070,7 @@ def get_adaptive_params(df: pd.DataFrame) -> dict:
         raise ValueError("Пустой DataFrame после очистки")
 
     current_price = float(work["close"].iloc[-1])
+    _ = symbol  # API-совместимость; профиль не привязываем к биржевому tick.
     tick_size = max(current_price * 0.0005, 1e-8)
 
     work["price_bin"] = (work["close"] / tick_size).round() * tick_size
@@ -969,7 +1119,7 @@ def get_adaptive_params(df: pd.DataFrame) -> dict:
 
 
 def analyze_coin_zones(df: pd.DataFrame, symbol: str = "BTC/USDT") -> pd.DataFrame:
-    params = get_adaptive_params(df)
+    params = get_adaptive_params(df, symbol=symbol)
     print(
         f"--- Анализ {symbol} --- "
         f"Dist: {params['distance_pct']:.4f}, Valley: {params['valley_threshold']}"
@@ -977,6 +1127,7 @@ def analyze_coin_zones(df: pd.DataFrame, symbol: str = "BTC/USDT") -> pd.DataFra
     hm = params.get("height_mult")
     return find_pro_levels(
         df,
+        symbol=symbol,
         smoothing_window=int(params.get("smoothing_window", 5)),
         height_percentile=float(params.get("height_percentile", 0.8)),
         height_percentile_strong=float(params.get("height_percentile_strong", 0.85)),

@@ -54,7 +54,8 @@ OI_TIMEFRAMES = ["1h", "4h", "1d"]  # Bybit intervalTime
 # fresh liquidations are collected from Bybit WebSocket stream.
 LIQUIDATIONS_UPDATE_INTERVAL = 300  # seconds
 LIQUIDATIONS_MAX_RECORDS = 200  # approx. number of latest liquidation events to collect
-LIQUIDATIONS_AGGREGATE_TIMEFRAMES = ["1h"]  # stored timeframe buckets in `liquidations`
+# 1h + 4h: экспорт в Sheets и отчёты ожидают 4h-бакеты для блока ликвидаций.
+LIQUIDATIONS_AGGREGATE_TIMEFRAMES = ["1h", "4h"]  # stored timeframe buckets in `liquidations`
 
 # Таймфреймы по категориям.
 # Важно: макро/индексы оставлены как списки для обратной совместимости с текущими вызовами,
@@ -132,3 +133,49 @@ COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY", "")
 FILL_MISSING_WEEKENDS = True
 MACRO_TIMEZONE = "US/Eastern"
 YFINANCE_TIMEZONE = MACRO_TIMEZONE
+
+# -----------------------------------------------------------------------------
+# Volume Profile Peaks (HVN) tuning (для поиска `final=2/3/...`)
+# -----------------------------------------------------------------------------
+#
+# Важно: ранее эти параметры читались из env `PRO_LEVELS_*`.
+# Сейчас они задаются в конфиге, чтобы расчет был встроен в проект.
+# Любой параметр = None означает: использовать adaptive-значение из
+# `get_adaptive_params()` (см. `analytics/volume_profile_peaks.py`).
+#
+# Настройка окна расчёта:
+#   - если PRO_LEVELS_LOOKBACK_DAYS/HOURS = None → берём предыдущий календарный месяц
+#   - если задано → окно считается от последней 1m-свечи в БД (anchor)
+
+PRO_LEVELS_LOOKBACK_DAYS = None
+PRO_LEVELS_LOOKBACK_HOURS = None
+
+# Core toggles / thresholds
+PRO_LEVELS_HEIGHT_MULT = None
+PRO_LEVELS_DISTANCE_PCT = None
+PRO_LEVELS_VALLEY_THRESHOLD = None
+
+PRO_LEVELS_MIN_DURATION_HOURS = None
+PRO_LEVELS_MAX_LEVELS = None
+PRO_LEVELS_INCLUDE_ALL_TIERS = None
+
+PRO_LEVELS_FINAL_MERGE_PCT = None  # если None — берётся dynamic_merge_pct (adaptive)
+PRO_LEVELS_VALLEY_MERGE_THRESHOLD = None
+PRO_LEVELS_ENABLE_VALLEY_MERGE = True
+
+PRO_LEVELS_DEDUP_ROUND_PCT = None
+PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD = None
+
+PRO_LEVELS_LEGACY_WEAK_MERGE = False
+PRO_LEVELS_RUN_SOFT_PASS = True
+
+PRO_LEVELS_STRICT_HEIGHT_WEAK = None
+PRO_LEVELS_STRICT_HEIGHT_MULT = None
+
+PRO_LEVELS_SOFT_HEIGHT_STRONG = None
+PRO_LEVELS_SOFT_HEIGHT_WEAK = None
+PRO_LEVELS_SOFT_HEIGHT_MULT = None
+PRO_LEVELS_SOFT_FINAL_MERGE_PCT = None
+
+PRO_LEVELS_EXCLUDE_RESERVED_PCT = None
+PRO_LEVELS_WEAK_MIN_DURATION = None

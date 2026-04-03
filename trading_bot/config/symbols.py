@@ -19,13 +19,11 @@ TRADING_SYMBOLS: list[str] = [
     "TIA/USDT",
     "LTC/USDT",
     "WIF/USDT",
-    "1000PEPE/USDT",
     "DOGE/USDT",
     "AVAX/USDT",
     "APT/USDT",
     "ARB/USDT",
     "OP/USDT",
-    "POPCAT/USDT",
     "ORDI/USDT",
 ]
 

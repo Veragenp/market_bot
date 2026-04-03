@@ -76,3 +76,12 @@ def test_wal_enabled(clean_db):
     mode = cursor.fetchone()[0]
     assert mode == 'wal'
     conn.close()
+
+
+def test_instruments_has_atr_column(clean_db):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(instruments)")
+    cols = {row[1] for row in cursor.fetchall()}
+    assert "atr" in cols
+    conn.close()

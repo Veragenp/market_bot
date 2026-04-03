@@ -34,6 +34,7 @@ from trading_bot.analytics.volume_profile_peaks import (
     get_adaptive_params,
 )
 from trading_bot.data.repositories import get_ohlcv_filled
+from trading_bot.data.volume_profile_peaks_db import LEVEL_TYPE_VOLUME_PROFILE_PEAKS
 from trading_bot.tools.sheets_exporter import SheetsExporter
 
 SHEET_TITLE = os.getenv("MARKET_AUDIT_SHEET_TITLE", "Market Data Audit")
@@ -43,12 +44,12 @@ SHEET_ID = os.getenv("MARKET_AUDIT_SHEET_ID")
 DYNAMIC_ZONES_SYMBOL = os.getenv("DYNAMIC_ZONES_SYMBOL", "BTC/USDT")
 # Список пар для листов volume profile (через запятую); если пусто — три пары по умолчанию.
 VOLUME_PEAK_SYMBOLS = os.getenv("VOLUME_PEAK_SYMBOLS")
-DEFAULT_VOLUME_PEAK_SYMBOLS = "BTC/USDT,SOL/USDT,AAVE/USDT"
+DEFAULT_VOLUME_PEAK_SYMBOLS = ",".join(TRADING_SYMBOLS)
 
 
 def resolve_volume_peak_export_symbols() -> str:
-    if VOLUME_PEAK_SYMBOLS and str(VOLUME_PEAK_SYMBOLS).strip():
-        return str(VOLUME_PEAK_SYMBOLS).strip()
+    # По требованию проекта: всегда берём символы из `trading_bot/config/symbols.py`.
+    # env-переопределение `VOLUME_PEAK_SYMBOLS` не используется.
     return DEFAULT_VOLUME_PEAK_SYMBOLS
 DYNAMIC_ZONES_YEAR = os.getenv("DYNAMIC_ZONES_YEAR")
 DYNAMIC_ZONES_MONTH = os.getenv("DYNAMIC_ZONES_MONTH")
@@ -68,27 +69,10 @@ VOLUME_PEAK_LEVELS_WORKSHEET = os.getenv(
 VOLUME_PEAK_ANALYSIS_WORKSHEET = os.getenv(
     "VOLUME_PEAK_ANALYSIS_WORKSHEET", "volume_profile_peaks_analysis"
 )
-PRO_LEVELS_HEIGHT_MULT = os.getenv("PRO_LEVELS_HEIGHT_MULT")
-PRO_LEVELS_DISTANCE_PCT = os.getenv("PRO_LEVELS_DISTANCE_PCT")
-PRO_LEVELS_VALLEY_THRESHOLD = os.getenv("PRO_LEVELS_VALLEY_THRESHOLD")
-PRO_LEVELS_MIN_DURATION_HOURS = os.getenv("PRO_LEVELS_MIN_DURATION_HOURS")
-PRO_LEVELS_MAX_LEVELS = os.getenv("PRO_LEVELS_MAX_LEVELS")
-PRO_LEVELS_INCLUDE_ALL_TIERS = os.getenv("PRO_LEVELS_INCLUDE_ALL_TIERS")
-PRO_LEVELS_FINAL_MERGE_PCT = os.getenv("PRO_LEVELS_FINAL_MERGE_PCT")
-PRO_LEVELS_VALLEY_MERGE_THRESHOLD = os.getenv("PRO_LEVELS_VALLEY_MERGE_THRESHOLD")
-PRO_LEVELS_ENABLE_VALLEY_MERGE = os.getenv("PRO_LEVELS_ENABLE_VALLEY_MERGE", "true")
-PRO_LEVELS_DEDUP_ROUND_PCT = os.getenv("PRO_LEVELS_DEDUP_ROUND_PCT")
-PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD = os.getenv("PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD")
-PRO_LEVELS_LEGACY_WEAK_MERGE = os.getenv("PRO_LEVELS_LEGACY_WEAK_MERGE", "false")
-PRO_LEVELS_RUN_SOFT_PASS = os.getenv("PRO_LEVELS_RUN_SOFT_PASS", "true")
-PRO_LEVELS_STRICT_HEIGHT_WEAK = os.getenv("PRO_LEVELS_STRICT_HEIGHT_WEAK")
-PRO_LEVELS_STRICT_HEIGHT_MULT = os.getenv("PRO_LEVELS_STRICT_HEIGHT_MULT")
-PRO_LEVELS_SOFT_HEIGHT_STRONG = os.getenv("PRO_LEVELS_SOFT_HEIGHT_STRONG")
-PRO_LEVELS_SOFT_HEIGHT_WEAK = os.getenv("PRO_LEVELS_SOFT_HEIGHT_WEAK")
-PRO_LEVELS_SOFT_HEIGHT_MULT = os.getenv("PRO_LEVELS_SOFT_HEIGHT_MULT")
-PRO_LEVELS_SOFT_FINAL_MERGE_PCT = os.getenv("PRO_LEVELS_SOFT_FINAL_MERGE_PCT")
-PRO_LEVELS_EXCLUDE_RESERVED_PCT = os.getenv("PRO_LEVELS_EXCLUDE_RESERVED_PCT")
-PRO_LEVELS_WEAK_MIN_DURATION = os.getenv("PRO_LEVELS_WEAK_MIN_DURATION")
+
+# Важно: пики volume_profile_peaks в Google Sheets теперь выгружаются
+# строго из SQLite `price_levels` (посчитанные и сохраненные скриптом rebuild).
+# Поэтому параметры `PRO_LEVELS_*` больше не читаются из env здесь.
 
 
 def _ts_to_iso_utc(ts: int) -> str:
@@ -482,40 +466,30 @@ def _fetch_volume_peak_levels_for_sheet(symbol: str) -> tuple[pd.DataFrame, pd.D
 
 def _volume_peak_levels_one(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Один символ: уровни для листа + одна строка аудита."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Берём только активные уровни последнего пересчёта (max created_at) для `symbol`.
     conn = get_connection()
-    df = pd.read_sql_query(
+    cur = conn.cursor()
+    cur.execute(
         """
-        SELECT timestamp, open, high, low, close, volume
-        FROM ohlcv
-        WHERE symbol = ? AND timeframe = '1m'
-        ORDER BY timestamp
+        SELECT MAX(created_at)
+        FROM price_levels
+        WHERE symbol = ? AND level_type = ? AND is_active = 1
         """,
-        conn,
-        params=(symbol,),
+        (symbol, LEVEL_TYPE_VOLUME_PROFILE_PEAKS),
     )
-    conn.close()
-
-    year: int | None = None
-    month: int | None = None
-    if DYNAMIC_ZONES_YEAR and DYNAMIC_ZONES_MONTH:
-        year = int(DYNAMIC_ZONES_YEAR)
-        month = int(DYNAMIC_ZONES_MONTH)
-    if year is None or month is None:
-        year, month = _default_prev_calendar_month_utc()
-
-    exported_at = datetime.now(timezone.utc).isoformat()
-    month_label = f"{year}-{month:02d}"
-    base_meta = {"symbol": symbol, "month_utc": month_label, "exported_at_utc": exported_at}
-
-    work = slice_calendar_month_utc(df, year, month)
-    if work.empty:
-        row = {**base_meta, "note": "Нет 1m данных за выбранный месяц"}
+    row = cur.fetchone()
+    max_created_at = int(row[0]) if row and row[0] is not None else None
+    if max_created_at is None:
+        conn.close()
+        out = pd.DataFrame([{"symbol": symbol, "month_utc": "", "exported_at_utc": now_iso, "note": "Нет активных уровней"}])
         audit = pd.DataFrame(
             [
                 {
                     "symbol": symbol,
-                    "month_utc": month_label,
-                    "exported_at_utc": exported_at,
+                    "month_utc": "",
+                    "exported_at_utc": now_iso,
                     "strict_raw_n": 0,
                     "strict_dedup_n": 0,
                     "final_levels_n": 0,
@@ -525,286 +499,134 @@ def _volume_peak_levels_one(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
                     "two_pass_mode": "",
                     "run_soft_pass": "",
                     "legacy_weak_merge": "",
-                    "note": row["note"],
+                    "dedup_round_pct": "",
+                    "distance_pct": "",
+                    "final_merge_pct": "",
+                    "note": "Нет активных levels в price_levels",
                 }
             ]
         )
-        return pd.DataFrame([row]), audit
+        return out, audit
 
-    params = get_adaptive_params(work)
-    height_mult: float | None = float(PRO_LEVELS_HEIGHT_MULT) if PRO_LEVELS_HEIGHT_MULT else None
-    distance_pct = (
-        float(PRO_LEVELS_DISTANCE_PCT) if PRO_LEVELS_DISTANCE_PCT else float(params["distance_pct"])
+    cur.execute(
+        """
+        SELECT
+            layer,
+            price,
+            volume_peak,
+            duration_hours,
+            tier,
+            t_start_unix,
+            t_end_unix,
+            created_at
+        FROM price_levels
+        WHERE symbol = ? AND level_type = ? AND is_active = 1 AND created_at = ?
+        ORDER BY volume_peak DESC, price ASC
+        """,
+        (symbol, LEVEL_TYPE_VOLUME_PROFILE_PEAKS, max_created_at),
     )
-    valley_threshold = (
-        float(PRO_LEVELS_VALLEY_THRESHOLD)
-        if PRO_LEVELS_VALLEY_THRESHOLD
-        else float(params["valley_threshold"])
-    )
-    tick_size = float(params["tick_size"])
-    avg_hourly_volatility = float(params["avg_hourly_volatility"])
-    volume_cv = float(params["volume_cv"])
-    top_n = int(params.get("top_n", 10))
-    min_duration_hours = float(params.get("min_duration_hours", 6.0))
-    max_levels: int | None = params.get("max_levels")
-    if PRO_LEVELS_MIN_DURATION_HOURS is not None and str(PRO_LEVELS_MIN_DURATION_HOURS).strip() != "":
-        min_duration_hours = float(PRO_LEVELS_MIN_DURATION_HOURS)
-    if PRO_LEVELS_MAX_LEVELS is not None and str(PRO_LEVELS_MAX_LEVELS).strip() != "":
-        max_levels = int(PRO_LEVELS_MAX_LEVELS)
-    include_all_tiers = True
-    if PRO_LEVELS_INCLUDE_ALL_TIERS is not None and str(PRO_LEVELS_INCLUDE_ALL_TIERS).strip() != "":
-        include_all_tiers = str(PRO_LEVELS_INCLUDE_ALL_TIERS).strip().lower() not in ("0", "false", "no", "off")
-    final_merge_pct: float | None = params.get("dynamic_merge_pct")
-    if PRO_LEVELS_FINAL_MERGE_PCT is not None and str(PRO_LEVELS_FINAL_MERGE_PCT).strip() != "":
-        final_merge_pct = float(PRO_LEVELS_FINAL_MERGE_PCT)
-    valley_merge_threshold = float(params.get("valley_merge_threshold", 0.5))
-    if PRO_LEVELS_VALLEY_MERGE_THRESHOLD is not None and str(PRO_LEVELS_VALLEY_MERGE_THRESHOLD).strip() != "":
-        valley_merge_threshold = float(PRO_LEVELS_VALLEY_MERGE_THRESHOLD)
-    enable_valley_merge = str(PRO_LEVELS_ENABLE_VALLEY_MERGE).strip().lower() == "true"
-    dedup_round_pct = float(params.get("dedup_round_pct", 0.001))
-    if PRO_LEVELS_DEDUP_ROUND_PCT is not None and str(PRO_LEVELS_DEDUP_ROUND_PCT).strip() != "":
-        dedup_round_pct = float(PRO_LEVELS_DEDUP_ROUND_PCT)
-    final_merge_valley_threshold: float | None = params.get("final_merge_valley_threshold")
-    if (
-        PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD is not None
-        and str(PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD).strip() != ""
-    ):
-        final_merge_valley_threshold = float(PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
 
-    legacy_weak_merge = str(PRO_LEVELS_LEGACY_WEAK_MERGE).strip().lower() in ("1", "true", "yes", "on")
-    run_soft_pass = str(PRO_LEVELS_RUN_SOFT_PASS).strip().lower() not in ("0", "false", "no", "off")
-    strict_height_percentile_weak: float | None = None
-    if PRO_LEVELS_STRICT_HEIGHT_WEAK is not None and str(PRO_LEVELS_STRICT_HEIGHT_WEAK).strip() != "":
-        strict_height_percentile_weak = float(PRO_LEVELS_STRICT_HEIGHT_WEAK)
-    strict_height_mult: float | None = None
-    if PRO_LEVELS_STRICT_HEIGHT_MULT is not None and str(PRO_LEVELS_STRICT_HEIGHT_MULT).strip() != "":
-        strict_height_mult = float(PRO_LEVELS_STRICT_HEIGHT_MULT)
-    soft_height_percentile_strong = 0.6
-    soft_height_percentile_weak = 0.55
-    if PRO_LEVELS_SOFT_HEIGHT_STRONG is not None and str(PRO_LEVELS_SOFT_HEIGHT_STRONG).strip() != "":
-        soft_height_percentile_strong = float(PRO_LEVELS_SOFT_HEIGHT_STRONG)
-    if PRO_LEVELS_SOFT_HEIGHT_WEAK is not None and str(PRO_LEVELS_SOFT_HEIGHT_WEAK).strip() != "":
-        soft_height_percentile_weak = float(PRO_LEVELS_SOFT_HEIGHT_WEAK)
-    soft_height_mult: float | None = None
-    if PRO_LEVELS_SOFT_HEIGHT_MULT is not None and str(PRO_LEVELS_SOFT_HEIGHT_MULT).strip() != "":
-        soft_height_mult = float(PRO_LEVELS_SOFT_HEIGHT_MULT)
-    soft_final_merge_pct: float | None = None
-    if PRO_LEVELS_SOFT_FINAL_MERGE_PCT is not None and str(PRO_LEVELS_SOFT_FINAL_MERGE_PCT).strip() != "":
-        soft_final_merge_pct = float(PRO_LEVELS_SOFT_FINAL_MERGE_PCT)
-    exclude_reserved_pct: float | None = None
-    if PRO_LEVELS_EXCLUDE_RESERVED_PCT is not None and str(PRO_LEVELS_EXCLUDE_RESERVED_PCT).strip() != "":
-        exclude_reserved_pct = float(PRO_LEVELS_EXCLUDE_RESERVED_PCT)
-    soft_min_duration_hours = 4.0
-    if PRO_LEVELS_WEAK_MIN_DURATION is not None and str(PRO_LEVELS_WEAK_MIN_DURATION).strip() != "":
-        soft_min_duration_hours = float(PRO_LEVELS_WEAK_MIN_DURATION)
-
-    height_percentile_strong = float(params.get("height_percentile_strong", 0.85))
-    height_percentile_weak = float(params.get("height_percentile_weak", 0.65))
-    two_pass_mode = not legacy_weak_merge
-
-    real_min_tick = float(params.get("real_min_tick", 0.0))
-    price_band_usdt = float(params.get("price_band_usdt", 0.0))
-    base_meta = {
-        **base_meta,
-        "height_mult": height_mult,
-        "distance_pct": distance_pct,
-        "valley_threshold": valley_threshold,
-        "tick_size": tick_size,
-        "avg_hourly_volatility": avg_hourly_volatility,
-        "volume_cv": volume_cv,
-        "top_n": top_n,
-        "min_duration_hours": min_duration_hours,
-        "max_levels": "" if max_levels is None else max_levels,
-        "include_all_tiers": include_all_tiers,
-        "final_merge_pct": "" if final_merge_pct is None else final_merge_pct,
-        "valley_merge_threshold": valley_merge_threshold,
-        "enable_valley_merge": enable_valley_merge,
-        "dedup_round_pct": dedup_round_pct,
-        "final_merge_valley_threshold": (
-            "" if final_merge_valley_threshold is None else final_merge_valley_threshold
-        ),
-        "legacy_weak_merge": legacy_weak_merge,
-        "run_soft_pass": run_soft_pass,
-        "two_pass_mode": two_pass_mode,
-        "height_percentile_strong": height_percentile_strong,
-        "height_percentile_weak": height_percentile_weak,
-        "strict_height_percentile_weak": (
-            "" if strict_height_percentile_weak is None else strict_height_percentile_weak
-        ),
-        "strict_height_mult": "" if strict_height_mult is None else strict_height_mult,
-        "soft_height_percentile_strong": soft_height_percentile_strong,
-        "soft_height_percentile_weak": soft_height_percentile_weak,
-        "soft_height_mult": "" if soft_height_mult is None else soft_height_mult,
-        "soft_min_duration_hours": soft_min_duration_hours,
-        "soft_final_merge_pct": "" if soft_final_merge_pct is None else soft_final_merge_pct,
-        "exclude_reserved_pct": "" if exclude_reserved_pct is None else exclude_reserved_pct,
-        "real_min_tick": real_min_tick,
-        "price_band_usdt": price_band_usdt,
-    }
-
-    try:
-        common_kw = dict(
-            height_mult=height_mult,
-            distance_pct=distance_pct,
-            valley_threshold=valley_threshold,
-            tick_size=tick_size,
-            top_n=top_n,
-            min_duration_hours=min_duration_hours,
-            max_levels=max_levels,
-            include_all_tiers=include_all_tiers,
-            final_merge_pct=final_merge_pct,
-            valley_merge_threshold=valley_merge_threshold,
-            enable_valley_merge=enable_valley_merge,
-            allow_stage_b_overlap=True,
-            dedup_round_pct=dedup_round_pct,
-            final_merge_valley_threshold=final_merge_valley_threshold,
-            legacy_weak_merge=legacy_weak_merge,
-            two_pass_mode=two_pass_mode,
-            run_soft_pass=run_soft_pass,
-            height_percentile_strong=height_percentile_strong,
-            height_percentile_weak=height_percentile_weak,
-            strict_height_percentile_weak=strict_height_percentile_weak,
-            strict_height_mult=strict_height_mult,
-            exclude_reserved_pct=exclude_reserved_pct,
-            soft_height_percentile_strong=soft_height_percentile_strong,
-            soft_height_percentile_weak=soft_height_percentile_weak,
-            soft_height_mult=soft_height_mult,
-            soft_min_duration_hours=soft_min_duration_hours,
-            soft_final_merge_pct=soft_final_merge_pct,
-        )
-        raw_levels = find_pro_levels(work, **common_kw, return_raw=True)
-        dedup_levels = find_pro_levels(work, **common_kw, return_dedup=True)
-        final_levels = find_pro_levels(work, **common_kw)
-        print(
-            f"[{symbol} {month_label}] levels raw={len(raw_levels)} dedup={len(dedup_levels)} final={len(final_levels)} "
-            f"merge_pct={final_merge_pct} valley_merge={enable_valley_merge} vm_thr={valley_merge_threshold}"
-        )
-    except RuntimeError as e:
-        row = {**base_meta, "note": str(e)}
+    if not rows:
+        out = pd.DataFrame([{"symbol": symbol, "month_utc": "", "exported_at_utc": now_iso, "note": "Нет строк"}])
         audit = pd.DataFrame(
             [
                 {
                     "symbol": symbol,
-                    "month_utc": month_label,
-                    "exported_at_utc": exported_at,
+                    "month_utc": "",
+                    "exported_at_utc": now_iso,
                     "strict_raw_n": 0,
                     "strict_dedup_n": 0,
                     "final_levels_n": 0,
                     "tier1_beton_n": 0,
                     "tier2_n": 0,
                     "tier3_n": 0,
-                    "two_pass_mode": two_pass_mode,
-                    "run_soft_pass": run_soft_pass,
-                    "legacy_weak_merge": legacy_weak_merge,
-                    "note": str(e),
+                    "two_pass_mode": "",
+                    "run_soft_pass": "",
+                    "legacy_weak_merge": "",
+                    "dedup_round_pct": "",
+                    "distance_pct": "",
+                    "final_merge_pct": "",
+                    "note": "Нет строк активных levels в price_levels",
                 }
             ]
         )
-        return pd.DataFrame([row]), audit
+        return out, audit
 
-    if final_levels.empty:
-        row = {**base_meta, "note": "Нет пиков по заданным height_mult / distance_pct"}
-        audit = pd.DataFrame(
-            [
-                {
-                    "symbol": symbol,
-                    "month_utc": month_label,
-                    "exported_at_utc": exported_at,
-                    "strict_raw_n": len(raw_levels),
-                    "strict_dedup_n": len(dedup_levels),
-                    "final_levels_n": 0,
-                    "tier1_beton_n": 0,
-                    "tier2_n": 0,
-                    "tier3_n": 0,
-                    "two_pass_mode": two_pass_mode,
-                    "run_soft_pass": run_soft_pass,
-                    "legacy_weak_merge": legacy_weak_merge,
-                    "note": row["note"],
-                }
-            ]
-        )
-        return pd.DataFrame([row]), audit
+    # month_utc: если задан env, используем его; иначе — из t_end_unix первого уровня.
+    month_label: str
+    if DYNAMIC_ZONES_YEAR and DYNAMIC_ZONES_MONTH:
+        year = int(DYNAMIC_ZONES_YEAR)
+        month = int(DYNAMIC_ZONES_MONTH)
+        month_label = f"{year}-{month:02d}"
+    else:
+        end_unix = rows[0].get("t_end_unix")
+        if end_unix is not None:
+            dt = datetime.fromtimestamp(int(end_unix), tz=timezone.utc)
+            month_label = f"{dt.year}-{dt.month:02d}"
+        else:
+            prev_y, prev_m = _default_prev_calendar_month_utc()
+            month_label = f"{prev_y}-{prev_m:02d}"
 
-    out = final_levels.copy()
-    out.insert(0, "symbol", symbol)
-    out.insert(1, "month_utc", month_label)
-    out["exported_at_utc"] = exported_at
-    out["height_mult"] = height_mult
-    out["distance_pct"] = distance_pct
-    out["valley_threshold"] = valley_threshold
-    out["tick_size"] = tick_size
-    out["avg_hourly_volatility"] = avg_hourly_volatility
-    out["volume_cv"] = volume_cv
-    out["top_n"] = top_n
-    out["min_duration_hours"] = min_duration_hours
-    out["max_levels"] = "" if max_levels is None else max_levels
-    out["include_all_tiers"] = include_all_tiers
-    out["final_merge_pct"] = "" if final_merge_pct is None else final_merge_pct
-    out["valley_merge_threshold"] = valley_merge_threshold
-    out["enable_valley_merge"] = enable_valley_merge
-    out["dedup_round_pct"] = dedup_round_pct
-    out["final_merge_valley_threshold"] = (
-        "" if final_merge_valley_threshold is None else final_merge_valley_threshold
+    def _ts_to_iso(v: object) -> str:
+        if v is None:
+            return ""
+        try:
+            return _ts_to_iso_utc(int(v))
+        except Exception:
+            return ""
+
+    out = pd.DataFrame(
+        [
+            {
+                "symbol": symbol,
+                "month_utc": month_label,
+                "exported_at_utc": now_iso,
+                "layer": r.get("layer"),
+                "Цена уровня": float(r.get("price")) if r.get("price") is not None else None,
+                "Суммарный объем": float(r.get("volume_peak")) if r.get("volume_peak") is not None else None,
+                "Время жизни (ч)": float(r.get("duration_hours")) if r.get("duration_hours") is not None else None,
+                "Сила (Tier)": str(r.get("tier")) if r.get("tier") is not None else "",
+                "start_utc": _ts_to_iso(r.get("t_start_unix")),
+                "end_utc": _ts_to_iso(r.get("t_end_unix")),
+            }
+            for r in rows
+        ]
     )
-    out["legacy_weak_merge"] = legacy_weak_merge
-    out["run_soft_pass"] = run_soft_pass
-    out["two_pass_mode"] = two_pass_mode
-    out["height_percentile_strong"] = height_percentile_strong
-    out["height_percentile_weak"] = height_percentile_weak
-    out["strict_height_percentile_weak"] = (
-        "" if strict_height_percentile_weak is None else strict_height_percentile_weak
+
+    t1 = int((out["Сила (Tier)"] == "Tier 1 (Бетон)").sum())
+    t2 = int(out["Сила (Tier)"].astype(str).str.contains("Tier 2", na=False).sum())
+    t3 = int(out["Сила (Tier)"].astype(str).str.contains("Tier 3", na=False).sum())
+
+    audit = pd.DataFrame(
+        [
+            {
+                "symbol": symbol,
+                "month_utc": month_label,
+                "exported_at_utc": now_iso,
+                "strict_raw_n": 0,
+                "strict_dedup_n": 0,
+                "final_levels_n": len(out),
+                "tier1_beton_n": t1,
+                "tier2_n": t2,
+                "tier3_n": t3,
+                "two_pass_mode": "",
+                "run_soft_pass": "",
+                "legacy_weak_merge": "",
+                "dedup_round_pct": "",
+                "distance_pct": "",
+                "final_merge_pct": "",
+                "note": "Считано из price_levels (is_active=1)",
+            }
+        ]
     )
-    out["strict_height_mult"] = "" if strict_height_mult is None else strict_height_mult
-    out["soft_height_percentile_strong"] = soft_height_percentile_strong
-    out["soft_height_percentile_weak"] = soft_height_percentile_weak
-    out["soft_height_mult"] = "" if soft_height_mult is None else soft_height_mult
-    out["soft_min_duration_hours"] = soft_min_duration_hours
-    out["soft_final_merge_pct"] = "" if soft_final_merge_pct is None else soft_final_merge_pct
-    out["exclude_reserved_pct"] = "" if exclude_reserved_pct is None else exclude_reserved_pct
-    out["real_min_tick"] = real_min_tick
-    out["price_band_usdt"] = price_band_usdt
-    out = out.rename(
-        columns={
-            "Price": "Цена уровня",
-            "Volume": "Суммарный объем",
-            "Duration_Hrs": "Время жизни (ч)",
-            "Tier": "Сила (Tier)",
-        }
-    )
+
+    # Сверяемся с предыдущими ожиданиями: оставляем только колонки, которые реально нужны/существуют.
     cols = [
         "symbol",
         "month_utc",
         "exported_at_utc",
-        "height_mult",
-        "distance_pct",
-        "valley_threshold",
-        "tick_size",
-        "avg_hourly_volatility",
-        "volume_cv",
-        "top_n",
-        "min_duration_hours",
-        "max_levels",
-        "include_all_tiers",
-        "final_merge_pct",
-        "valley_merge_threshold",
-        "enable_valley_merge",
-        "dedup_round_pct",
-        "final_merge_valley_threshold",
-        "legacy_weak_merge",
-        "run_soft_pass",
-        "two_pass_mode",
-        "height_percentile_strong",
-        "height_percentile_weak",
-        "strict_height_percentile_weak",
-        "strict_height_mult",
-        "soft_height_percentile_strong",
-        "soft_height_percentile_weak",
-        "soft_height_mult",
-        "soft_min_duration_hours",
-        "soft_final_merge_pct",
-        "exclude_reserved_pct",
-        "real_min_tick",
-        "price_band_usdt",
         "Цена уровня",
         "Суммарный объем",
         "Время жизни (ч)",
@@ -813,35 +635,6 @@ def _volume_peak_levels_one(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         "end_utc",
     ]
     out = out[[c for c in cols if c in out.columns]]
-    if not final_levels.empty and "Tier" in final_levels.columns:
-        t1 = int((final_levels["Tier"] == "Tier 1 (Бетон)").sum())
-        ser = final_levels["Tier"].astype(str)
-        t2 = int(ser.str.contains("Tier 2", na=False).sum())
-        t3 = int(ser.str.contains("Tier 3", na=False).sum())
-    else:
-        t1 = t2 = t3 = 0
-    audit = pd.DataFrame(
-        [
-            {
-                "symbol": symbol,
-                "month_utc": month_label,
-                "exported_at_utc": exported_at,
-                "strict_raw_n": len(raw_levels),
-                "strict_dedup_n": len(dedup_levels),
-                "final_levels_n": len(final_levels),
-                "tier1_beton_n": t1,
-                "tier2_n": t2,
-                "tier3_n": t3,
-                "two_pass_mode": two_pass_mode,
-                "run_soft_pass": run_soft_pass,
-                "legacy_weak_merge": legacy_weak_merge,
-                "dedup_round_pct": dedup_round_pct,
-                "distance_pct": distance_pct,
-                "final_merge_pct": "" if final_merge_pct is None else final_merge_pct,
-                "note": "",
-            }
-        ]
-    )
     return out, audit
 
 

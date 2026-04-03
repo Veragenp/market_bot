@@ -174,8 +174,8 @@
 
 Файлы:
 
-- `src/tools/sheets_exporter.py`
-- `scripts/export_to_sheets.py`
+- `trading_bot/tools/sheets_exporter.py`
+- `trading_bot/google_sheets/export_to_sheets.py`
 
 Листы в таблице:
 
@@ -193,7 +193,11 @@
 
 Запуск:
 
-- `python scripts/export_to_sheets.py`
+- Перед экспортом для volume profile peaks нужно сначала заполнить `price_levels` в БД:
+  - `python trading_bot/scripts/rebuild_volume_profile_peaks_to_db.py`
+  - (опционально) настроить окно расчёта через env `PRO_LEVELS_LOOKBACK_DAYS` или `PRO_LEVELS_LOOKBACK_HOURS`
+- Затем экспортировать:
+  - `python trading_bot/google_sheets/export_to_sheets.py`
 
 ---
 
@@ -250,7 +254,8 @@
    - вручную через функции коллекторов
    - или `python scripts/run_scheduler.py`
 5. Экспорт:
-   - `python scripts/export_to_sheets.py`
+   - `python trading_bot/scripts/rebuild_volume_profile_peaks_to_db.py`
+   - `python trading_bot/google_sheets/export_to_sheets.py`
 
 ---
 

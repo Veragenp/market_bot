@@ -6,7 +6,9 @@ import logging
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
+from trading_bot.analytics.atr import GERCHIK_ATR_BARS, atr_gerchik_from_ohlcv_rows
 from trading_bot.config.settings import (
+    DEFAULT_SOURCE_BINANCE,
     HISTORY_START_TS,
     INTRADAY_1M_DAYS,
     INSTRUMENTS_SYMBOLS_TO_UPDATE,
@@ -116,6 +118,50 @@ class DataLoaderManager:
                 data=rec,
             )
         return len(records)
+
+    def update_instruments_atr_for_trading_symbols(
+        self,
+        *,
+        source: str = DEFAULT_SOURCE_BINANCE,
+        ohlcv_limit: int = 400,
+    ) -> int:
+        """
+        Пишет в `instruments.atr` (bybit_futures): ATR в стиле Герчика по **последним 10** дневным
+        свечам spot (см. `GERCHIK_ATR_BARS`). Свечи **только из SQLite** (`get_ohlcv`), без прямых
+        запросов к бирже на этом шаге. Нужна строка в `instruments`.
+        """
+        updated = 0
+        for symbol_internal in TRADING_SYMBOLS:
+            bybit_sym = self._to_bybit_symbol(symbol_internal)
+            if not self.instruments_repo.get(bybit_sym, "bybit_futures"):
+                logger.warning("ATR skip %s: no instruments row for %s", symbol_internal, bybit_sym)
+                continue
+            rows = get_ohlcv(
+                symbol_internal,
+                "1d",
+                source=source,
+                limit=ohlcv_limit,
+            )
+            atr_val = atr_gerchik_from_ohlcv_rows(rows)
+            if atr_val is None:
+                logger.warning(
+                    "ATR skip %s: insufficient 1d OHLCV (source=%s, rows=%s, need>=%s)",
+                    symbol_internal,
+                    source,
+                    len(rows),
+                    GERCHIK_ATR_BARS,
+                )
+                continue
+            self.instruments_repo.update_atr(bybit_sym, "bybit_futures", atr_val)
+            updated += 1
+            logger.info("ATR updated %s -> %s (gerchik, last %s bars)", symbol_internal, atr_val, GERCHIK_ATR_BARS)
+        return updated
+
+    def update_instruments_daily(self) -> None:
+        """Bybit поля инструмента + ATR по TRADING_SYMBOLS (для ежедневного job)."""
+        n_inst = self.update_instruments_for_symbols(list(TRADING_SYMBOLS))
+        n_atr = self.update_instruments_atr_for_trading_symbols()
+        logger.info("Daily instruments: bybit rows=%s, atr_updated=%s", n_inst, n_atr)
 
     def is_tradable(self, symbol_internal: str) -> bool:
         """Фильтр по ликвидности (avg_volume_24h в USDT)."""

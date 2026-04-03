@@ -299,6 +299,7 @@ def save_instrument(
     tick_size: Optional[float] = None,
     min_qty: Optional[float] = None,
     avg_volume_24h: Optional[float] = None,
+    atr: Optional[float] = None,
     commission_open: Optional[float] = None,
     commission_close: Optional[float] = None,
 ) -> None:
@@ -308,18 +309,47 @@ def save_instrument(
     now = int(time.time())
     cursor.execute(
         """
-        INSERT INTO instruments (symbol, exchange, tick_size, min_qty, avg_volume_24h,
+        INSERT INTO instruments (symbol, exchange, tick_size, min_qty, avg_volume_24h, atr,
             commission_open, commission_close, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(symbol, exchange) DO UPDATE SET
             tick_size = excluded.tick_size,
             min_qty = excluded.min_qty,
             avg_volume_24h = excluded.avg_volume_24h,
+            atr = COALESCE(excluded.atr, instruments.atr),
             commission_open = excluded.commission_open,
             commission_close = excluded.commission_close,
             updated_at = excluded.updated_at
         """,
-        (symbol, exchange, tick_size, min_qty, avg_volume_24h, commission_open, commission_close, now),
+        (
+            symbol,
+            exchange,
+            tick_size,
+            min_qty,
+            avg_volume_24h,
+            atr,
+            commission_open,
+            commission_close,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_instrument_atr(symbol: str, exchange: str, atr: float) -> None:
+    """Только ATR + updated_at (строка `instruments` должна уже существовать)."""
+    _ensure_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = int(time.time())
+    cursor.execute(
+        """
+        UPDATE instruments
+        SET atr = ?, updated_at = ?
+        WHERE symbol = ? AND exchange = ?
+        """,
+        (atr, now, symbol, exchange),
     )
     conn.commit()
     conn.close()
@@ -391,9 +421,13 @@ class InstrumentsRepository:
             tick_size=data.get("tick_size"),
             min_qty=data.get("min_qty"),
             avg_volume_24h=data.get("avg_volume_24h"),
+            atr=data.get("atr"),
             commission_open=data.get("commission_open"),
             commission_close=data.get("commission_close"),
         )
+
+    def update_atr(self, symbol: str, exchange: str, atr: float) -> None:
+        update_instrument_atr(symbol, exchange, atr)
 
     def get(self, symbol: str, exchange: str) -> Optional[Dict[str, Any]]:
         return get_instrument(symbol, exchange)
