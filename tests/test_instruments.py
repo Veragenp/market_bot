@@ -1,23 +1,8 @@
-import os
-
 import pytest
 
 from trading_bot.config.settings import MIN_AVG_VOLUME_24H
 from trading_bot.data.data_loader import DataLoaderManager
-from trading_bot.data.db import DB_PATH
 from trading_bot.data.repositories import InstrumentsRepository, save_ohlcv
-from trading_bot.data.schema import init_db, run_migrations
-
-
-@pytest.fixture
-def clean_db():
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-    init_db()
-    run_migrations()
-    yield
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
 
 
 def test_is_tradable_filters_by_avg_volume(clean_db):

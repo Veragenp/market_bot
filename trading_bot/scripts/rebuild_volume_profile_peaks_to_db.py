@@ -297,6 +297,7 @@ def main() -> None:
             final_levels,
             layer=layer,
             level_type=LEVEL_TYPE_VOLUME_PROFILE_PEAKS,
+            timeframe="1m",
         )
 
         print(f"OK: {symbol} layer={layer} final={0 if final_levels is None else len(final_levels)}")

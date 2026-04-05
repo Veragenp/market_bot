@@ -9,11 +9,12 @@ from typing import Any, Dict, List, Optional
 
 from trading_bot.config.settings import DEFAULT_SOURCE_BINANCE, YFINANCE_TICKERS
 from trading_bot.data.db import get_connection
-from trading_bot.data.schema import init_db
+from trading_bot.data.schema import init_db, run_migrations
 
 
 def _ensure_db() -> None:
     init_db()
+    run_migrations()
 
 
 def save_ohlcv(symbol: str, timeframe: str, records: List[Dict[str, Any]]) -> None:

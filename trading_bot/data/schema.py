@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 
 from trading_bot.data.db import get_connection
 
@@ -179,7 +180,16 @@ def init_db() -> None:
             tier TEXT,
             created_at INTEGER NOT NULL,
             expires_at INTEGER,
-            is_active INTEGER DEFAULT 1
+            is_active INTEGER DEFAULT 1,
+            stable_level_id TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            origin TEXT NOT NULL DEFAULT 'auto',
+            timeframe TEXT,
+            parent_stable_level_id TEXT,
+            confirmed_human_at INTEGER,
+            updated_at INTEGER,
+            last_matched_calc_at INTEGER,
+            lookback_days INTEGER
         )
         """
     )
@@ -187,6 +197,12 @@ def init_db() -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pl_symbol_layer ON price_levels(symbol, layer)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pl_strength ON price_levels(symbol, strength DESC)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pl_tier ON price_levels(symbol, tier)")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pl_symbol_type_status ON price_levels(symbol, level_type, status)"
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pl_stable_level_id ON price_levels(stable_level_id)"
+    )
 
     cursor.execute(
         """
@@ -570,6 +586,69 @@ def run_migrations() -> None:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_le_stable ON level_events(stable_level_id)")
         cursor.execute(
             "INSERT INTO db_version (version, applied_at) VALUES (8, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 9:
+        pl_cols = _column_names(cursor, "price_levels")
+        if "stable_level_id" not in pl_cols:
+            cursor.execute("ALTER TABLE price_levels ADD COLUMN stable_level_id TEXT")
+        if "status" not in pl_cols:
+            cursor.execute(
+                "ALTER TABLE price_levels ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+            )
+        if "origin" not in pl_cols:
+            cursor.execute(
+                "ALTER TABLE price_levels ADD COLUMN origin TEXT NOT NULL DEFAULT 'auto'"
+            )
+        if "timeframe" not in pl_cols:
+            cursor.execute("ALTER TABLE price_levels ADD COLUMN timeframe TEXT")
+        if "parent_stable_level_id" not in pl_cols:
+            cursor.execute("ALTER TABLE price_levels ADD COLUMN parent_stable_level_id TEXT")
+        if "confirmed_human_at" not in pl_cols:
+            cursor.execute("ALTER TABLE price_levels ADD COLUMN confirmed_human_at INTEGER")
+        if "updated_at" not in pl_cols:
+            cursor.execute("ALTER TABLE price_levels ADD COLUMN updated_at INTEGER")
+        if "last_matched_calc_at" not in pl_cols:
+            cursor.execute("ALTER TABLE price_levels ADD COLUMN last_matched_calc_at INTEGER")
+        if "lookback_days" not in pl_cols:
+            cursor.execute("ALTER TABLE price_levels ADD COLUMN lookback_days INTEGER")
+
+        cursor.execute(
+            "UPDATE price_levels SET status = CASE WHEN is_active = 1 THEN 'active' ELSE 'archived' END"
+        )
+        cursor.execute(
+            "UPDATE price_levels SET updated_at = created_at WHERE updated_at IS NULL"
+        )
+
+        cursor.execute("SELECT id FROM price_levels WHERE stable_level_id IS NULL OR stable_level_id = ''")
+        for row in cursor.fetchall():
+            cursor.execute(
+                "UPDATE price_levels SET stable_level_id = ? WHERE id = ?",
+                (str(uuid.uuid4()), int(row["id"])),
+            )
+
+        cursor.execute(
+            "UPDATE price_levels SET level_type = 'vp_local' WHERE level_type = 'volume_profile_peaks'"
+        )
+        cursor.execute(
+            "UPDATE price_levels SET level_type = 'vp_global' WHERE level_type = 'volume_profile_htf'"
+        )
+        cursor.execute(
+            "UPDATE price_levels SET level_type = 'vp_global_4h_90d' "
+            "WHERE level_type = 'volume_profile_htf_4h_90d'"
+        )
+
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pl_symbol_type_status ON price_levels(symbol, level_type, status)"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pl_stable_level_id ON price_levels(stable_level_id)"
+        )
+
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (9, ?)",
             (int(time.time()),),
         )
         conn.commit()

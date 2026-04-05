@@ -1,21 +1,8 @@
-import os
 import sqlite3
 import pytest
-from trading_bot.data.db import get_connection, DB_PATH
+from trading_bot.data.db import get_connection
 from trading_bot.data.schema import init_db, run_migrations
 
-@pytest.fixture
-def clean_db():
-    """Фикстура для тестов: удаляет БД перед тестом, инициализирует, после теста удаляет."""
-    # Удаляем БД, если она существует
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-    init_db()
-    run_migrations()
-    yield
-    # После теста удаляем БД
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
 
 def test_tables_exist(clean_db):
     """Проверяет, что все таблицы созданы."""
@@ -59,6 +46,8 @@ def test_indices_exist(clean_db):
         "idx_instruments_exchange",
         "idx_pl_symbol_active",
         "idx_pl_symbol_layer",
+        "idx_pl_symbol_type_status",
+        "idx_pl_stable_level_id",
         "idx_pl_strength",
         "idx_pl_tier",
         "idx_mc_timestamp",

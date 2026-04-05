@@ -1,23 +1,14 @@
+"""Совместимость: делегирует в trading_bot/entrypoints/run_scheduler.py."""
 from __future__ import annotations
 
-import logging
 import os
+import runpy
 import sys
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from trading_bot.data.scheduler import run_scheduler_forever
-
-
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    )
-    run_scheduler_forever()
-
-
-if __name__ == "__main__":
-    main()
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+runpy.run_path(
+    os.path.join(_REPO, "trading_bot", "entrypoints", "run_scheduler.py"),
+    run_name="__main__",
+)

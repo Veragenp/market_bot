@@ -22,6 +22,7 @@ credentials.json
 
 # Local databases and artifacts
 data/*.db
+trading_bot/data/*.db
 *.sqlite
 *.sqlite3
 

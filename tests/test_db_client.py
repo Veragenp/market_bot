@@ -1,22 +1,17 @@
 import time
-import pytest
-from trading_bot.data.db_client import (
-    save_ohlcv, get_ohlcv, get_last_update, update_metadata,
-    save_liquidations, save_open_interest, clean_old_minute_data
-)
-from trading_bot.data.db import DB_PATH
-import os
 
-@pytest.fixture
-def clean_db():
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-    from trading_bot.data.schema import init_db, run_migrations
-    init_db()
-    run_migrations()
-    yield
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+import pytest
+
+from trading_bot.data.db_client import (
+    clean_old_minute_data,
+    get_last_update,
+    get_ohlcv,
+    save_liquidations,
+    save_ohlcv,
+    save_open_interest,
+    update_metadata,
+)
+
 
 def test_save_and_get_ohlcv(clean_db):
     symbol = "BTC/USDT"

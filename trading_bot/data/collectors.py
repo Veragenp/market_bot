@@ -620,12 +620,16 @@ def update_liquidation_history(symbol: str, timeframe: str = "4h", days_back: in
 
 
 def update_all_futures_data(days_back: int = 30) -> None:
-    """Run futures OI and liquidation updates for all trading symbols."""
+    """
+    Binance USDT-M: только open interest по TRADING_SYMBOLS.
+
+    Ликвидации в проекте собираются с Bybit (WebSocket), см. `DataLoaderManager.update_liquidations`
+    и `load_all_data.py` — не дублируем Binance REST (нужны API keys и другой смысл `source`).
+    """
     for symbol in TRADING_SYMBOLS:
         try:
             for tf in ["1h", "4h", "1d"]:
                 update_futures_open_interest(symbol=symbol, period=tf, days_back=days_back)
-                update_liquidation_history(symbol=symbol, timeframe=tf, days_back=days_back)
                 time.sleep(_SYMBOL_SLEEP_SEC)
         except Exception as exc:
             logger.exception("Futures update failed for %s: %s", symbol, exc)

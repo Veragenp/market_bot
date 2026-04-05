@@ -42,8 +42,8 @@ except Exception as e:
 # Пробуем импортировать schema и вызвать init_db
 print("\nИмпорт trading_bot.data.schema...")
 try:
-    from trading_bot.data.schema import init_db
-    print("  init_db импортирована")
+    from trading_bot.data.schema import init_db, run_migrations
+    print("  init_db / run_migrations импортированы")
 except Exception as e:
     print("  Ошибка импорта schema:", e)
     import traceback
@@ -54,9 +54,10 @@ except Exception as e:
 print("\nВызов init_db...")
 try:
     init_db()
-    print("  init_db выполнена успешно")
+    run_migrations()
+    print("  init_db + run_migrations выполнены успешно")
 except Exception as e:
-    print("  Ошибка при вызове init_db:", e)
+    print("  Ошибка при вызове init_db/run_migrations:", e)
     import traceback
     traceback.print_exc()
     sys.exit(1)

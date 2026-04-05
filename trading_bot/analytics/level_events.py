@@ -9,6 +9,7 @@ from trading_bot.config.settings import DEFAULT_SOURCE_BINANCE, LEVEL_EVENTS_LOO
 from trading_bot.data.db import get_connection
 from trading_bot.data.repositories import get_ohlcv
 from trading_bot.data.schema import init_db, run_migrations
+from trading_bot.data.volume_profile_peaks_db import LEVEL_TYPE_VP_LOCAL
 from trading_bot.analytics.level_identity import stable_level_id
 
 
@@ -24,6 +25,7 @@ class LevelRow:
     t_end_unix: Optional[int]
     tick_size: float
     atr_daily: float
+    stable_level_id_db: Optional[str] = None
 
 
 def _month_label(ts: Optional[int]) -> str:
@@ -42,14 +44,13 @@ def load_active_levels_with_metrics() -> List[LevelRow]:
     rows: List[LevelRow] = []
     for sym_row in cur.execute(
         """
-        SELECT symbol, MAX(created_at) AS mx
+        SELECT DISTINCT symbol
         FROM price_levels
-        WHERE is_active = 1 AND level_type = 'volume_profile_peaks'
-        GROUP BY symbol
-        """
+        WHERE is_active = 1 AND status = 'active' AND level_type = ?
+        """,
+        (LEVEL_TYPE_VP_LOCAL,),
     ).fetchall():
         symbol = str(sym_row["symbol"])
-        created_at = int(sym_row["mx"])
         inst = cur.execute(
             "SELECT tick_size, atr FROM instruments WHERE symbol = ? AND exchange = 'bybit_futures'",
             (symbol.replace("/", ""),),
@@ -61,12 +62,13 @@ def load_active_levels_with_metrics() -> List[LevelRow]:
         for r in cur.execute(
             """
             SELECT symbol, level_type, ifnull(layer,'') AS layer, ifnull(tier,'') AS tier,
-                   price, volume_peak, duration_hours, t_end_unix
+                   price, volume_peak, duration_hours, t_end_unix, stable_level_id
             FROM price_levels
-            WHERE symbol = ? AND is_active = 1 AND level_type = 'volume_profile_peaks' AND created_at = ?
+            WHERE symbol = ? AND is_active = 1 AND status = 'active' AND level_type = ?
             """,
-            (symbol, created_at),
+            (symbol, LEVEL_TYPE_VP_LOCAL),
         ).fetchall():
+            sid = r["stable_level_id"]
             rows.append(
                 LevelRow(
                     symbol=str(r["symbol"]),
@@ -79,6 +81,7 @@ def load_active_levels_with_metrics() -> List[LevelRow]:
                     t_end_unix=int(r["t_end_unix"]) if r["t_end_unix"] is not None else None,
                     tick_size=tick_size,
                     atr_daily=atr_daily,
+                    stable_level_id_db=str(sid) if sid else None,
                 )
             )
     conn.close()
@@ -176,7 +179,7 @@ def build_level_events(now_ts: Optional[int] = None) -> List[Dict[str, object]]:
                     else:
                         rebound_after = max(0.0, (lv.price - min(after_vals)) / lv.atr_daily)
 
-            sid = stable_level_id(
+            sid = lv.stable_level_id_db or stable_level_id(
                 symbol=lv.symbol,
                 level_type=lv.level_type,
                 layer=lv.layer,

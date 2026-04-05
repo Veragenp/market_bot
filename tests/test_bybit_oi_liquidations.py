@@ -1,24 +1,10 @@
-import os
 import time
 
 import pytest
 
-from trading_bot.data.db import DB_PATH as REAL_DB_PATH
 from trading_bot.data.bybit_futures_loader import BybitFuturesDataLoader
 from trading_bot.data.data_loader import DataLoaderManager
-from trading_bot.data.schema import init_db, run_migrations
 from trading_bot.data.repositories import MetadataRepository
-
-
-@pytest.fixture
-def clean_db():
-    if os.path.exists(REAL_DB_PATH):
-        os.remove(REAL_DB_PATH)
-    init_db()
-    run_migrations()
-    yield
-    if os.path.exists(REAL_DB_PATH):
-        os.remove(REAL_DB_PATH)
 
 
 def test_fetch_open_interest_pagination_and_change(monkeypatch, clean_db):

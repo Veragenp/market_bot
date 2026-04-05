@@ -6,7 +6,7 @@
 
 ### 1) База данных и схема
 
-- SQLite БД: `data/market_data.db`
+- SQLite БД: **`trading_bot/data/market_data.db`** (путь задаётся в `trading_bot/config/settings.py`; переопределение: `MARKET_BOT_DB_PATH` / `MARKET_BOT_DATA_DIR`). Раньше использовался `data/market_data.db` в корне репозитория — при переносе скопируйте файл в новое место.
 - Таблицы:
   - `ohlcv`
   - `liquidations`
@@ -166,7 +166,7 @@
 
 Запуск:
 
-- `python scripts/run_scheduler.py`
+- `python trading_bot/entrypoints/run_scheduler.py` (или `python scripts/run_scheduler.py` — обёртка)
 
 ---
 
@@ -252,7 +252,7 @@
    - дать сервисному аккаунту доступ к таблице
 4. Прогнать сбор:
    - вручную через функции коллекторов
-   - или `python scripts/run_scheduler.py`
+   - или `python trading_bot/entrypoints/run_scheduler.py` (`scripts/run_scheduler.py` — обёртка)
 5. Экспорт:
    - `python trading_bot/scripts/rebuild_volume_profile_peaks_to_db.py`
    - `python trading_bot/google_sheets/export_to_sheets.py`

@@ -116,7 +116,7 @@ class TradingViewDataLoader(BaseDataLoader):
             self._tv = TvDatafeed()
             logger.warning(
                 "TradingView: TRADINGVIEW_USERNAME/PASSWORD not set — nologin (limited data). "
-                "Put them in .env at project root or export in the shell."
+                "Задайте в trading_bot/.env или в .env в корне репозитория (REPO_ROOT), либо MARKET_BOT_ENV_PATH."
             )
         self._symbol_map = dict(symbol_map or TRADINGVIEW_SYMBOLS)
         self._exchange = exchange
