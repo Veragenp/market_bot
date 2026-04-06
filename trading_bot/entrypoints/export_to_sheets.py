@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -68,6 +69,8 @@ VOLUME_PEAK_ANALYSIS_WORKSHEET = os.getenv(
     "VOLUME_PEAK_ANALYSIS_WORKSHEET", "volume_profile_peaks_analysis"
 )
 LEVEL_EVENTS_WORKSHEET = os.getenv("LEVEL_EVENTS_WORKSHEET", "level_events")
+LEVEL_STRENGTH_WORKSHEET = os.getenv("LEVEL_STRENGTH_WORKSHEET", "level_strength_report")
+LEVEL_STOP_PROFILE_WORKSHEET = os.getenv("LEVEL_STOP_PROFILE_WORKSHEET", "level_stop_profile")
 
 # Важно: пики volume_profile_peaks в Google Sheets теперь выгружаются
 # строго из SQLite `price_levels` (посчитанные и сохраненные скриптом rebuild).
@@ -736,6 +739,105 @@ def _fetch_level_events_for_sheet(lookback_days: int = 30) -> pd.DataFrame:
     return out[[c for c in cols if c in out.columns]]
 
 
+def _fetch_level_strength_report_for_sheet(lookback_days: int = 90) -> pd.DataFrame:
+    start_ts = int(datetime.now(timezone.utc).timestamp()) - int(lookback_days * 86400)
+    rows = get_level_events_since(start_ts)
+    if not rows:
+        return pd.DataFrame([{"note": "Нет событий для расчета силы уровней."}])
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame([{"note": "Нет событий для расчета силы уровней."}])
+
+    grp = df.groupby(["symbol", "stable_level_id", "tier", "layer", "level_price"], dropna=False)
+    out = grp.agg(
+        touches_n=("event_id", "count"),
+        return_rate=("return_time", lambda s: float(pd.Series(s).notna().mean())),
+        p50_penetration_atr=("penetration_atr", "median"),
+        p80_penetration_atr=("penetration_atr", lambda s: float(pd.Series(s).quantile(0.8))),
+        p95_penetration_atr=("penetration_atr", lambda s: float(pd.Series(s).quantile(0.95))),
+        median_rebound_after_atr=("rebound_after_return_atr", "median"),
+        median_rebound_pure_atr=("rebound_pure_atr", "median"),
+        median_cluster_size=("cluster_size", "median"),
+    ).reset_index()
+
+    # Composite score tuned for practical ranking.
+    out["pen_score"] = (1.0 - (out["p80_penetration_atr"].fillna(0.0) / 1.5)).clip(0.0, 1.0)
+    out["reb_score"] = (out["median_rebound_after_atr"].fillna(0.0) / 1.5).clip(0.0, 1.0)
+    out["sample_score"] = out["touches_n"].fillna(0.0).apply(
+        lambda x: min(1.0, (0.0 if x <= 0 else (math.log1p(float(x)) / math.log1p(30.0))))
+    )
+    out["noise_score"] = (1.0 - ((out["median_cluster_size"].fillna(1.0) - 1.0) / 4.0)).clip(0.0, 1.0)
+    out["composite_score"] = (
+        100.0
+        * (
+            0.35 * out["return_rate"].fillna(0.0)
+            + 0.20 * out["pen_score"]
+            + 0.20 * out["reb_score"]
+            + 0.15 * out["sample_score"]
+            + 0.10 * out["noise_score"]
+        )
+    ).round(2)
+    out["strength_bucket"] = out["composite_score"].apply(
+        lambda s: "strong" if s >= 80 else ("medium" if s >= 60 else "weak")
+    )
+    out["recommended_stop_atr_base"] = (out["p80_penetration_atr"].fillna(0.0) + 0.05).round(4)
+    out["recommended_stop_atr_conservative"] = (out["p95_penetration_atr"].fillna(0.0) + 0.05).round(4)
+    out["exported_at_utc"] = datetime.now(timezone.utc).isoformat()
+    return out
+
+
+def _fetch_level_stop_profile_for_sheet(lookback_days: int = 90) -> pd.DataFrame:
+    strength = _fetch_level_strength_report_for_sheet(lookback_days=lookback_days)
+    if "stable_level_id" not in strength.columns:
+        return pd.DataFrame([{"note": "Нет данных для stop profile."}])
+
+    conn = get_connection()
+    cur = conn.cursor()
+    atr_by_symbol: Dict[str, float] = {}
+    for row in cur.execute(
+        "SELECT symbol, atr FROM instruments WHERE exchange='bybit_futures' AND atr IS NOT NULL"
+    ).fetchall():
+        s = str(row["symbol"] or "")
+        # instruments symbol: BTCUSDT; normalize to BTC/USDT
+        if s.endswith("USDT") and "/" not in s:
+            s = s[:-4] + "/USDT"
+        atr_by_symbol[s] = float(row["atr"])
+    conn.close()
+
+    out = strength.copy()
+    out["atr_daily"] = out["symbol"].map(atr_by_symbol)
+    out = out[out["atr_daily"].notna()].copy()
+    if out.empty:
+        return pd.DataFrame([{"note": "Нет ATR по символам для stop profile."}])
+
+    out["stop_price_long_base"] = (
+        out["level_price"].astype(float) - out["recommended_stop_atr_base"].astype(float) * out["atr_daily"].astype(float)
+    )
+    out["stop_price_short_base"] = (
+        out["level_price"].astype(float) + out["recommended_stop_atr_base"].astype(float) * out["atr_daily"].astype(float)
+    )
+    out["valid_from_utc"] = datetime.now(timezone.utc).isoformat()
+    out["valid_to_utc"] = ""
+    cols = [
+        "symbol",
+        "stable_level_id",
+        "tier",
+        "layer",
+        "level_price",
+        "atr_daily",
+        "recommended_stop_atr_base",
+        "recommended_stop_atr_conservative",
+        "stop_price_long_base",
+        "stop_price_short_base",
+        "strength_bucket",
+        "composite_score",
+        "valid_from_utc",
+        "valid_to_utc",
+    ]
+    return out[[c for c in cols if c in out.columns]]
+
+
 def main() -> None:
     init_db()
     exporter = SheetsExporter(
@@ -747,7 +849,13 @@ def main() -> None:
     exported_at = datetime.now(timezone.utc).isoformat()
     audit_entries: List[Dict[str, Any]] = []
 
-    crypto_symbols = sorted(set(TRADING_SYMBOLS + ANALYTIC_SYMBOLS.get("crypto", [])))
+    crypto_symbols = sorted(
+        set(
+            TRADING_SYMBOLS
+            + ANALYTIC_SYMBOLS.get("crypto_context", [])
+            + ANALYTIC_SYMBOLS.get("crypto", []),
+        )
+    )
     df_binance = _fetch_ohlcv_sample(
         symbols=crypto_symbols,
         timeframes=["1h", "4h", "1d", "1w", "1M"],
@@ -887,6 +995,28 @@ def main() -> None:
             "source": "level_events",
             "worksheet": LEVEL_EVENTS_WORKSHEET,
             "rows": len(df_level_events),
+            "last_exported_at_utc": exported_at,
+        }
+    )
+
+    df_level_strength = _fetch_level_strength_report_for_sheet(lookback_days=90)
+    exporter.export_dataframe_to_sheet(df_level_strength, SHEET_TITLE, LEVEL_STRENGTH_WORKSHEET)
+    audit_entries.append(
+        {
+            "source": "level_strength",
+            "worksheet": LEVEL_STRENGTH_WORKSHEET,
+            "rows": len(df_level_strength),
+            "last_exported_at_utc": exported_at,
+        }
+    )
+
+    df_level_stops = _fetch_level_stop_profile_for_sheet(lookback_days=90)
+    exporter.export_dataframe_to_sheet(df_level_stops, SHEET_TITLE, LEVEL_STOP_PROFILE_WORKSHEET)
+    audit_entries.append(
+        {
+            "source": "level_stop_profile",
+            "worksheet": LEVEL_STOP_PROFILE_WORKSHEET,
+            "rows": len(df_level_stops),
             "last_exported_at_utc": exported_at,
         }
     )

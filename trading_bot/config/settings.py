@@ -198,6 +198,11 @@ PRO_LEVELS_WEAK_MIN_DURATION = None
 # Level events analytics (daily batch over 1m candles)
 LEVEL_EVENTS_WINDOW_HOURS = 4
 LEVEL_EVENTS_LOOKBACK_HOURS = 24
+LEVEL_EVENTS_MODE = os.getenv("LEVEL_EVENTS_MODE", "runtime").strip().lower()
+LEVEL_EVENTS_MIN_PENETRATION_ATR = float(os.getenv("LEVEL_EVENTS_MIN_PENETRATION_ATR", "0.05"))
+LEVEL_EVENTS_MIN_REBOUND_PURE_ATR = float(os.getenv("LEVEL_EVENTS_MIN_REBOUND_PURE_ATR", "0.03"))
+LEVEL_EVENTS_RETURN_EPS_ATR = float(os.getenv("LEVEL_EVENTS_RETURN_EPS_ATR", "0.05"))
+LEVEL_EVENTS_REBOUND_HORIZON_BARS = int(os.getenv("LEVEL_EVENTS_REBOUND_HORIZON_BARS", "240"))
 
 # -----------------------------------------------------------------------------
 # HTF volume profile (отдельно от 1m `volume_profile_peaks`: крупный ТФ + окно в днях)
@@ -242,6 +247,9 @@ HUMAN_LEVELS_ATR_PERIOD = int(os.getenv("HUMAN_LEVELS_ATR_PERIOD", "14"))
 HUMAN_LEVELS_MIN_FRACTAL_COUNT = int(os.getenv("HUMAN_LEVELS_MIN_FRACTAL_COUNT", "2"))
 _ms = os.getenv("HUMAN_LEVELS_MIN_STRENGTH", "0").strip()
 HUMAN_LEVELS_MIN_STRENGTH = float(_ms) if _ms else 0.0
+# Разрежение D1-зон по центрам после кластеризации (доли ATR_D1); 0 = выкл. W1 не затрагивается.
+_zgap = os.getenv("HUMAN_LEVELS_ZONE_MIN_GAP_ATR", "0.5").strip()
+HUMAN_LEVELS_ZONE_MIN_GAP_ATR = float(_zgap) if _zgap else 0.0
 HUMAN_LEVELS_DISABLE_SHEETS = os.getenv("HUMAN_LEVELS_DISABLE_SHEETS", "").strip().lower() in (
     "1",
     "true",
@@ -259,3 +267,37 @@ HUMAN_LEVELS_SHEET_TITLE = os.getenv("HUMAN_LEVELS_SHEET_TITLE", "").strip()
 # -----------------------------------------------------------------------------
 _vp_levels_sheet = (os.getenv("VOLUME_PEAK_LEVELS_WORKSHEET") or os.getenv("DBSCAN_ZONES_WORKSHEET") or "").strip()
 VOLUME_PEAK_LEVELS_WORKSHEET = _vp_levels_sheet or "vp_local_levels"
+
+def _env_strip_quotes(val: str) -> str:
+    s = (val or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return s
+
+
+# -----------------------------------------------------------------------------
+# Google: сервисный аккаунт (Sheets и др.)
+# -----------------------------------------------------------------------------
+_gcp = _env_strip_quotes(os.getenv("GOOGLE_CREDENTIALS_PATH", ""))
+GOOGLE_CREDENTIALS_PATH = _gcp if _gcp else "credentials.json"
+
+# -----------------------------------------------------------------------------
+# Ручные глобальные уровни HVN (отдельная книга Sheets → price_levels manual_global_hvn)
+# ID книги: MANUAL_GLOBAL_HVN_SPREADSHEET_ID или общий GOOGLE_SHEETS_ID (если одна книга для ручных уровней).
+# -----------------------------------------------------------------------------
+MANUAL_GLOBAL_HVN_SPREADSHEET_ID = _env_strip_quotes(
+    os.getenv("MANUAL_GLOBAL_HVN_SPREADSHEET_ID", "")
+) or _env_strip_quotes(os.getenv("GOOGLE_SHEETS_ID", ""))
+MANUAL_GLOBAL_HVN_SPREADSHEET_URL = os.getenv("MANUAL_GLOBAL_HVN_SPREADSHEET_URL", "").strip()
+MANUAL_GLOBAL_HVN_SPREADSHEET_TITLE = os.getenv("MANUAL_GLOBAL_HVN_SPREADSHEET_TITLE", "").strip()
+MANUAL_GLOBAL_HVN_INSTRUCTION_SHEET = os.getenv("MANUAL_GLOBAL_HVN_INSTRUCTION_SHEET", "instruction").strip()
+
+# -----------------------------------------------------------------------------
+# Telegram (общий бот и джобы; см. trading_bot.tools.telegram_notify)
+# -----------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN = _env_strip_quotes(os.getenv("TELEGRAM_BOT_TOKEN", "")) or _env_strip_quotes(
+    os.getenv("TELEGRAM_TOKEN", "")
+)
+TELEGRAM_CHAT_ID = _env_strip_quotes(os.getenv("TELEGRAM_CHAT_ID", "")) or _env_strip_quotes(
+    os.getenv("CHAT_ID", "")
+)

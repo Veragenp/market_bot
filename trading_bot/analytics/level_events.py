@@ -5,7 +5,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from trading_bot.config.settings import DEFAULT_SOURCE_BINANCE, LEVEL_EVENTS_LOOKBACK_HOURS, LEVEL_EVENTS_WINDOW_HOURS
+from trading_bot.config.settings import (
+    DEFAULT_SOURCE_BINANCE,
+    LEVEL_EVENTS_LOOKBACK_HOURS,
+    LEVEL_EVENTS_MIN_PENETRATION_ATR,
+    LEVEL_EVENTS_MIN_REBOUND_PURE_ATR,
+    LEVEL_EVENTS_REBOUND_HORIZON_BARS,
+    LEVEL_EVENTS_RETURN_EPS_ATR,
+    LEVEL_EVENTS_WINDOW_HOURS,
+)
 from trading_bot.data.db import get_connection
 from trading_bot.data.repositories import get_ohlcv
 from trading_bot.data.schema import init_db, run_migrations
@@ -95,89 +103,103 @@ def build_level_events(now_ts: Optional[int] = None) -> List[Dict[str, object]]:
     if not all_levels:
         return []
 
-    # Earliest touch across all symbols/levels => global t0
-    touches: List[tuple[int, LevelRow, int, float]] = []
+    symbol_candles: Dict[str, List[Dict[str, object]]] = {}
     for lv in all_levels:
-        candles = get_ohlcv(lv.symbol, "1m", start=lookback_start, end=now, source=DEFAULT_SOURCE_BINANCE)
-        if len(candles) < 3:
-            continue
-        first_close = float(candles[0]["close"])
-        dist_start = abs(first_close - lv.price) / lv.atr_daily if lv.atr_daily > 0 else 0.0
-        if dist_start < 0.3:
-            continue
-        prev = float(candles[0]["close"])
-        for idx in range(1, len(candles)):
-            cur = float(candles[idx]["close"])
-            touched = (prev <= lv.price <= cur) or (prev >= lv.price >= cur) or abs(cur - lv.price) <= 0.05 * lv.atr_daily
-            if touched:
-                ts = int(candles[idx]["timestamp"])
-                touches.append((ts, lv, idx, dist_start))
-                break
-            prev = cur
-    if not touches:
-        return []
+        if lv.symbol not in symbol_candles:
+            symbol_candles[lv.symbol] = get_ohlcv(
+                lv.symbol,
+                "1m",
+                start=lookback_start,
+                end=now,
+                source=DEFAULT_SOURCE_BINANCE,
+            )
 
-    t0 = min(t[0] for t in touches)
-    window_end = t0 + int(LEVEL_EVENTS_WINDOW_HOURS * 3600)
     events: List[Dict[str, object]] = []
+    min_pen_atr = float(LEVEL_EVENTS_MIN_PENETRATION_ATR)
+    min_rebound_pure_atr = float(LEVEL_EVENTS_MIN_REBOUND_PURE_ATR)
+    eps_mult = float(LEVEL_EVENTS_RETURN_EPS_ATR)
+    rebound_horizon = int(LEVEL_EVENTS_REBOUND_HORIZON_BARS)
 
     for lv in all_levels:
-        candles = get_ohlcv(lv.symbol, "1m", start=t0 - 60, end=window_end, source=DEFAULT_SOURCE_BINANCE)
+        candles = symbol_candles.get(lv.symbol) or []
         if len(candles) < 3 or lv.atr_daily <= 0:
             continue
-        price_at_t0 = float(candles[1]["close"])
-        dist_start = abs(price_at_t0 - lv.price) / lv.atr_daily
-        if dist_start < 0.3:
-            continue
-        eps = 0.01 * lv.atr_daily
-        prev_close = float(candles[0]["close"])
+
+        price_at_start = float(candles[0]["close"])
+        dist_start = abs(price_at_start - lv.price) / lv.atr_daily
+        eps = eps_mult * lv.atr_daily
         event_counter = 0
         i = 1
         while i < len(candles):
-            cur_close = float(candles[i]["close"])
-            crossed = (prev_close <= lv.price <= cur_close) or (prev_close >= lv.price >= cur_close)
-            if not crossed:
-                prev_close = cur_close
+            low_i = float(candles[i]["low"])
+            high_i = float(candles[i]["high"])
+            prev_close = float(candles[i - 1]["close"])
+
+            is_touch = (
+                low_i <= lv.price <= high_i
+                or abs(lv.price - low_i) <= 0.01 * lv.atr_daily
+                or abs(lv.price - high_i) <= 0.01 * lv.atr_daily
+            )
+            if not is_touch:
                 i += 1
                 continue
+
             touch_ts = int(candles[i]["timestamp"])
             pre_side = 1 if prev_close > lv.price else -1
-            extreme_behind = cur_close
+            extreme_behind = lv.price
             rebound_pure = 0.0
             return_ts = None
             rebound_after = None
-            j = i
+
+            # Do not allow immediate return on the same candle.
+            j = i + 1
             while j < len(candles):
-                p = float(candles[j]["close"])
                 if pre_side > 0:
-                    if p < lv.price:
-                        extreme_behind = min(extreme_behind, p)
-                    if p > lv.price:
-                        rebound_pure = max(rebound_pure, (p - lv.price) / lv.atr_daily)
-                    if p >= lv.price + eps:
+                    low_j = float(candles[j]["low"])
+                    high_j = float(candles[j]["high"])
+                    extreme_behind = min(extreme_behind, low_j)
+                    rebound_pure = max(rebound_pure, (high_j - lv.price) / lv.atr_daily)
+                    if high_j >= lv.price + eps:
                         return_ts = int(candles[j]["timestamp"])
                         break
                 else:
-                    if p > lv.price:
-                        extreme_behind = max(extreme_behind, p)
-                    if p < lv.price:
-                        rebound_pure = max(rebound_pure, (lv.price - p) / lv.atr_daily)
-                    if p <= lv.price - eps:
+                    low_j = float(candles[j]["low"])
+                    high_j = float(candles[j]["high"])
+                    extreme_behind = max(extreme_behind, high_j)
+                    rebound_pure = max(rebound_pure, (lv.price - low_j) / lv.atr_daily)
+                    if low_j <= lv.price - eps:
                         return_ts = int(candles[j]["timestamp"])
                         break
                 j += 1
+
+            # If no return found, keep tracking penetration till the end.
+            if return_ts is None:
+                k = max(i + 1, j)
+                while k < len(candles):
+                    if pre_side > 0:
+                        extreme_behind = min(extreme_behind, float(candles[k]["low"]))
+                    else:
+                        extreme_behind = max(extreme_behind, float(candles[k]["high"]))
+                    k += 1
+
             if pre_side > 0:
                 penetration = max(0.0, (lv.price - extreme_behind) / lv.atr_daily)
             else:
                 penetration = max(0.0, (extreme_behind - lv.price) / lv.atr_daily)
 
+            if penetration < min_pen_atr or rebound_pure < min_rebound_pure_atr:
+                i = j + 1 if j > i else i + 1
+                continue
+
             if return_ts is not None:
-                after_vals = [float(c["close"]) for c in candles[j:min(j + 240, len(candles))]]
+                after_vals = candles[j : min(j + rebound_horizon, len(candles))]
                 if after_vals:
                     if pre_side > 0:
-                        rebound_after = max(0.0, (max(after_vals) - lv.price) / lv.atr_daily)
+                        max_after = max(float(c["high"]) for c in after_vals)
+                        rebound_after = max(0.0, (max_after - lv.price) / lv.atr_daily)
                     else:
-                        rebound_after = max(0.0, (lv.price - min(after_vals)) / lv.atr_daily)
+                        min_after = min(float(c["low"]) for c in after_vals)
+                        rebound_after = max(0.0, (lv.price - min_after) / lv.atr_daily)
 
             sid = lv.stable_level_id_db or stable_level_id(
                 symbol=lv.symbol,
@@ -208,17 +230,21 @@ def build_level_events(now_ts: Optional[int] = None) -> List[Dict[str, object]]:
                     "penetration_atr": penetration,
                     "rebound_pure_atr": rebound_pure,
                     "rebound_after_return_atr": rebound_after,
-                    "window_start": t0,
-                    "window_end": window_end,
+                    "window_start": lookback_start,
+                    "window_end": now,
                 }
             )
-            prev_close = cur_close
             i = j + 1 if j > i else i + 1
 
-    # cluster size in 4h from touch_time (same symbol-agnostic pool)
-    touch_times = sorted(int(e["touch_time"]) for e in events)
-    for e in events:
-        t = int(e["touch_time"])
-        e["cluster_size"] = sum(1 for x in touch_times if t <= x <= t + int(LEVEL_EVENTS_WINDOW_HOURS * 3600))
+    # cluster size in LEVEL_EVENTS_WINDOW_HOURS from touch_time (sliding window).
+    if events:
+        window_sec = int(LEVEL_EVENTS_WINDOW_HOURS * 3600)
+        events_sorted = sorted(events, key=lambda x: int(x["touch_time"]))
+        times = [int(e["touch_time"]) for e in events_sorted]
+        left = 0
+        for right, t in enumerate(times):
+            while times[left] < t - window_sec:
+                left += 1
+            events_sorted[right]["cluster_size"] = right - left + 1
     return events
 
