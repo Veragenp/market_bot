@@ -5,6 +5,8 @@
   - Если заданы env `PRO_LEVELS_LOOKBACK_DAYS` и/или `PRO_LEVELS_LOOKBACK_HOURS`:
       окно = [last_1m_timestamp_in_db - lookback_seconds, last_1m_timestamp_in_db]
       (якорь = последняя 1m свеча в БД).
+  - Перед find_pro_levels: метрика качества 1m OHLC; при «плоских» свечах — ресемпл 5m
+      в памяти (см. `analytics/vp_ohlc_source.py`, пороги `VP_OHLC_*` в settings).
   - Иначе:
       используется календарный месяц `DYNAMIC_ZONES_YEAR` / `DYNAMIC_ZONES_MONTH`
       (fallback как в `export_to_sheets.py`).
@@ -15,7 +17,8 @@
       перед вставкой новых строк деактивируем старые активные записи этого `symbol`+`level_type`
       (история остается).
   - `price_levels.layer`:
-      `volpeak_{days}d_{hours}h_{start_ts}_{end_ts}`
+      `volpeak_{days}d_{hours}h_{start_ts}_{end_ts}` и при 5m суффикс `_5mrs`
+  - `price_levels.timeframe`: `1m` или `5m` (5m = ресемпл из 1m)
 """
 
 from __future__ import annotations
@@ -58,6 +61,7 @@ from config import (
     PRO_LEVELS_WEAK_MIN_DURATION,
 )
 from trading_bot.analytics.dynamic_accumulation_zones import slice_calendar_month_utc
+from trading_bot.analytics.vp_ohlc_source import select_vp_ohlcv_dataframe
 from trading_bot.analytics.volume_profile_peaks import find_pro_levels, get_adaptive_params
 from trading_bot.data.db import get_connection
 from trading_bot.data.schema import init_db
@@ -271,7 +275,7 @@ def main() -> None:
             if df.empty:
                 print(f"SKIP {symbol}: empty 1m data in lookback window {start_ts}->{end_ts}")
                 continue
-            layer = f"volpeak_{lookback_days}d_{lookback_hours}h_{start_ts}_{end_ts}"
+            base_layer = f"volpeak_{lookback_days}d_{lookback_hours}h_{start_ts}_{end_ts}"
         else:
             df_all = _fetch_ohlcv_1m_all_for_symbol(symbol)
             work = slice_calendar_month_utc(df_all, year, month)
@@ -283,11 +287,18 @@ def main() -> None:
             seconds = max(0, end_ts - start_ts)
             days = seconds // 86400
             hours = (seconds % 86400) // 3600
-            layer = f"volpeak_{int(days)}d_{int(hours)}h_{start_ts}_{end_ts}"
+            base_layer = f"volpeak_{int(days)}d_{int(hours)}h_{start_ts}_{end_ts}"
             df = work
 
-        common = _compute_find_pro_params(df, symbol)
-        final_levels = find_pro_levels(df, symbol=symbol, **common)
+        if df.empty:
+            print(f"SKIP {symbol}: empty OHLCV window")
+            continue
+
+        df_vp, tf_used, vp_diag = select_vp_ohlcv_dataframe(df)
+        layer = f"{base_layer}_5mrs" if tf_used == "5m" else base_layer
+
+        common = _compute_find_pro_params(df_vp, symbol)
+        final_levels = find_pro_levels(df_vp, symbol=symbol, **common)
         if final_levels is None or final_levels.empty:
             print(f"SKIP {symbol}: find_pro_levels() returned no levels")
             continue
@@ -297,10 +308,16 @@ def main() -> None:
             final_levels,
             layer=layer,
             level_type=LEVEL_TYPE_VOLUME_PROFILE_PEAKS,
-            timeframe="1m",
+            timeframe=tf_used,
         )
 
-        print(f"OK: {symbol} layer={layer} final={0 if final_levels is None else len(final_levels)}")
+        src = vp_diag.get("vp_source", "")
+        q1 = vp_diag.get("quality_1m") or {}
+        print(
+            f"OK: {symbol} layer={layer} tf={tf_used} vp_src={src} "
+            f"1m_flat={q1.get('flat_frac')} 1m_mrng={q1.get('median_rel_range')} "
+            f"final={0 if final_levels is None else len(final_levels)}"
+        )
 
 
 if __name__ == "__main__":

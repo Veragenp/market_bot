@@ -89,9 +89,11 @@ def test_get_adaptive_params_has_expected_keys():
     )
     p = get_adaptive_params(df)
     assert "tick_size" in p and p["tick_size"] > 0
-    assert "distance_pct" in p and float(p["distance_pct"]) == 0.003
-    assert float(p["valley_threshold"]) == 0.4
+    assert "distance_pct" in p and 0.001 <= float(p["distance_pct"]) <= 0.05
+    assert 0.35 <= float(p["valley_threshold"]) <= 0.65
     assert "height_mult" in p and float(p["height_mult"]) >= 1.0
+    assert "daily_vol_pct" in p and float(p["daily_vol_pct"]) >= 0.0
+    assert "top_n" in p and 1 <= int(p["top_n"]) <= 20
 
 
 def test_analyze_coin_zones_runs_with_adaptive_params():
@@ -121,6 +123,6 @@ def test_get_adaptive_params_alt_branch():
         {"timestamp": ts, "close": close, "high": high, "low": low, "volume": volume}
     )
     p = get_adaptive_params(df)
-    assert float(p["valley_threshold"]) == 0.4
+    assert 0.35 <= float(p["valley_threshold"]) <= 0.65
     assert float(p["height_mult"]) >= 1.0
-    assert float(p["distance_pct"]) == 0.003
+    assert 0.001 <= float(p["distance_pct"]) <= 0.05

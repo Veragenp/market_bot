@@ -7,6 +7,7 @@ from trading_bot.analytics.human_levels import (
     atr_w1_equiv_from_daily,
     bill_williams_fractal_mask,
     cluster_fractal_prices_to_zones,
+    deduplicate_zones_by_vertical_gap,
     detect_flip_events,
     extract_fractals,
     filter_human_zones,
@@ -109,6 +110,31 @@ def test_pipeline_from_trivial_daily():
     res = human_levels_from_ohlcv_rows(rows_d1, rows_w1, cluster_atr_mult=0.5)
     assert res.atr_d1_last > 0
     assert res.atr_w1_equiv > 0
+
+
+def test_human_zone_center():
+    z = HumanZone(100.0, 104.0, "1d", 1.0, 1)
+    assert z.center == 102.0
+
+
+def test_deduplicate_zones_by_vertical_gap_keeps_stronger_and_drops_close():
+    atr = 10.0
+    gap = 0.5
+    # центры 100 и 103 → разница 3 < 5? min_gap_price = 5, so 3 < 5 → too close
+    strong = HumanZone(99.0, 101.0, "1d", 10.0, 3)
+    weak = HumanZone(102.0, 104.0, "1d", 2.0, 1)
+    out = deduplicate_zones_by_vertical_gap([weak, strong], atr, gap)
+    assert len(out) == 1
+    assert out[0].strength == 10.0
+
+    far = HumanZone(200.0, 202.0, "1d", 1.0, 1)
+    out2 = deduplicate_zones_by_vertical_gap([strong, far], atr, gap)
+    assert len(out2) == 2
+
+
+def test_deduplicate_zones_zero_gap_noop():
+    z = HumanZone(1.0, 2.0, "1d", 1.0, 1)
+    assert deduplicate_zones_by_vertical_gap([z], 10.0, 0.0) == [z]
 
 
 def test_filter_human_zones_by_count_and_strength():

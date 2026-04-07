@@ -46,6 +46,10 @@ class HumanZone:
     strength: float
     fractal_count: int
 
+    @property
+    def center(self) -> float:
+        return (self.zone_low + self.zone_high) / 2.0
+
 
 @dataclass(frozen=True)
 class FlipEvent:
@@ -87,6 +91,35 @@ def filter_human_zones(
             continue
         out.append(z)
     return out
+
+
+def deduplicate_zones_by_vertical_gap(
+    zones: list[HumanZone],
+    atr_value: float,
+    min_gap_atr: float,
+) -> list[HumanZone]:
+    """
+    Жадное разрежение по вертикали: оставляем сильные зоны, отбрасываем те, чей центр
+    ближе min_gap_atr * ATR к центру уже принятой. Только для списка одного ТФ (ожидается D1).
+    min_gap_atr <= 0 или невалидный ATR — без изменений.
+    """
+    if min_gap_atr <= 0.0 or not zones:
+        return list(zones)
+    av = float(atr_value)
+    if not np.isfinite(av) or av <= 0.0:
+        return list(zones)
+    min_gap_price = float(min_gap_atr) * av
+    sorted_zones = sorted(zones, key=lambda z: z.strength, reverse=True)
+    filtered: list[HumanZone] = []
+    for z in sorted_zones:
+        cz = z.center
+        if not filtered:
+            filtered.append(z)
+            continue
+        too_close = any(abs(cz - a.center) < min_gap_price for a in filtered)
+        if not too_close:
+            filtered.append(z)
+    return filtered
 
 
 def wilder_atr(
@@ -340,10 +373,13 @@ def run_human_levels_pipeline(
     *,
     atr_period: int = 14,
     cluster_atr_mult: float = DEFAULT_CLUSTER_ATR_MULT,
+    zone_min_gap_atr_d1: float = 0.0,
 ) -> HumanLevelsResult:
     """
     Полный прогон v1: ATR(14) только с дневок; кластер D1 — от ATR_D1,
     кластер W1 — от ATR_W1_equiv = ATR_D1 × √5 (фракталы с недельных баров).
+    После кластеризации D1-зоны опционально разреживаются по центрам (см. deduplicate_zones_by_vertical_gap);
+    W1 не трогаем.
     """
     atr_d = last_valid_atr_d1(df_d1, atr_period=atr_period)
     eps_d1 = float(cluster_atr_mult) * atr_d if atr_d > 0 else 0.0
@@ -356,6 +392,7 @@ def run_human_levels_pipeline(
         fractal_weight=FRACTAL_WEIGHT_D1,
         cluster_eps_price=eps_d1,
     )
+    zones_d1 = deduplicate_zones_by_vertical_gap(zones_d1, atr_d, float(zone_min_gap_atr_d1))
     zones_w1, fr_w1 = build_zones_for_timeframe(
         df_w1,
         timeframe="1w",
@@ -427,6 +464,7 @@ __all__ = [
     "build_zones_for_timeframe",
     "close_in_zone",
     "cluster_fractal_prices_to_zones",
+    "deduplicate_zones_by_vertical_gap",
     "detect_flip_events",
     "extract_fractals",
     "filter_human_zones",

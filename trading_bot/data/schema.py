@@ -216,15 +216,24 @@ def init_db() -> None:
             layer TEXT,
             tier TEXT,
             level_price REAL NOT NULL,
+            event_status TEXT,
+            pre_side TEXT,
             volume_peak REAL,
             duration_hours REAL,
             atr_daily REAL,
+            atr_pct REAL,
             dist_start_atr REAL,
             touch_time INTEGER NOT NULL,
             return_time INTEGER,
             penetration_atr REAL,
+            penetration_pct REAL,
             rebound_pure_atr REAL,
+            rebound_pure_pct REAL,
             rebound_after_return_atr REAL,
+            rebound_after_return_pct REAL,
+            confirm_time INTEGER,
+            confirm_time_sec INTEGER,
+            touch_count_before_confirm INTEGER,
             cluster_size INTEGER,
             window_start INTEGER,
             window_end INTEGER,
@@ -649,6 +658,36 @@ def run_migrations() -> None:
 
         cursor.execute(
             "INSERT INTO db_version (version, applied_at) VALUES (9, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 10:
+        le_cols = _column_names(cursor, "level_events")
+        def _safe_add(col: str, ddl: str) -> None:
+            if col in le_cols:
+                return
+            try:
+                cursor.execute(ddl)
+            except Exception:
+                # idempotent migration guard for partially applied local DBs
+                pass
+
+        _safe_add("event_status", "ALTER TABLE level_events ADD COLUMN event_status TEXT")
+        _safe_add("pre_side", "ALTER TABLE level_events ADD COLUMN pre_side TEXT")
+        _safe_add("atr_pct", "ALTER TABLE level_events ADD COLUMN atr_pct REAL")
+        _safe_add("penetration_pct", "ALTER TABLE level_events ADD COLUMN penetration_pct REAL")
+        _safe_add("rebound_pure_pct", "ALTER TABLE level_events ADD COLUMN rebound_pure_pct REAL")
+        _safe_add("rebound_after_return_pct", "ALTER TABLE level_events ADD COLUMN rebound_after_return_pct REAL")
+        _safe_add("confirm_time", "ALTER TABLE level_events ADD COLUMN confirm_time INTEGER")
+        _safe_add("confirm_time_sec", "ALTER TABLE level_events ADD COLUMN confirm_time_sec INTEGER")
+        _safe_add(
+            "touch_count_before_confirm",
+            "ALTER TABLE level_events ADD COLUMN touch_count_before_confirm INTEGER",
+        )
+
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (10, ?)",
             (int(time.time()),),
         )
         conn.commit()

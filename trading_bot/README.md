@@ -19,6 +19,7 @@
 | Ядро алгоритма | `trading_bot/analytics/volume_profile_peaks.py` |
 | Адаптация параметров под монету | `get_adaptive_params()` в том же файле |
 | Пересчёт и запись в БД | `trading_bot/scripts/rebuild_volume_profile_peaks_to_db.py` |
+| Автовыбор 1m / 5m (ресемпл) по качеству OHLC | `trading_bot/analytics/vp_ohlc_source.py`, пороги `VP_OHLC_*` в `settings.py` |
 | INSERT в `price_levels` | `trading_bot/data/volume_profile_peaks_db.py` |
 | Планировщик (суточный прогон) | `trading_bot/data/scheduler.py` — задача ~02:45 UTC |
 | Потребители активных уровней | `trading_bot/analytics/level_events.py` (только `is_active=1`, `level_type='volume_profile_peaks'`), `trading_bot/entrypoints/export_to_sheets.py` |
@@ -34,6 +35,8 @@
 - Если заданы **`PRO_LEVELS_LOOKBACK_DAYS`** и/или **`PRO_LEVELS_LOOKBACK_HOURS`** в `trading_bot/config/settings.py` — окно от **последней 1m-свечи в БД** назад на эту длительность.
 - Иначе — **предыдущий календарный месяц UTC** (срез через `slice_calendar_month_utc` из `dynamic_accumulation_zones`).
 
+Перед `find_pro_levels()` по метрикам 1m-окна решается, оставить минутки или **собрать 5m в памяти** (ресемпл тех же данных); при 5m в **`layer`** добавляется суффикс **`_5mrs`**, в `price_levels.timeframe` пишется **`5m`**.
+
 Итоговый набор свечей передаётся в `find_pro_levels()`. Строка **`layer`** в БД кодирует окно (например `volpeak_{days}d_{hours}h_{start}_{end}` или аналог для месяца).
 
 ---
@@ -46,8 +49,8 @@
 2. **Шаг бинирования профиля** `tick_size_eff`:
    - если в параметрах передан явный `tick_size` — он используется;
    - иначе эвристика **`max(current_price * 0.0005, 1e-8)`** (половина «типа 0.05%» от цены, но не ноль).
-3. Каждая свеча относится к бину: **`price_bin = round(close / tick_size) * tick_size`**.
-4. **Профиль:** сумма `volume` по каждому `price_bin` → ряд «цена → объём».
+3. Каждая свеча: объём **`volume` делится поровну** между всеми бинами ширины `tick_size_eff`, которые пересекают интервал **`[low, high]`** (классический VP, как TradingView / Sierra Chart). Если в данных нет `high`/`low`, подставляется **`close`** (вырожденный случай — один бин на свечу).
+4. **Профиль:** сумма долей объёма по каждому бину (метка — **центр бина**) → ряд «цена → объём».
 5. **Сглаживание:** скользящее среднее по этому ряду (`rolling`, окно по умолчанию **5**, нечётное), получается `volume_sm` — по нему ищутся «пики».
 
 **Округление цены в ответе для человека/БД:** опционально по **биржевому tick** (Binance spot → запасной вариант Bybit `instruments`) через `symbol=` — на **построение бинов профиля** это не влияет, только на число знаков в поле `Price`.

@@ -148,6 +148,10 @@ def run_scheduler_forever() -> None:
       - 1M: first day 00:00 UTC
       - Binance futures OI (история): every 4h (collectors; ликвидации — только Bybit WS)
       - Bybit OI / liquidations: по интервалам из settings
+
+    TODO (ручные глобальные HVN): периодический sync из Google Sheets
+      `trading_bot/entrypoints/sync_manual_global_hvn_from_sheets.py` и напоминания в Telegram
+      (чеклист: trading_bot/docs/manual_global_hvn_roadmap.md; колонки: manual_global_levels_sheet.md).
     """
     try:
         import schedule  # type: ignore

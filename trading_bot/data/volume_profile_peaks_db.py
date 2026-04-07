@@ -185,6 +185,7 @@ def save_volume_profile_peaks_levels_to_db(
             inserts.append(r)
 
     for oid, r in updates:
+        new_price = float(r["Price"])
         volume_peak = float(r["Volume"])
         duration_hours = float(r["Duration_Hrs"])
         tier = str(r["Tier"])
@@ -195,7 +196,8 @@ def save_volume_profile_peaks_levels_to_db(
         cur.execute(
             """
             UPDATE price_levels
-            SET strength = ?,
+            SET price = ?,
+                strength = ?,
                 volume_peak = ?,
                 tier = ?,
                 duration_hours = ?,
@@ -209,6 +211,7 @@ def save_volume_profile_peaks_levels_to_db(
             WHERE id = ?
             """,
             (
+                new_price,
                 strength,
                 volume_peak,
                 tier,

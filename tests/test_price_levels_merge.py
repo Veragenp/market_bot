@@ -1,4 +1,4 @@
-"""Слияние VP при сохранении: порог 0.1*ATR, цена якоря не меняется."""
+"""Слияние VP при сохранении: порог 0.1*ATR; при merge цена обновляется на новый POC."""
 
 import pandas as pd
 
@@ -15,7 +15,7 @@ def _row(cur, sql, params=()):
     return cur.fetchone()
 
 
-def test_vp_merge_keeps_price_and_archives_unmatched(clean_db):
+def test_vp_merge_updates_price_and_archives_unmatched(clean_db):
     conn = get_connection()
     cur = conn.cursor()
     sym = "BTC/USDT"
@@ -92,11 +92,12 @@ def test_vp_merge_keeps_price_and_archives_unmatched(clean_db):
     ).fetchall()
     conn.close()
 
+    merged_price = 50000.0 + (eps * 0.5)
     active_only = [r for r in all_rows if int(r["is_active"]) == 1]
     by_price = {float(r["price"]): r for r in active_only}
-    assert 50000.0 in by_price
-    assert float(by_price[50000.0]["volume_peak"]) == 10.0
-    assert str(by_price[50000.0]["stable_level_id"]) == str(sid_low)
+    assert merged_price in by_price
+    assert float(by_price[merged_price]["volume_peak"]) == 10.0
+    assert str(by_price[merged_price]["stable_level_id"]) == str(sid_low)
 
     archived = [r for r in all_rows if int(r["is_active"]) == 0]
     assert any(float(r["price"]) == 51000.0 for r in archived)

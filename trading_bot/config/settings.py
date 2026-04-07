@@ -162,8 +162,14 @@ YFINANCE_TIMEZONE = MACRO_TIMEZONE
 #   - если PRO_LEVELS_LOOKBACK_DAYS/HOURS = None → берём предыдущий календарный месяц
 #   - если задано → окно считается от последней 1m-свечи в БД (anchor)
 
-PRO_LEVELS_LOOKBACK_DAYS = None
+PRO_LEVELS_LOOKBACK_DAYS = 30  # 30 дней от последней 1m-свечи в БД
 PRO_LEVELS_LOOKBACK_HOURS = None
+
+# Автовыбор входных свечей для VP (rebuild): только пороги, без списков символов.
+# Если 1m «плохие» — в памяти строится 5m из тех же 1m (ресемпл).
+VP_OHLC_FLAT_BAR_MAX_FRAC = float(os.getenv("VP_OHLC_FLAT_BAR_MAX_FRAC", "0.45"))
+VP_OHLC_MEDIAN_RANGE_MIN = float(os.getenv("VP_OHLC_MEDIAN_RANGE_MIN", "1e-7"))
+VP_OHLC_RESAMPLE_MIN_1M_BARS = int(os.getenv("VP_OHLC_RESAMPLE_MIN_1M_BARS", "120"))
 
 # Core toggles / thresholds
 PRO_LEVELS_HEIGHT_MULT = None
@@ -203,6 +209,13 @@ LEVEL_EVENTS_MIN_PENETRATION_ATR = float(os.getenv("LEVEL_EVENTS_MIN_PENETRATION
 LEVEL_EVENTS_MIN_REBOUND_PURE_ATR = float(os.getenv("LEVEL_EVENTS_MIN_REBOUND_PURE_ATR", "0.03"))
 LEVEL_EVENTS_RETURN_EPS_ATR = float(os.getenv("LEVEL_EVENTS_RETURN_EPS_ATR", "0.05"))
 LEVEL_EVENTS_REBOUND_HORIZON_BARS = int(os.getenv("LEVEL_EVENTS_REBOUND_HORIZON_BARS", "240"))
+LEVEL_EVENTS_CONFIRM_ATR_PCT = float(os.getenv("LEVEL_EVENTS_CONFIRM_ATR_PCT", "0.30"))
+LEVEL_EVENTS_STALE_OPEN_MINUTES = int(os.getenv("LEVEL_EVENTS_STALE_OPEN_MINUTES", "180"))
+# Порог отбоя в долях ATR для строк `level_strength_report` / `level_stop_profile` (≥ 0.30 = 30% ATR).
+# Не путать с LEVEL_EVENTS_RETURN_EPS_ATR (допуск возврата через уровень).
+LEVEL_STRENGTH_REPORT_MIN_REBOUND_PURE_ATR = float(
+    os.getenv("LEVEL_STRENGTH_REPORT_MIN_REBOUND_PURE_ATR", "0.30")
+)
 
 # -----------------------------------------------------------------------------
 # HTF volume profile (отдельно от 1m `volume_profile_peaks`: крупный ТФ + окно в днях)

@@ -52,7 +52,20 @@ def _normalize_timeframe(tf: str) -> str:
 
 
 def iter_config_symbols_with_source() -> Iterator[tuple[str, str]]:
+    seen: set[str] = set()
     for s in TRADING_SYMBOLS:
+        seen.add(s)
+        yield s, DEFAULT_SOURCE_BINANCE
+    # Контекстные спот-пары (намеренный дубль в конфиге допустим; здесь не обрабатываем дважды)
+    for s in ANALYTIC_SYMBOLS.get("crypto_context", []):
+        if s in seen:
+            continue
+        seen.add(s)
+        yield s, DEFAULT_SOURCE_BINANCE
+    for s in ANALYTIC_SYMBOLS.get("crypto", []):
+        if s in seen:
+            continue
+        seen.add(s)
         yield s, DEFAULT_SOURCE_BINANCE
     for s in ANALYTIC_SYMBOLS.get("macro", []):
         yield s, DEFAULT_SOURCE_YFINANCE
@@ -178,7 +191,8 @@ def run_htf_volume_levels_batch(
     level_type: str | None = None,
 ) -> tuple[int, pd.DataFrame]:
     """
-    Для всех символов из `TRADING_SYMBOLS` + `ANALYTIC_SYMBOLS` (macro, indices):
+    Для всех символов из `TRADING_SYMBOLS` + доп. спот из `ANALYTIC_SYMBOLS['crypto_context']`
+    (без повтора пар из торгового списка) + `macro`, `indices`:
     загрузка OHLCV, `find_pro_levels`, сохранение в `price_levels`.
 
     `level_type` по умолчанию `vp_global`; для экспериментов передайте отдельную строку,

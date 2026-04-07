@@ -66,6 +66,7 @@ def test_run_human_levels_and_save_inserts_human_auto(clean_db):
         layer="test_human_layer",
         cluster_atr_mult=2.0,
         min_fractal_count=1,
+        zone_min_gap_atr_d1=0.0,
     )
 
     conn = get_connection()

@@ -2,11 +2,14 @@
 Уровни по пикам сглаженного объёмного профиля (HVN): жадный отбор по сглаженному профилю,
 склейка по долинам и финальный merge близких уровней.
 
+Глобальный профиль: объём каждой свечи **равномерно** делится между всеми бинами ширины `tick`,
+пересекающими **[low, high]** (классический VP, как TradingView / Sierra Chart), а не кладётся
+в один бин по `close`. Если `high`/`low` нет в данных, подставляется `close`.
+
 Единая «умная» метрика уровня (жёсткий и мягкий проходы): коридор цен
 [min·(1−distance_pct), max·(1+distance_pct)]; в зону входят свечи, **пересекающие** диапазон
-по high/low (не только close внутри — иначе теряется «пила»). Суммарный объём по всем таким
-свечам; POC — **price_bin(close)** с максимальной суммой объёма (тот же шаг tick_size, что
-у глобального профиля), а не одна свеча с max volume. Длительность — по шагу времени в поднаборе.
+по high/low. Суммарный объём по всем таким свечам; POC — центр бина с максимальной суммой объёма
+на том же шаге `tick_size`, что и глобальный профиль. Длительность — по шагу времени в поднаборе.
 """
 
 from __future__ import annotations
@@ -105,6 +108,87 @@ def _profile_tick_size_eff(explicit_tick: Optional[float], current_price: float)
     if explicit_tick is not None:
         return max(float(explicit_tick), 1e-8)
     return max(float(current_price) * 0.0005, 1e-8)
+
+
+def _price_bins_edges_and_centers(mn: float, mx: float, tick: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Равномерная сетка: бин i — [edges[i], edges[i+1]), метка в Series — centers[i] (центр бина).
+    """
+    tick = max(float(tick), 1e-12)
+    if not math.isfinite(mn) or not math.isfinite(mx):
+        raise ValueError("mn/mx must be finite")
+    if mx < mn:
+        mn, mx = mx, mn
+    start = math.floor(mn / tick) * tick
+    span = mx - start
+    n_bins = max(1, int(math.ceil(span / tick)))
+    while start + n_bins * tick < mx - tick * 1e-9:
+        n_bins += 1
+    edges = start + np.arange(n_bins + 1, dtype=np.float64) * tick
+    centers = edges[:-1] + tick * 0.5
+    return edges, centers
+
+
+def _accumulate_volume_uniform_hl(
+    low: np.ndarray,
+    high: np.ndarray,
+    volume: np.ndarray,
+    edges: np.ndarray,
+) -> np.ndarray:
+    """Равномерно делит объём свечи между всеми бинами, пересекающими [low, high]."""
+    m = int(len(edges) - 1)
+    prof = np.zeros(m, dtype=np.float64)
+    if m <= 0:
+        return prof
+    tick = float(edges[1] - edges[0])
+    eps = max(1e-15, tick * 1e-9)
+    for i in range(len(volume)):
+        v = float(volume[i])
+        if v <= 0.0 or not math.isfinite(v):
+            continue
+        lo = float(low[i])
+        hi = float(high[i])
+        if not math.isfinite(lo) or not math.isfinite(hi):
+            continue
+        if hi < lo:
+            lo, hi = hi, lo
+        hi_adj = hi + eps
+        i0 = int(np.searchsorted(edges, lo, side="right") - 1)
+        i1 = int(np.searchsorted(edges, hi_adj, side="right") - 1)
+        i0 = max(0, min(i0, m - 1))
+        i1 = max(0, min(i1, m - 1))
+        if i0 > i1:
+            i1 = i0
+        n_touch = i1 - i0 + 1
+        add = v / float(n_touch)
+        prof[i0 : i1 + 1] += add
+    return prof
+
+
+def _volume_profile_from_hl(work: pd.DataFrame, tick: float) -> pd.Series:
+    """
+    Строит профиль объёма по high–low: равномерное распределение volume по бинам ширины tick.
+    Ожидаются колонки low, high, volume.
+    """
+    tick = max(float(tick), 1e-12)
+    lows = work["low"].to_numpy(dtype=np.float64)
+    highs = work["high"].to_numpy(dtype=np.float64)
+    vols = work["volume"].to_numpy(dtype=np.float64)
+    mn = float(np.nanmin(lows))
+    mx = float(np.nanmax(highs))
+    edges, centers = _price_bins_edges_and_centers(mn, mx, tick)
+    prof = _accumulate_volume_uniform_hl(lows, highs, vols, edges)
+    return pd.Series(prof, index=centers, dtype=np.float64).sort_index()
+
+
+def _ensure_ohlc_for_profile(work: pd.DataFrame) -> pd.DataFrame:
+    """Для VP по HL; без high/low — вырожденный случай close-only."""
+    out = work.copy()
+    if "high" not in out.columns:
+        out["high"] = out["close"]
+    if "low" not in out.columns:
+        out["low"] = out["close"]
+    return out
 
 
 def resolve_display_tick_size(symbol: Optional[str]) -> Optional[float]:
@@ -215,7 +299,7 @@ def _snapshot_band_volume(
     """
     Свечи, пересекающие [lower, upper] по high/low.
     Суммарный объём — сумма volume по всем свечам в коридоре.
-    POC — бин с максимальной суммой объёма (bin по close round(tick)).
+    POC — центр бина с максимальной суммой объёма (профиль HL → равномерно по [low, high]).
 
     Returns (poc_price, vol_sum, dur_h, t0, t1) или None.
     """
@@ -229,22 +313,24 @@ def _snapshot_band_volume(
     if sub.empty:
         return None
     ts_bin = max(float(tick_size), 1e-12)
-    # Бинирование по close round (чтобы совпадало с профилем в других модулях).
-    binned = (sub["close"] / ts_bin).round() * ts_bin
-    vol_by_bin = sub.groupby(binned, sort=False)["volume"].sum()
-    if vol_by_bin.empty:
+    sub_hl = _ensure_ohlc_for_profile(sub)
+    sub_hl = sub_hl.dropna(subset=["low", "high", "volume"])
+    if sub_hl.empty:
+        return None
+    vol_by_bin = _volume_profile_from_hl(sub_hl[["low", "high", "volume"]], ts_bin)
+    if vol_by_bin.empty or float(vol_by_bin.sum()) <= 0.0:
         return None
 
     poc_price = float(vol_by_bin.idxmax())
-    vol_sum = float(sub["volume"].sum())
-    if "timestamp" in sub.columns:
-        ts = np.sort(sub["timestamp"].to_numpy(dtype=np.int64))
+    vol_sum = float(sub_hl["volume"].sum())
+    if "timestamp" in sub_hl.columns:
+        ts = np.sort(sub_hl["timestamp"].to_numpy(dtype=np.int64))
         step_seconds = float(np.median(np.diff(ts))) if ts.size >= 2 else 60.0
-        dur_h = float(sub.shape[0]) * max(step_seconds, 1.0) / 3600.0
-        t0 = int(sub["timestamp"].min())
-        t1 = int(sub["timestamp"].max())
+        dur_h = float(sub_hl.shape[0]) * max(step_seconds, 1.0) / 3600.0
+        t0 = int(sub_hl["timestamp"].min())
+        t1 = int(sub_hl["timestamp"].max())
     else:
-        dur_h = float(sub.shape[0]) / 60.0
+        dur_h = float(sub_hl.shape[0]) / 60.0
         t0, t1 = None, None
     return poc_price, vol_sum, dur_h, t0, t1
 
@@ -840,7 +926,7 @@ def find_pro_levels(
     weak_fallback_threshold: зарезервировано под совместимость (пока не используется).
     symbol: например «ADA/USDT» — влияет **только** на округление поля `Price` в ответе
         (берётся биржевой tick для числа знаков). Построение профиля и отбор уровней
-        используют `tick_size` и эвристику `current_price * 0.0005`, как раньше.
+        используют `tick_size`, эвристику `current_price * 0.0005` и распределение объёма по [low, high].
     """
     if return_raw and return_dedup:
         raise ValueError("Задайте только один из return_raw или return_dedup")
@@ -855,6 +941,8 @@ def find_pro_levels(
         raise ValueError("Нужны колонки close и volume")
     work = work.dropna(subset=["close", "volume"])
     work = work[work["volume"] >= 0]
+    work = _ensure_ohlc_for_profile(work)
+    work = work.dropna(subset=["high", "low"])
     empty = pd.DataFrame(columns=["Price", "Volume", "Duration_Hrs", "Tier", "start_utc", "end_utc"])
     if work.empty:
         return empty
@@ -864,8 +952,7 @@ def find_pro_levels(
     tick_size_eff = _profile_tick_size_eff(tick_size, current_price)
     price_decimals = _price_decimals_for_output(sym)
 
-    work["price_bin"] = (work["close"] / tick_size_eff).round() * tick_size_eff
-    profile = work.groupby("price_bin", sort=True)["volume"].sum()
+    profile = _volume_profile_from_hl(work[["low", "high", "volume"]], tick_size_eff)
     win = max(3, int(smoothing_window))
     if win % 2 == 0:
         win += 1
@@ -1056,9 +1143,9 @@ def find_pro_levels(
 
 def get_adaptive_params(df: pd.DataFrame, symbol: str | None = None) -> dict:
     """
-    Универсальная адаптация параметров под волатильность и структуру объема монеты.
-    `symbol` оставлен для совместимости вызовов; на `tick_size` в словаре не влияет
-    (шаг профиля — эвристика `current_price * 0.0005`, как изначально).
+    Адаптация параметров под окно OHLCV: волатильность (масштаб до «~дневной» %),
+    типичный относительный размах свечи, CV объёма, средний объём свечи.
+    `symbol` зарезервирован для совместимости вызовов.
     """
     work = df.copy()
     required = {"close", "high", "low", "volume"}
@@ -1070,51 +1157,111 @@ def get_adaptive_params(df: pd.DataFrame, symbol: str | None = None) -> dict:
         raise ValueError("Пустой DataFrame после очистки")
 
     current_price = float(work["close"].iloc[-1])
-    _ = symbol  # API-совместимость; профиль не привязываем к биржевому tick.
-    tick_size = max(current_price * 0.0005, 1e-8)
+    _ = symbol
 
-    work["price_bin"] = (work["close"] / tick_size).round() * tick_size
-    profile_vol = work.groupby("price_bin")["volume"].sum()
+    rets = work["close"].astype(np.float64).pct_change().dropna()
+    if len(rets) >= 2:
+        sig_m = float(rets.std())
+        if not math.isfinite(sig_m) or sig_m < 0:
+            sig_m = 0.0
+        # Доля за минуту → оценка дневной волатильности в % (sqrt(минут в сутках))
+        daily_vol_pct = float(sig_m * np.sqrt(1440.0) * 100.0)
+    else:
+        daily_vol_pct = 0.0
+
+    close_safe = work["close"].replace(0, np.nan)
+    typical_range = float(((work["high"] - work["low"]) / close_safe).median())
+    if not math.isfinite(typical_range):
+        typical_range = 0.0
+
+    vol_mean = float(work["volume"].mean()) + 1e-9
+    volume_cv = float(work["volume"].std() / vol_mean)
+    if not math.isfinite(volume_cv):
+        volume_cv = 0.0
+
+    # --- Волатильность → distance, порог финального merge (нижняя граница), valley ---
+    if daily_vol_pct > 4.0:
+        distance_pct = min(0.03, 0.01 + daily_vol_pct / 200.0)
+        merge_pct_floor = min(0.025, 0.005 + daily_vol_pct / 150.0)
+        valley_threshold = 0.4
+    elif daily_vol_pct > 2.0:
+        distance_pct = 0.015
+        merge_pct_floor = 0.01
+        valley_threshold = 0.5
+    else:
+        distance_pct = 0.01
+        merge_pct_floor = 0.007
+        valley_threshold = 0.6
+
+    # --- Типичный размах свечи → шаг бина профиля ---
+    tick_size = max(current_price * 0.0005, 1e-8)
+    if typical_range > 0.003:
+        tick_size *= 1.5
+
+    # --- CV объёма → перцентили высоты и множитель к среднему сглаженного профиля ---
+    if volume_cv < 0.5:
+        height_percentile_strong = 0.97
+        height_percentile_weak = 0.85
+        height_mult = 2.5
+    elif volume_cv < 1.0:
+        height_percentile_strong = 0.95
+        height_percentile_weak = 0.80
+        height_mult = 2.0
+    else:
+        height_percentile_strong = 0.92
+        height_percentile_weak = 0.75
+        height_mult = 1.5
+
+    height_percentile = float((height_percentile_strong + height_percentile_weak) / 2.0)
+
+    profile_vol = _volume_profile_from_hl(work[["low", "high", "volume"]], tick_size)
     mean_v = float(profile_vol.mean()) if not profile_vol.empty else 0.0
     q80 = float(profile_vol.quantile(0.80)) if not profile_vol.empty else 0.0
     if mean_v > 1e-12:
-        height_mult = max(1.2, q80 / mean_v)
-    else:
-        height_mult = 1.2
+        height_mult_data = max(1.2, q80 / mean_v)
+        height_mult = max(float(height_mult), float(height_mult_data))
 
-    volume_cv = float(work["volume"].std() / (work["volume"].mean() + 1e-9))
-    valley_threshold = 0.40
-    distance_pct = 0.003
+    # --- Минимальная длительность в коридоре (часы) ---
+    denom = daily_vol_pct / 2.0 + 0.5
+    if denom < 1e-6:
+        denom = 0.5
+    min_duration_hours = max(24.0, min(72.0, 48.0 / denom))
+
+    # --- Число кандидатов greedy: без привязки к абсолютному объёму (override через PRO_LEVELS_MAX_LEVELS / rebuild). ---
+    top_n = 10
+
+    mean_hl_pct = float((work["high"] - work["low"]).mean()) / max(current_price, 1e-9)
+    range_merge = float(mean_hl_pct * 2.0)
+    dynamic_merge_pct = min(
+        max(FINAL_MERGE_PCT_CLAMP_MIN, max(merge_pct_floor, range_merge)),
+        FINAL_MERGE_PCT_CLAMP_MAX,
+    )
+
+    merge_distance_pct = min(0.005, max(0.0005, float(distance_pct) / 3.0))
 
     return {
         "tick_size": float(tick_size),
         "distance_pct": float(distance_pct),
         "height_mult": round(float(height_mult), 2),
-        "height_percentile": 0.8,
-        "height_percentile_strong": 0.85,
-        "height_percentile_weak": 0.65,
+        "height_percentile": float(height_percentile),
+        "height_percentile_strong": float(height_percentile_strong),
+        "height_percentile_weak": float(height_percentile_weak),
         "smoothing_window": 5,
-        "merge_distance_pct": 0.001,
+        "merge_distance_pct": float(merge_distance_pct),
         "dedup_round_pct": 0.001,
         "duration_thresholds": (48.0, 12.0),
-        "min_duration_hours": 6.0,
-        "top_n": 10,
+        "min_duration_hours": float(min_duration_hours),
+        "top_n": int(top_n),
         "max_levels": None,
-        "dynamic_merge_pct": min(
-            max(
-                FINAL_MERGE_PCT_CLAMP_MIN,
-                float((work["high"] - work["low"]).mean()) / max(current_price, 1e-9) * 2.0,
-            ),
-            FINAL_MERGE_PCT_CLAMP_MAX,
-        ),
+        "dynamic_merge_pct": float(dynamic_merge_pct),
         "final_merge_valley_threshold": 0.5,
-        "valley_merge_threshold": 0.4,
+        "valley_merge_threshold": float(valley_threshold),
         "enable_valley_merge": True,
         "valley_threshold": float(valley_threshold),
         "volume_cv": round(float(volume_cv), 2),
-        "avg_hourly_volatility": round(
-            float((work["high"] - work["low"]).mean()) / max(current_price, 1e-9), 5
-        ),
+        "avg_hourly_volatility": round(float(mean_hl_pct), 5),
+        "daily_vol_pct": round(float(daily_vol_pct), 4),
+        "typical_range": round(float(typical_range), 6),
     }
 
 

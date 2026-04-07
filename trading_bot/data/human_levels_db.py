@@ -23,6 +23,7 @@ from trading_bot.analytics.human_levels import (
 from trading_bot.config.settings import (
     HUMAN_LEVELS_MIN_FRACTAL_COUNT,
     HUMAN_LEVELS_MIN_STRENGTH,
+    HUMAN_LEVELS_ZONE_MIN_GAP_ATR,
 )
 from trading_bot.data.db import get_connection
 from trading_bot.data.schema import init_db, run_migrations
@@ -178,18 +179,22 @@ def run_human_levels_and_save(
     cluster_atr_mult: float = DEFAULT_CLUSTER_ATR_MULT,
     min_fractal_count: Optional[int] = None,
     min_strength: Optional[float] = None,
+    zone_min_gap_atr_d1: Optional[float] = None,
 ) -> HumanLevelsResult:
     """
     Пайплайн human_levels + сохранение в БД.
     Окно t_start/t_end — по min/max timestamp среди D1 и W1 (если есть колонка).
     Перед сохранением зоны фильтруются по HUMAN_LEVELS_MIN_* из settings,
     если не переданы явные min_fractal_count / min_strength.
+    Разрежение D1 по центрам: HUMAN_LEVELS_ZONE_MIN_GAP_ATR, если не задано zone_min_gap_atr_d1.
     """
+    zgap = HUMAN_LEVELS_ZONE_MIN_GAP_ATR if zone_min_gap_atr_d1 is None else float(zone_min_gap_atr_d1)
     result = run_human_levels_pipeline(
         df_d1,
         df_w1,
         atr_period=atr_period,
         cluster_atr_mult=cluster_atr_mult,
+        zone_min_gap_atr_d1=zgap,
     )
     mfc = HUMAN_LEVELS_MIN_FRACTAL_COUNT if min_fractal_count is None else min_fractal_count
     ms = HUMAN_LEVELS_MIN_STRENGTH if min_strength is None else min_strength

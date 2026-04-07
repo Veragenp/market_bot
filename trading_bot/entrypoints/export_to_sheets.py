@@ -35,7 +35,11 @@ from trading_bot.analytics.volume_profile_peaks import (
     get_adaptive_params,
 )
 from trading_bot.data.repositories import get_level_events_since, get_ohlcv_filled
-from trading_bot.config.settings import VOLUME_PEAK_LEVELS_WORKSHEET
+from trading_bot.config.settings import (
+    LEVEL_EVENTS_CONFIRM_ATR_PCT,
+    LEVEL_STRENGTH_REPORT_MIN_REBOUND_PURE_ATR,
+    VOLUME_PEAK_LEVELS_WORKSHEET,
+)
 from trading_bot.data.volume_profile_peaks_db import LEVEL_TYPE_VOLUME_PROFILE_PEAKS
 from trading_bot.tools.sheets_exporter import SheetsExporter
 
@@ -71,6 +75,17 @@ VOLUME_PEAK_ANALYSIS_WORKSHEET = os.getenv(
 LEVEL_EVENTS_WORKSHEET = os.getenv("LEVEL_EVENTS_WORKSHEET", "level_events")
 LEVEL_STRENGTH_WORKSHEET = os.getenv("LEVEL_STRENGTH_WORKSHEET", "level_strength_report")
 LEVEL_STOP_PROFILE_WORKSHEET = os.getenv("LEVEL_STOP_PROFILE_WORKSHEET", "level_stop_profile")
+
+# События с итоговым исходом для strength/stop: подтверждённый отбой/пробой или ложный пробой (возврат без confirm).
+_LEVEL_STRENGTH_QUALIFYING_STATUSES = frozenset(
+    {
+        "confirmed_rebound_up",
+        "confirmed_rebound_down",
+        "confirmed_breakout_up",
+        "confirmed_breakout_down",
+        "false_break",
+    }
+)
 
 # Важно: пики volume_profile_peaks в Google Sheets теперь выгружаются
 # строго из SQLite `price_levels` (посчитанные и сохраненные скриптом rebuild).
@@ -470,20 +485,27 @@ def _volume_peak_levels_one(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Один символ: уровни для листа + одна строка аудита."""
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Берём только активные уровни последнего пересчёта (max created_at) для `symbol`.
+    # Активные уровни текущего слоя: при save через merge UPDATE не меняет created_at,
+    # поэтому отбор только по MAX(created_at) отрезает часть строк одного прогона в Sheets.
+    # Берём layer с самой свежей COALESCE(updated_at, created_at), затем все активные строки этого layer.
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT MAX(created_at)
-        FROM price_levels
+        SELECT layer FROM price_levels
         WHERE symbol = ? AND level_type = ? AND is_active = 1
+        ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+        LIMIT 1
         """,
         (symbol, LEVEL_TYPE_VOLUME_PROFILE_PEAKS),
     )
-    row = cur.fetchone()
-    max_created_at = int(row[0]) if row and row[0] is not None else None
-    if max_created_at is None:
+    row_layer = cur.fetchone()
+    ref_layer = (
+        str(row_layer["layer"])
+        if row_layer is not None and row_layer["layer"] is not None and str(row_layer["layer"]).strip() != ""
+        else None
+    )
+    if ref_layer is None:
         conn.close()
         out = pd.DataFrame([{"symbol": symbol, "month_utc": "", "exported_at_utc": now_iso, "note": "Нет активных уровней"}])
         audit = pd.DataFrame(
@@ -522,10 +544,10 @@ def _volume_peak_levels_one(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             t_end_unix,
             created_at
         FROM price_levels
-        WHERE symbol = ? AND level_type = ? AND is_active = 1 AND created_at = ?
+        WHERE symbol = ? AND level_type = ? AND is_active = 1 AND layer = ?
         ORDER BY volume_peak DESC, price ASC
         """,
-        (symbol, LEVEL_TYPE_VOLUME_PROFILE_PEAKS, max_created_at),
+        (symbol, LEVEL_TYPE_VOLUME_PROFILE_PEAKS, ref_layer),
     )
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -709,6 +731,35 @@ def _fetch_level_events_for_sheet(lookback_days: int = 30) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame([{"note": "Нет событий уровней за выбранный период."}])
     out = pd.DataFrame(rows)
+    if "event_status" in out.columns:
+        out["event_status"] = out["event_status"].fillna("legacy_unknown")
+        out = out[out["event_status"] != "legacy_unknown"].copy()
+    if out.empty:
+        return pd.DataFrame([{"note": "Нет событий нового алгоритма за выбранный период."}])
+    # Backward compatibility: older DB schema does not store *_pct metrics.
+    if "atr_pct" not in out.columns and {"atr_daily", "level_price"}.issubset(out.columns):
+        out["atr_pct"] = (out["atr_daily"].astype(float) / out["level_price"].astype(float)) * 100.0
+    if "penetration_pct" not in out.columns and {"penetration_atr", "atr_daily", "level_price"}.issubset(out.columns):
+        out["penetration_pct"] = (
+            out["penetration_atr"].astype(float) * out["atr_daily"].astype(float) / out["level_price"].astype(float) * 100.0
+        )
+    if "rebound_pure_pct" not in out.columns and {"rebound_pure_atr", "atr_daily", "level_price"}.issubset(out.columns):
+        out["rebound_pure_pct"] = (
+            out["rebound_pure_atr"].astype(float) * out["atr_daily"].astype(float) / out["level_price"].astype(float) * 100.0
+        )
+    if "rebound_after_return_pct" not in out.columns and {"rebound_after_return_atr", "atr_daily", "level_price"}.issubset(out.columns):
+        out["rebound_after_return_pct"] = (
+            out["rebound_after_return_atr"].astype(float) * out["atr_daily"].astype(float) / out["level_price"].astype(float) * 100.0
+        )
+    # ATR-relative percentages (canonical for analytics).
+    if "dist_start_atr" in out.columns:
+        out["dist_start_atr_pct"] = pd.to_numeric(out["dist_start_atr"], errors="coerce") * 100.0
+    if "penetration_atr" in out.columns:
+        out["penetration_atr_pct"] = pd.to_numeric(out["penetration_atr"], errors="coerce") * 100.0
+    if "rebound_pure_atr" in out.columns:
+        out["rebound_pure_atr_pct"] = pd.to_numeric(out["rebound_pure_atr"], errors="coerce") * 100.0
+    if "rebound_after_return_atr" in out.columns:
+        out["rebound_after_return_atr_pct"] = pd.to_numeric(out["rebound_after_return_atr"], errors="coerce") * 100.0
     for c in ("touch_time", "return_time", "window_start", "window_end", "created_at"):
         if c in out.columns:
             name = f"{c}_utc"
@@ -716,54 +767,127 @@ def _fetch_level_events_for_sheet(lookback_days: int = 30) -> pd.DataFrame:
                 lambda v: _ts_to_iso_utc(int(v)) if pd.notna(v) else ""
             )
     cols = [
-        "event_id",
-        "stable_level_id",
         "symbol",
-        "month_utc",
-        "tier",
-        "layer",
+        "stable_level_id",
+        "event_status",
+        "pre_side",
         "level_price",
-        "volume_peak",
-        "duration_hours",
-        "atr_daily",
-        "dist_start_atr",
         "touch_time_utc",
-        "return_time_utc",
-        "penetration_atr",
-        "rebound_pure_atr",
-        "rebound_after_return_atr",
+        "confirm_time_sec",
+        "touch_count_before_confirm",
+        "dist_start_atr_pct",
+        "penetration_atr_pct",
+        "rebound_pure_atr_pct",
+        "rebound_after_return_atr_pct",
         "cluster_size",
-        "window_start_utc",
-        "window_end_utc",
     ]
     return out[[c for c in cols if c in out.columns]]
 
 
-def _fetch_level_strength_report_for_sheet(lookback_days: int = 90) -> pd.DataFrame:
-    start_ts = int(datetime.now(timezone.utc).timestamp()) - int(lookback_days * 86400)
-    rows = get_level_events_since(start_ts)
+def _prepare_level_events_for_strength_export(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     if not rows:
-        return pd.DataFrame([{"note": "Нет событий для расчета силы уровней."}])
-
+        return pd.DataFrame()
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame([{"note": "Нет событий для расчета силы уровней."}])
+        return pd.DataFrame()
+    if "event_status" in df.columns:
+        df["event_status"] = df["event_status"].fillna("legacy_unknown")
+        df = df[df["event_status"] != "legacy_unknown"].copy()
+    if df.empty:
+        return pd.DataFrame()
+    if "atr_pct" not in df.columns and {"atr_daily", "level_price"}.issubset(df.columns):
+        df["atr_pct"] = (df["atr_daily"].astype(float) / df["level_price"].astype(float)) * 100.0
+    if "penetration_atr_pct" not in df.columns and "penetration_atr" in df.columns:
+        df["penetration_atr_pct"] = pd.to_numeric(df["penetration_atr"], errors="coerce") * 100.0
+    if "rebound_pure_atr_pct" not in df.columns and "rebound_pure_atr" in df.columns:
+        df["rebound_pure_atr_pct"] = pd.to_numeric(df["rebound_pure_atr"], errors="coerce") * 100.0
+    if "rebound_after_return_atr_pct" not in df.columns and "rebound_after_return_atr" in df.columns:
+        df["rebound_after_return_atr_pct"] = pd.to_numeric(
+            df["rebound_after_return_atr"], errors="coerce"
+        ) * 100.0
+    return df
 
-    grp = df.groupby(["symbol", "stable_level_id", "tier", "layer", "level_price"], dropna=False)
-    out = grp.agg(
-        touches_n=("event_id", "count"),
-        return_rate=("return_time", lambda s: float(pd.Series(s).notna().mean())),
-        p50_penetration_atr=("penetration_atr", "median"),
-        p80_penetration_atr=("penetration_atr", lambda s: float(pd.Series(s).quantile(0.8))),
-        p95_penetration_atr=("penetration_atr", lambda s: float(pd.Series(s).quantile(0.95))),
-        median_rebound_after_atr=("rebound_after_return_atr", "median"),
-        median_rebound_pure_atr=("rebound_pure_atr", "median"),
-        median_cluster_size=("cluster_size", "median"),
-    ).reset_index()
 
-    # Composite score tuned for practical ranking.
-    out["pen_score"] = (1.0 - (out["p80_penetration_atr"].fillna(0.0) / 1.5)).clip(0.0, 1.0)
-    out["reb_score"] = (out["median_rebound_after_atr"].fillna(0.0) / 1.5).clip(0.0, 1.0)
+def _aggregate_level_strength_by_level(df: pd.DataFrame) -> pd.DataFrame:
+    """Одна строка на уровень: контекст для merge с событиями (composite, broken, touches_n, …)."""
+    if df.empty:
+        return pd.DataFrame()
+    group_cols = ["symbol", "stable_level_id", "tier", "layer", "level_price"]
+    rows_out: List[Dict[str, Any]] = []
+    recent_n = 5
+    for keys, g in df.groupby(group_cols, dropna=False):
+        g = g.sort_values("touch_time", ascending=False)
+        touches_n = int(len(g))
+        if "event_status" in g.columns:
+            g_eval = g[
+                g["event_status"].isin(
+                    [
+                        "confirmed_rebound_up",
+                        "confirmed_rebound_down",
+                        "confirmed_breakout_up",
+                        "confirmed_breakout_down",
+                        "open",
+                        "stale_open",
+                    ]
+                )
+            ].copy()
+            returned = g_eval[g_eval["event_status"].isin(["confirmed_rebound_up", "confirmed_rebound_down"])].copy()
+            breakouts = g_eval[g_eval["event_status"].isin(["confirmed_breakout_up", "confirmed_breakout_down"])].copy()
+            confirmed_n = len(returned) + len(breakouts)
+            return_rate = float(len(returned) / confirmed_n) if confirmed_n > 0 else 0.0
+            break_rate = float(len(breakouts) / confirmed_n) if confirmed_n > 0 else 0.0
+        else:
+            returned = g[g["return_time"].notna()].copy()
+            return_rate = float(len(returned) / touches_n) if touches_n > 0 else 0.0
+            break_rate = max(0.0, 1.0 - return_rate)
+
+        pen_all = pd.to_numeric(g["penetration_atr_pct"], errors="coerce").dropna()
+        pen_ret = pd.to_numeric(returned["penetration_atr_pct"], errors="coerce").dropna()
+        reb_after = pd.to_numeric(returned["rebound_after_return_atr_pct"], errors="coerce").dropna()
+        reb_pure = pd.to_numeric(g["rebound_pure_atr_pct"], errors="coerce").dropna()
+        atr_pct_s = pd.to_numeric(g["atr_pct"], errors="coerce").dropna()
+        cluster = pd.to_numeric(g["cluster_size"], errors="coerce").dropna()
+
+        rec = g.head(recent_n)
+        recent_no_return_n = int(rec["return_time"].isna().sum())
+        recent_pen_p80 = (
+            float(pd.to_numeric(rec["penetration_atr_pct"], errors="coerce").dropna().quantile(0.8))
+            if len(rec)
+            else 0.0
+        )
+        recent_break_streak = 0
+        for _, rr in rec.iterrows():
+            if pd.notna(rr.get("return_time")):
+                break
+            recent_break_streak += 1
+
+        rows_out.append(
+            {
+                "symbol": keys[0],
+                "stable_level_id": keys[1],
+                "tier": keys[2],
+                "layer": keys[3],
+                "level_price": keys[4],
+                "touches_n": touches_n,
+                "return_rate": return_rate,
+                "break_rate": break_rate,
+                "p50_penetration_atr_pct": float(pen_all.median()) if not pen_all.empty else None,
+                "p80_penetration_atr_pct": float(pen_all.quantile(0.8)) if not pen_all.empty else None,
+                "p95_penetration_atr_pct": float(pen_all.quantile(0.95)) if not pen_all.empty else None,
+                "p80_penetration_atr_pct_returned": float(pen_ret.quantile(0.8)) if not pen_ret.empty else None,
+                "median_rebound_after_atr_pct": float(reb_after.median()) if not reb_after.empty else None,
+                "median_rebound_pure_atr_pct": float(reb_pure.median()) if not reb_pure.empty else None,
+                "lvl_median_atr_pct": float(atr_pct_s.median()) if not atr_pct_s.empty else None,
+                "median_cluster_size": float(cluster.median()) if not cluster.empty else None,
+                "recent_no_return_n": recent_no_return_n,
+                "recent_break_streak": recent_break_streak,
+                "recent_penetration_p80_pct": recent_pen_p80,
+            }
+        )
+
+    out = pd.DataFrame(rows_out)
+    out["pen_score"] = (1.0 - (out["p80_penetration_atr_pct"].fillna(0.0) / 120.0)).clip(0.0, 1.0)
+    out["reb_score"] = (out["median_rebound_after_atr_pct"].fillna(0.0) / 120.0).clip(0.0, 1.0)
     out["sample_score"] = out["touches_n"].fillna(0.0).apply(
         lambda x: min(1.0, (0.0 if x <= 0 else (math.log1p(float(x)) / math.log1p(30.0))))
     )
@@ -771,25 +895,142 @@ def _fetch_level_strength_report_for_sheet(lookback_days: int = 90) -> pd.DataFr
     out["composite_score"] = (
         100.0
         * (
-            0.35 * out["return_rate"].fillna(0.0)
+            0.30 * out["return_rate"].fillna(0.0)
             + 0.20 * out["pen_score"]
             + 0.20 * out["reb_score"]
             + 0.15 * out["sample_score"]
             + 0.10 * out["noise_score"]
+            + 0.05 * (1.0 - out["break_rate"])
         )
     ).round(2)
     out["strength_bucket"] = out["composite_score"].apply(
         lambda s: "strong" if s >= 80 else ("medium" if s >= 60 else "weak")
     )
-    out["recommended_stop_atr_base"] = (out["p80_penetration_atr"].fillna(0.0) + 0.05).round(4)
-    out["recommended_stop_atr_conservative"] = (out["p95_penetration_atr"].fillna(0.0) + 0.05).round(4)
-    out["exported_at_utc"] = datetime.now(timezone.utc).isoformat()
+    out["broken_flag"] = (
+        ((out["break_rate"].fillna(0.0) >= 0.60) & (out["return_rate"].fillna(0.0) <= 0.40))
+        | (out["recent_break_streak"].fillna(0) >= 3)
+        | (
+            (out["recent_no_return_n"].fillna(0) >= 3)
+            & (out["recent_penetration_p80_pct"].fillna(0.0) >= 60.0)
+        )
+    ).astype(int)
+    base_stop_raw = pd.to_numeric(out["p80_penetration_atr_pct_returned"], errors="coerce") + 10.0
+    atr_floor = pd.Series(float(LEVEL_EVENTS_CONFIRM_ATR_PCT) * 100.0, index=out.index)
+    out["lvl_recommended_stop_pct_base"] = pd.concat([base_stop_raw, atr_floor], axis=1).max(axis=1).round(4)
+    out["lvl_recommended_stop_pct_conservative"] = (
+        pd.concat(
+            [
+                out["lvl_recommended_stop_pct_base"] + 15.0,
+                atr_floor * 1.25,
+            ],
+            axis=1,
+        )
+        .max(axis=1)
+        .round(4)
+    )
+    out["stop_floor_pct"] = atr_floor.round(4)
+    out.loc[
+        out["p80_penetration_atr_pct_returned"].isna() & atr_floor.isna(),
+        ["lvl_recommended_stop_pct_base", "lvl_recommended_stop_pct_conservative"],
+    ] = pd.NA
     return out
 
 
+def _fetch_level_strength_report_for_sheet(lookback_days: int = 90, compact: bool = True) -> pd.DataFrame:
+    start_ts = int(datetime.now(timezone.utc).timestamp()) - int(lookback_days * 86400)
+    rows = get_level_events_since(start_ts)
+    if not rows:
+        return pd.DataFrame([{"note": "Нет событий для расчета силы уровней."}])
+
+    df = _prepare_level_events_for_strength_export(rows)
+    if df.empty:
+        return pd.DataFrame([{"note": "Нет событий нового алгоритма для расчета силы."}])
+
+    agg = _aggregate_level_strength_by_level(df)
+    merge_keys = ["symbol", "stable_level_id", "tier", "layer", "level_price"]
+    min_reb = float(LEVEL_STRENGTH_REPORT_MIN_REBOUND_PURE_ATR)
+    qual = df[df["event_status"].isin(_LEVEL_STRENGTH_QUALIFYING_STATUSES)].copy()
+    qual = qual[pd.to_numeric(qual["rebound_pure_atr"], errors="coerce") >= min_reb]
+    if qual.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "note": (
+                        f"Нет событий с rebound_pure ≥ {min_reb * 100:.0f}% ATR "
+                        "и итоговым статусом (confirm / false_break) за период."
+                    )
+                }
+            ]
+        )
+
+    out = qual.merge(agg, on=merge_keys, how="left")
+    out = out.sort_values(["symbol", "touch_time"], ascending=[True, False])
+    for c in ("touch_time", "return_time", "window_start", "window_end"):
+        if c in out.columns:
+            out[f"{c}_utc"] = out[c].apply(
+                lambda v: _ts_to_iso_utc(int(v)) if pd.notna(v) else "",
+            )
+    out["exported_at_utc"] = datetime.now(timezone.utc).isoformat()
+    if not compact:
+        return out
+    cols = [
+        "symbol",
+        "stable_level_id",
+        "event_id",
+        "event_status",
+        "pre_side",
+        "level_price",
+        "touch_time_utc",
+        "penetration_atr_pct",
+        "rebound_pure_atr_pct",
+        "rebound_after_return_atr_pct",
+        "confirm_time_sec",
+        "touch_count_before_confirm",
+        "cluster_size",
+        "touches_n",
+        "return_rate",
+        "break_rate",
+        "broken_flag",
+        "composite_score",
+        "strength_bucket",
+        "p80_penetration_atr_pct",
+        "median_rebound_after_atr_pct",
+        "lvl_recommended_stop_pct_base",
+        "lvl_recommended_stop_pct_conservative",
+        "exported_at_utc",
+    ]
+    return out[[c for c in cols if c in out.columns]]
+
+
 def _fetch_level_stop_profile_for_sheet(lookback_days: int = 90) -> pd.DataFrame:
-    strength = _fetch_level_strength_report_for_sheet(lookback_days=lookback_days)
-    if "stable_level_id" not in strength.columns:
+    start_ts = int(datetime.now(timezone.utc).timestamp()) - int(lookback_days * 86400)
+    rows = get_level_events_since(start_ts)
+    if not rows:
+        return pd.DataFrame([{"note": "Нет данных для stop profile."}])
+
+    df = _prepare_level_events_for_strength_export(rows)
+    if df.empty:
+        return pd.DataFrame([{"note": "Нет данных для stop profile."}])
+
+    agg = _aggregate_level_strength_by_level(df)
+    merge_keys = ["symbol", "stable_level_id", "tier", "layer", "level_price"]
+    min_reb = float(LEVEL_STRENGTH_REPORT_MIN_REBOUND_PURE_ATR)
+    qual = df[df["event_status"].isin(_LEVEL_STRENGTH_QUALIFYING_STATUSES)].copy()
+    qual = qual[pd.to_numeric(qual["rebound_pure_atr"], errors="coerce") >= min_reb]
+    if qual.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "note": (
+                        f"Нет событий с rebound_pure ≥ {min_reb * 100:.0f}% ATR "
+                        "для stop profile за период."
+                    )
+                }
+            ]
+        )
+
+    out = qual.merge(agg, on=merge_keys, how="left")
+    if "stable_level_id" not in out.columns:
         return pd.DataFrame([{"note": "Нет данных для stop profile."}])
 
     conn = get_connection()
@@ -799,41 +1040,97 @@ def _fetch_level_stop_profile_for_sheet(lookback_days: int = 90) -> pd.DataFrame
         "SELECT symbol, atr FROM instruments WHERE exchange='bybit_futures' AND atr IS NOT NULL"
     ).fetchall():
         s = str(row["symbol"] or "")
-        # instruments symbol: BTCUSDT; normalize to BTC/USDT
         if s.endswith("USDT") and "/" not in s:
             s = s[:-4] + "/USDT"
         atr_by_symbol[s] = float(row["atr"])
     conn.close()
 
-    out = strength.copy()
     out["atr_daily"] = out["symbol"].map(atr_by_symbol)
     out = out[out["atr_daily"].notna()].copy()
     if out.empty:
         return pd.DataFrame([{"note": "Нет ATR по символам для stop profile."}])
 
-    out["stop_price_long_base"] = (
-        out["level_price"].astype(float) - out["recommended_stop_atr_base"].astype(float) * out["atr_daily"].astype(float)
+    pen_pct = pd.to_numeric(out["penetration_atr_pct"], errors="coerce")
+    atr_floor_pct = float(LEVEL_EVENTS_CONFIRM_ATR_PCT) * 100.0
+    out["recommended_stop_pct_base"] = pd.concat(
+        [pen_pct + 10.0, pd.Series(atr_floor_pct, index=out.index)], axis=1
+    ).max(axis=1).round(4)
+    out["recommended_stop_pct_conservative"] = (
+        pd.concat(
+            [
+                out["recommended_stop_pct_base"] + 15.0,
+                pd.Series(atr_floor_pct * 1.25, index=out.index),
+            ],
+            axis=1,
+        )
+        .max(axis=1)
+        .round(4)
     )
-    out["stop_price_short_base"] = (
-        out["level_price"].astype(float) + out["recommended_stop_atr_base"].astype(float) * out["atr_daily"].astype(float)
+
+    out["stop_price_long_base"] = out["level_price"].astype(float) - (
+        pd.to_numeric(out["recommended_stop_pct_base"], errors="coerce") / 100.0
+    ) * out["atr_daily"].astype(float)
+    out["stop_price_short_base"] = out["level_price"].astype(float) + (
+        pd.to_numeric(out["recommended_stop_pct_base"], errors="coerce") / 100.0
+    ) * out["atr_daily"].astype(float)
+    out["stop_price_long_conservative"] = out["level_price"].astype(float) - (
+        pd.to_numeric(out["recommended_stop_pct_conservative"], errors="coerce") / 100.0
+    ) * out["atr_daily"].astype(float)
+    out["stop_price_short_conservative"] = out["level_price"].astype(float) + (
+        pd.to_numeric(out["recommended_stop_pct_conservative"], errors="coerce") / 100.0
+    ) * out["atr_daily"].astype(float)
+    out["break_boundary_price"] = out["level_price"].astype(float) - (
+        float(LEVEL_EVENTS_CONFIRM_ATR_PCT) * out["atr_daily"].astype(float)
+    )
+    out["stop_formula_atr_pct"] = (
+        (
+            (out["level_price"].astype(float) - out["break_boundary_price"].astype(float)).abs()
+            * 100.0
+            / out["atr_daily"].astype(float)
+        ).round(4)
     )
     out["valid_from_utc"] = datetime.now(timezone.utc).isoformat()
     out["valid_to_utc"] = ""
+    out["trade_allowed"] = (
+        (out["broken_flag"].fillna(0).astype(int) == 0)
+        & pd.to_numeric(out["recommended_stop_pct_base"], errors="coerce").notna()
+        & (out["touches_n"].fillna(0).astype(int) >= 5)
+    ).astype(int)
+    out["deny_reason"] = out.apply(
+        lambda r: (
+            "broken"
+            if int(r.get("broken_flag", 0) or 0) == 1
+            else (
+                "no_stop"
+                if pd.isna(r.get("recommended_stop_pct_base"))
+                else ("low_sample" if int(r.get("touches_n", 0) or 0) < 5 else "")
+            )
+        ),
+        axis=1,
+    )
+    out["quality_gate"] = out["trade_allowed"].map({1: "ALLOW", 0: "DENY"})
+    out.loc[out["broken_flag"] == 1, [
+        "recommended_stop_pct_base",
+        "recommended_stop_pct_conservative",
+        "stop_price_long_base",
+        "stop_price_short_base",
+        "stop_price_long_conservative",
+        "stop_price_short_conservative",
+    ]] = pd.NA
     cols = [
         "symbol",
         "stable_level_id",
-        "tier",
-        "layer",
+        "event_id",
+        "event_status",
         "level_price",
-        "atr_daily",
-        "recommended_stop_atr_base",
-        "recommended_stop_atr_conservative",
-        "stop_price_long_base",
-        "stop_price_short_base",
-        "strength_bucket",
-        "composite_score",
+        "broken_flag",
+        "trade_allowed",
+        "deny_reason",
+        "stop_formula_atr_pct",
+        "recommended_stop_pct_base",
+        "recommended_stop_pct_conservative",
+        "break_boundary_price",
         "valid_from_utc",
-        "valid_to_utc",
     ]
     return out[[c for c in cols if c in out.columns]]
 
