@@ -165,6 +165,21 @@ YFINANCE_TIMEZONE = MACRO_TIMEZONE
 PRO_LEVELS_LOOKBACK_DAYS = 30  # 30 дней от последней 1m-свечи в БД
 PRO_LEVELS_LOOKBACK_HOURS = None
 
+# Плановый пересчёт vp_local → `price_levels` (см. `data/scheduler.py`).
+# >0: интервал в часах (например 1 или 4). 0: только ежедневный слот 02:45 UTC.
+_raw_vp_rebuild_h = os.getenv("VP_LOCAL_REBUILD_INTERVAL_HOURS", "4").strip()
+VP_LOCAL_REBUILD_INTERVAL_HOURS = int(_raw_vp_rebuild_h) if _raw_vp_rebuild_h else 0
+
+# После rebuild: если по символу find_pro_levels пустой — снять активные vp_local (не показывать старый снимок).
+# 0/false/off — оставить последний успешный активный набор (ручная отладка).
+VP_LOCAL_CLEAR_ON_EMPTY_REBUILD = os.getenv("VP_LOCAL_CLEAR_ON_EMPTY_REBUILD", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+)
+
 # Автовыбор входных свечей для VP (rebuild): только пороги, без списков символов.
 # Если 1m «плохие» — в памяти строится 5m из тех же 1m (ресемпл).
 VP_OHLC_FLAT_BAR_MAX_FRAC = float(os.getenv("VP_OHLC_FLAT_BAR_MAX_FRAC", "0.45"))
@@ -205,6 +220,8 @@ PRO_LEVELS_WEAK_MIN_DURATION = None
 LEVEL_EVENTS_WINDOW_HOURS = 4
 LEVEL_EVENTS_LOOKBACK_HOURS = 24
 LEVEL_EVENTS_MODE = os.getenv("LEVEL_EVENTS_MODE", "runtime").strip().lower()
+# all — все активные vp_local (как раньше). active_cycle — только уровни из cycle_levels текущего цикла, окно от frozen_at.
+LEVEL_EVENTS_SCOPE = os.getenv("LEVEL_EVENTS_SCOPE", "all").strip().lower() or "all"
 LEVEL_EVENTS_MIN_PENETRATION_ATR = float(os.getenv("LEVEL_EVENTS_MIN_PENETRATION_ATR", "0.05"))
 LEVEL_EVENTS_MIN_REBOUND_PURE_ATR = float(os.getenv("LEVEL_EVENTS_MIN_REBOUND_PURE_ATR", "0.03"))
 LEVEL_EVENTS_RETURN_EPS_ATR = float(os.getenv("LEVEL_EVENTS_RETURN_EPS_ATR", "0.05"))
@@ -255,7 +272,7 @@ HUMAN_LEVELS_MIN_BARS_D1 = int(os.getenv("HUMAN_LEVELS_MIN_BARS_D1", "20"))
 HUMAN_LEVELS_MIN_BARS_W1 = int(os.getenv("HUMAN_LEVELS_MIN_BARS_W1", "8"))
 # Больше mult → шире зоны, меньше строк (склейка соседних фракталов).
 HUMAN_LEVELS_CLUSTER_ATR_MULT = float(os.getenv("HUMAN_LEVELS_CLUSTER_ATR_MULT", "0.35"))
-HUMAN_LEVELS_ATR_PERIOD = int(os.getenv("HUMAN_LEVELS_ATR_PERIOD", "14"))
+# Удалено: human levels берут ATR только из instruments.atr (Gerchik) или тот же Gerchik по хвосту D1.
 # Отсев слабых зон перед записью в БД / Sheets (0 = не фильтровать по силе).
 HUMAN_LEVELS_MIN_FRACTAL_COUNT = int(os.getenv("HUMAN_LEVELS_MIN_FRACTAL_COUNT", "2"))
 _ms = os.getenv("HUMAN_LEVELS_MIN_STRENGTH", "0").strip()
@@ -276,10 +293,125 @@ HUMAN_LEVELS_SHEET_TITLE = os.getenv("HUMAN_LEVELS_SHEET_TITLE", "").strip()
 
 # -----------------------------------------------------------------------------
 # Локальный VP (level_type=vp_local в price_levels) → лист в MARKET_AUDIT_* таблице.
-# Данные только после rebuild: python -m trading_bot.scripts.rebuild_volume_profile_peaks_to_db
+# Источник: только БД после планового rebuild (по умолчанию каждые VP_LOCAL_REBUILD_INTERVAL_HOURS ч;
+# при 0 — раз в сутки 02:45 UTC). Ручной прогон: python -m trading_bot.scripts.rebuild_volume_profile_peaks_to_db
 # -----------------------------------------------------------------------------
 _vp_levels_sheet = (os.getenv("VOLUME_PEAK_LEVELS_WORKSHEET") or os.getenv("DBSCAN_ZONES_WORKSHEET") or "").strip()
 VOLUME_PEAK_LEVELS_WORKSHEET = _vp_levels_sheet or "vp_local_levels"
+
+# -----------------------------------------------------------------------------
+# Cycle levels selection (DB-first detector input)
+# -----------------------------------------------------------------------------
+# Whitelist `price_levels.level_type` (через запятую). Известные типы в проекте:
+#   vp_local              — локальный VP (1m rolling)
+#   vp_global             — HTF VP (напр. 1d)
+#   vp_global_4h_90d      — экспериментальный HTF (пока можно не включать)
+#   human                 — уровни из human_levels (авто origin=auto, не «ручной ввод»)
+#   manual_global_hvn     — ручные HVN из отдельной книги Sheets
+# Старые алиасы в БД миграцией приводятся к vp_*.
+def _parse_csv_types(raw: str, default: str) -> list[str]:
+    s = (raw or "").strip()
+    if not s:
+        s = default
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+# По умолчанию: локальный VP + ручные HVN из Sheets. Не включаем vp_global / vp_global_4h_90d / human, пока не решите иначе.
+CYCLE_LEVELS_ALLOWED_LEVEL_TYPES: list[str] = _parse_csv_types(
+    os.getenv("CYCLE_LEVELS_ALLOWED_LEVEL_TYPES", ""),
+    "vp_local,manual_global_hvn",
+)
+# Мин. |price−ref|/ATR; дефолт 0 — порог задавайте в .env (напр. CYCLE_LEVELS_MIN_DIST_ATR=0.3)
+CYCLE_LEVELS_MIN_DIST_ATR = float(os.getenv("CYCLE_LEVELS_MIN_DIST_ATR", "0.0"))
+CYCLE_LEVELS_ZONE_HALF_WIDTH_ATR = float(os.getenv("CYCLE_LEVELS_ZONE_HALF_WIDTH_ATR", "0.3"))
+CYCLE_LEVELS_ZONE_EXPAND_STEP_ATR = float(os.getenv("CYCLE_LEVELS_ZONE_EXPAND_STEP_ATR", "0.2"))
+CYCLE_LEVELS_ZONE_EXPAND_MAX_STEPS = int(os.getenv("CYCLE_LEVELS_ZONE_EXPAND_MAX_STEPS", "1"))
+CYCLE_LEVELS_FALLBACK_MAX_ATR = float(os.getenv("CYCLE_LEVELS_FALLBACK_MAX_ATR", "0.5"))
+CYCLE_LEVELS_COOLDOWN_HOURS = int(os.getenv("CYCLE_LEVELS_COOLDOWN_HOURS", "24"))
+CYCLE_LEVELS_WORKSHEET = os.getenv("CYCLE_LEVELS_WORKSHEET", "cycle_levels_v1").strip() or "cycle_levels_v1"
+CYCLE_LEVELS_DIAG_WORKSHEET = (
+    os.getenv("CYCLE_LEVELS_DIAG_WORKSHEET", "cycle_levels_diag_v1").strip()
+    or "cycle_levels_diag_v1"
+)
+CYCLE_LEVELS_CANDIDATES_WORKSHEET = (
+    os.getenv("CYCLE_LEVELS_CANDIDATES_WORKSHEET", "cycle_levels_candidates_v1").strip()
+    or "cycle_levels_candidates_v1"
+)
+# Источник цены для freeze: позже = тот же, что у детектора (Bybit WS / last trade). Сейчас в коде — last 1m close из SQLite.
+CYCLE_LEVELS_REFERENCE_PRICE_SOURCE = (
+    os.getenv("CYCLE_LEVELS_REFERENCE_PRICE_SOURCE", "db_1m_close").strip() or "db_1m_close"
+)
+PRICE_FEED_WS_WARMUP_SEC = int(os.getenv("PRICE_FEED_WS_WARMUP_SEC", "8"))
+PRICE_FEED_MAX_STALE_SEC = int(os.getenv("PRICE_FEED_MAX_STALE_SEC", "30"))
+# Гейт для legacy rebuild_cycle_levels (из price_levels -> cycle_levels).
+# False: разрешён только явный вызов с force=True (например из orchestrator/ручного скрипта).
+CYCLE_LEVELS_REBUILD_ENABLED = os.getenv("CYCLE_LEVELS_REBUILD_ENABLED", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Structural cycle (§3 cycle_structural_start_spec): пул (L,U), MAD, mid-полоса → freeze в cycle_levels.
+# Источник ref для скана кандидатов из price_levels: `db_1m_close` — как vp_local (Binance spot в БД);
+# `price_feed` — Bybit WS/REST (может расходиться со spot-уровнями).
+STRUCTURAL_REF_PRICE_SOURCE = (
+    os.getenv("STRUCTURAL_REF_PRICE_SOURCE", "db_1m_close").strip().lower() or "db_1m_close"
+)
+# Отдельно от CYCLE_LEVELS_ALLOWED_LEVEL_TYPES. Human (D1/W1) в structural по умолчанию не берём —
+# только vp_local + ручные глобальные HVN. При экстремальной цене vp_local часто не закрывает обе
+# стороны: это ограничение исходных уровней, не «узкое окно» N_touch (оно другое).
+STRUCTURAL_ALLOWED_LEVEL_TYPES: list[str] = _parse_csv_types(
+    os.getenv("STRUCTURAL_ALLOWED_LEVEL_TYPES", ""),
+    "vp_local,manual_global_hvn",
+)
+# Минимум кандидатов с каждой стороны от ref (для входа в пул достаточно 1+1; top-K — отдельно).
+STRUCTURAL_MIN_CANDIDATES_PER_SIDE = int(os.getenv("STRUCTURAL_MIN_CANDIDATES_PER_SIDE", "1"))
+STRUCTURAL_TOP_K = int(os.getenv("STRUCTURAL_TOP_K", "5"))
+STRUCTURAL_MAD_K = float(os.getenv("STRUCTURAL_MAD_K", "3"))
+STRUCTURAL_CENTER_FILTER_ENABLED = os.getenv("STRUCTURAL_CENTER_FILTER_ENABLED", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+STRUCTURAL_CENTER_MAD_K = float(os.getenv("STRUCTURAL_CENTER_MAD_K", "2.5"))
+STRUCTURAL_TARGET_ALIGN_ENABLED = os.getenv("STRUCTURAL_TARGET_ALIGN_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+STRUCTURAL_ANCHOR_SYMBOLS: list[str] = _parse_csv_types(
+    os.getenv("STRUCTURAL_ANCHOR_SYMBOLS", ""),
+    "BTC/USDT,ETH/USDT,SOL/USDT,ADA/USDT",
+)
+STRUCTURAL_TARGET_W_BAND_K = float(os.getenv("STRUCTURAL_TARGET_W_BAND_K", "2.5"))
+STRUCTURAL_TARGET_CENTER_WEIGHT = float(os.getenv("STRUCTURAL_TARGET_CENTER_WEIGHT", "1.0"))
+STRUCTURAL_TARGET_WIDTH_WEIGHT = float(os.getenv("STRUCTURAL_TARGET_WIDTH_WEIGHT", "0.6"))
+STRUCTURAL_MIN_POOL_SYMBOLS = int(os.getenv("STRUCTURAL_MIN_POOL_SYMBOLS", "5"))
+STRUCTURAL_MID_BAND_PCT = float(os.getenv("STRUCTURAL_MID_BAND_PCT", "2"))
+STRUCTURAL_REFINE_MAX_ROUNDS = int(os.getenv("STRUCTURAL_REFINE_MAX_ROUNDS", "5"))
+STRUCTURAL_AUTO_FREEZE_ON_SCAN = os.getenv("STRUCTURAL_AUTO_FREEZE_ON_SCAN", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+STRUCTURAL_N_TOUCH = int(os.getenv("STRUCTURAL_N_TOUCH", "5"))
+STRUCTURAL_TOUCH_WINDOW_SEC = int(os.getenv("STRUCTURAL_TOUCH_WINDOW_SEC", "900"))
+STRUCTURAL_ENTRY_TIMER_SEC = int(os.getenv("STRUCTURAL_ENTRY_TIMER_SEC", "300"))
+STRUCTURAL_N_ABORT = int(os.getenv("STRUCTURAL_N_ABORT", "5"))
+STRUCTURAL_ABORT_DIST_ATR = float(os.getenv("STRUCTURAL_ABORT_DIST_ATR", "0.3"))
+STRUCTURAL_TOUCH_DEBOUNCE_SEC = int(os.getenv("STRUCTURAL_TOUCH_DEBOUNCE_SEC", "5"))
+STRUCTURAL_POLL_SEC = float(os.getenv("STRUCTURAL_POLL_SEC", "1.0"))
+STRUCTURAL_MAX_RUNTIME_SEC = int(os.getenv("STRUCTURAL_MAX_RUNTIME_SEC", "7200"))
+
+# Отчёт structural-scan → Google Sheets (лист по умолчанию; переименование через env).
+STRUCTURAL_LEVELS_REPORT_WORKSHEET = (
+    os.getenv("STRUCTURAL_LEVELS_REPORT_WORKSHEET", "structural_levels_report").strip()
+    or "structural_levels_report"
+)
 
 def _env_strip_quotes(val: str) -> str:
     s = (val or "").strip()

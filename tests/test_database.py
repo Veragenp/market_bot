@@ -23,6 +23,9 @@ def test_tables_exist(clean_db):
         "price_levels",
         "market_context",
         "level_events",
+        "structural_cycles",
+        "structural_cycle_symbols",
+        "structural_events",
     }
     assert expected.issubset(tables)
     conn.close()

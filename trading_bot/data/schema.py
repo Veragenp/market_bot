@@ -265,6 +265,159 @@ def init_db() -> None:
     )
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mc_timestamp ON market_context(timestamp DESC)")
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trading_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            cycle_id TEXT,
+            structural_cycle_id TEXT,
+            position_state TEXT NOT NULL DEFAULT 'none' CHECK (position_state IN ('none', 'long', 'short')),
+            cycle_phase TEXT NOT NULL DEFAULT 'arming' CHECK (cycle_phase IN ('arming', 'in_position', 'closed')),
+            levels_frozen INTEGER NOT NULL DEFAULT 0,
+            cycle_version INTEGER NOT NULL DEFAULT 0,
+            close_reason TEXT,
+            last_transition_at INTEGER,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    _ts_cols = _column_names(cursor, "trading_state")
+    if _ts_cols and "structural_cycle_id" not in _ts_cols:
+        cursor.execute("ALTER TABLE trading_state ADD COLUMN structural_cycle_id TEXT")
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO trading_state (id, cycle_id, structural_cycle_id, position_state, cycle_phase, levels_frozen, cycle_version, close_reason, last_transition_at, updated_at)
+        VALUES (1, NULL, NULL, 'none', 'arming', 0, 0, NULL, NULL, strftime('%s','now'))
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cycle_levels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL CHECK (direction IN ('long', 'short')),
+            level_step INTEGER NOT NULL DEFAULT 1,
+            level_price REAL NOT NULL,
+            source_level_id INTEGER,
+            tier TEXT,
+            volume_peak REAL,
+            distance_atr REAL,
+            ref_price REAL,
+            ref_price_source TEXT,
+            ref_price_ts INTEGER,
+            is_primary INTEGER NOT NULL DEFAULT 1,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            frozen_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(cycle_id, symbol, direction, level_step),
+            FOREIGN KEY (source_level_id) REFERENCES price_levels(id)
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cycle_levels_cycle_dir ON cycle_levels(cycle_id, direction, is_active)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cycle_levels_symbol_cycle ON cycle_levels(symbol, cycle_id)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cycle_level_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL CHECK (direction IN ('long', 'short')),
+            source_level_id INTEGER,
+            level_price REAL NOT NULL,
+            used_at INTEGER NOT NULL,
+            reason TEXT,
+            cycle_id TEXT,
+            FOREIGN KEY (source_level_id) REFERENCES price_levels(id)
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cycle_usage_symbol_dir_time ON cycle_level_usage(symbol, direction, used_at DESC)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS structural_cycles (
+            id TEXT PRIMARY KEY,
+            phase TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            params_json TEXT,
+            pool_median_w REAL,
+            pool_mad REAL,
+            pool_k REAL,
+            symbols_valid_count INTEGER,
+            touch_started_at INTEGER,
+            entry_timer_until INTEGER,
+            cancel_reason TEXT
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_structural_cycles_phase ON structural_cycles(phase, updated_at DESC)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS structural_cycle_symbols (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            status TEXT NOT NULL,
+            level_below_id INTEGER,
+            level_above_id INTEGER,
+            L_price REAL,
+            U_price REAL,
+            atr REAL,
+            W_atr REAL,
+            mid_price REAL,
+            mid_band_low REAL,
+            mid_band_high REAL,
+            ref_price_ws REAL,
+            evaluated_at INTEGER NOT NULL,
+            tier_below TEXT,
+            tier_above TEXT,
+            volume_peak_below REAL,
+            volume_peak_above REAL,
+            FOREIGN KEY (level_below_id) REFERENCES price_levels(id),
+            FOREIGN KEY (level_above_id) REFERENCES price_levels(id),
+            FOREIGN KEY (cycle_id) REFERENCES structural_cycles(id),
+            UNIQUE(cycle_id, symbol)
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_structural_cycle_symbols_cycle ON structural_cycle_symbols(cycle_id)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS structural_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_id TEXT NOT NULL,
+            symbol TEXT,
+            event_type TEXT NOT NULL,
+            price REAL,
+            ts INTEGER NOT NULL,
+            meta_json TEXT,
+            FOREIGN KEY (cycle_id) REFERENCES structural_cycles(id)
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_structural_events_cycle_ts ON structural_events(cycle_id, ts)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_structural_events_symbol_ts ON structural_events(symbol, ts)"
+    )
+
     conn.commit()
     conn.close()
 
@@ -688,6 +841,180 @@ def run_migrations() -> None:
 
         cursor.execute(
             "INSERT INTO db_version (version, applied_at) VALUES (10, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 11:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trading_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                cycle_id TEXT,
+                position_state TEXT NOT NULL DEFAULT 'none' CHECK (position_state IN ('none', 'long', 'short')),
+                cycle_phase TEXT NOT NULL DEFAULT 'arming' CHECK (cycle_phase IN ('arming', 'in_position', 'closed')),
+                levels_frozen INTEGER NOT NULL DEFAULT 0,
+                cycle_version INTEGER NOT NULL DEFAULT 0,
+                close_reason TEXT,
+                last_transition_at INTEGER,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO trading_state (id, cycle_id, position_state, cycle_phase, levels_frozen, cycle_version, close_reason, last_transition_at, updated_at)
+            VALUES (1, NULL, 'none', 'arming', 0, 0, NULL, NULL, strftime('%s','now'))
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cycle_levels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('long', 'short')),
+                level_step INTEGER NOT NULL DEFAULT 1,
+                level_price REAL NOT NULL,
+                source_level_id INTEGER,
+                tier TEXT,
+                volume_peak REAL,
+                distance_atr REAL,
+                ref_price REAL,
+                ref_price_source TEXT,
+                ref_price_ts INTEGER,
+                is_primary INTEGER NOT NULL DEFAULT 1,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                frozen_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(cycle_id, symbol, direction, level_step),
+                FOREIGN KEY (source_level_id) REFERENCES price_levels(id)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cycle_levels_cycle_dir ON cycle_levels(cycle_id, direction, is_active)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cycle_levels_symbol_cycle ON cycle_levels(symbol, cycle_id)"
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cycle_level_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('long', 'short')),
+                source_level_id INTEGER,
+                level_price REAL NOT NULL,
+                used_at INTEGER NOT NULL,
+                reason TEXT,
+                cycle_id TEXT,
+                FOREIGN KEY (source_level_id) REFERENCES price_levels(id)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cycle_usage_symbol_dir_time ON cycle_level_usage(symbol, direction, used_at DESC)"
+        )
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (11, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 12:
+        cl_cols = _column_names(cursor, "cycle_levels")
+        if "ref_price" not in cl_cols:
+            cursor.execute("ALTER TABLE cycle_levels ADD COLUMN ref_price REAL")
+        if "ref_price_source" not in cl_cols:
+            cursor.execute("ALTER TABLE cycle_levels ADD COLUMN ref_price_source TEXT")
+        if "ref_price_ts" not in cl_cols:
+            cursor.execute("ALTER TABLE cycle_levels ADD COLUMN ref_price_ts INTEGER")
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (12, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 13:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS structural_cycles (
+                id TEXT PRIMARY KEY,
+                phase TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                params_json TEXT,
+                pool_median_w REAL,
+                pool_mad REAL,
+                pool_k REAL,
+                symbols_valid_count INTEGER,
+                touch_started_at INTEGER,
+                entry_timer_until INTEGER,
+                cancel_reason TEXT
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_structural_cycles_phase ON structural_cycles(phase, updated_at DESC)"
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS structural_cycle_symbols (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                status TEXT NOT NULL,
+                level_below_id INTEGER,
+                level_above_id INTEGER,
+                L_price REAL,
+                U_price REAL,
+                atr REAL,
+                W_atr REAL,
+                mid_price REAL,
+                mid_band_low REAL,
+                mid_band_high REAL,
+                ref_price_ws REAL,
+                evaluated_at INTEGER NOT NULL,
+                tier_below TEXT,
+                tier_above TEXT,
+                volume_peak_below REAL,
+                volume_peak_above REAL,
+                FOREIGN KEY (level_below_id) REFERENCES price_levels(id),
+                FOREIGN KEY (level_above_id) REFERENCES price_levels(id),
+                FOREIGN KEY (cycle_id) REFERENCES structural_cycles(id),
+                UNIQUE(cycle_id, symbol)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_structural_cycle_symbols_cycle ON structural_cycle_symbols(cycle_id)"
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS structural_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id TEXT NOT NULL,
+                symbol TEXT,
+                event_type TEXT NOT NULL,
+                price REAL,
+                ts INTEGER NOT NULL,
+                meta_json TEXT,
+                FOREIGN KEY (cycle_id) REFERENCES structural_cycles(id)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_structural_events_cycle_ts ON structural_events(cycle_id, ts)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_structural_events_symbol_ts ON structural_events(symbol, ts)"
+        )
+        ts_cols = _column_names(cursor, "trading_state")
+        if ts_cols and "structural_cycle_id" not in ts_cols:
+            cursor.execute("ALTER TABLE trading_state ADD COLUMN structural_cycle_id TEXT")
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (13, ?)",
             (int(time.time()),),
         )
         conn.commit()
