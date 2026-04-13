@@ -29,6 +29,7 @@ from trading_bot.data.repositories import (
     OIRepository,
     LiquidationsRepository,
     get_ohlcv,
+    get_ohlcv_tail,
 )
 from trading_bot.data.tradingview_loader import TradingViewDataLoader
 from trading_bot.data.yahoo_finance_loader import YahooFinanceDataLoader
@@ -126,9 +127,11 @@ class DataLoaderManager:
         ohlcv_limit: int = 400,
     ) -> int:
         """
-        Пишет в `instruments.atr` (bybit_futures): ATR в стиле Герчика по **последним 10** дневным
-        свечам spot (см. `GERCHIK_ATR_BARS`). Свечи **только из SQLite** (`get_ohlcv`), без прямых
-        запросов к бирже на этом шаге. Нужна строка в `instruments`.
+        Единственная запись дневного ATR в торговый контур: колонка `instruments.atr` (bybit_futures).
+        Остальной код (cycle_levels, VP, level_events) только читает это поле.
+
+        Метод: Герчик по **последним 10** дневным spot-свечам из SQLite (`get_ohlcv_tail`), без REST
+        на этом шаге. Строка в `instruments` должна уже существовать.
         """
         updated = 0
         for symbol_internal in TRADING_SYMBOLS:
@@ -136,11 +139,11 @@ class DataLoaderManager:
             if not self.instruments_repo.get(bybit_sym, "bybit_futures"):
                 logger.warning("ATR skip %s: no instruments row for %s", symbol_internal, bybit_sym)
                 continue
-            rows = get_ohlcv(
+            rows = get_ohlcv_tail(
                 symbol_internal,
                 "1d",
-                source=source,
                 limit=ohlcv_limit,
+                source=source,
             )
             atr_val = atr_gerchik_from_ohlcv_rows(rows)
             if atr_val is None:

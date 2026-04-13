@@ -12,6 +12,7 @@ from trading_bot.config.settings import (
     LEVEL_EVENTS_MIN_PENETRATION_ATR,
     LEVEL_EVENTS_REBOUND_HORIZON_BARS,
     LEVEL_EVENTS_RETURN_EPS_ATR,
+    LEVEL_EVENTS_SCOPE,
     LEVEL_EVENTS_STALE_OPEN_MINUTES,
     LEVEL_EVENTS_WINDOW_HOURS,
 )
@@ -97,12 +98,88 @@ def load_active_levels_with_metrics() -> List[LevelRow]:
     return rows
 
 
+def load_cycle_scoped_levels_and_window() -> tuple[List[LevelRow], Optional[int], Optional[str]]:
+    """
+    Уровни только из активного снимка `cycle_levels` (текущий `trading_state.cycle_id`).
+    Окно аналитики начинается с MIN(frozen_at) по этому циклу.
+    """
+    init_db()
+    run_migrations()
+    conn = get_connection()
+    cur = conn.cursor()
+    row = cur.execute("SELECT cycle_id FROM trading_state WHERE id = 1").fetchone()
+    if not row or not row["cycle_id"]:
+        conn.close()
+        return [], None, None
+    cycle_id = str(row["cycle_id"])
+    wrow = cur.execute(
+        """
+        SELECT MIN(frozen_at) AS wstart
+        FROM cycle_levels
+        WHERE cycle_id = ? AND is_active = 1
+        """,
+        (cycle_id,),
+    ).fetchone()
+    if not wrow or wrow["wstart"] is None:
+        conn.close()
+        return [], None, cycle_id
+    wstart = int(wrow["wstart"])
+    prows = cur.execute(
+        """
+        SELECT pl.symbol, pl.level_type, ifnull(pl.layer,'') AS layer, ifnull(pl.tier,'') AS tier,
+               pl.price, pl.volume_peak, pl.duration_hours, pl.t_end_unix, pl.stable_level_id
+        FROM cycle_levels cl
+        JOIN price_levels pl ON pl.id = cl.source_level_id
+        WHERE cl.cycle_id = ? AND cl.is_active = 1
+        """,
+        (cycle_id,),
+    ).fetchall()
+    rows_out: List[LevelRow] = []
+    for r in prows:
+        symbol = str(r["symbol"])
+        inst = cur.execute(
+            "SELECT tick_size, atr FROM instruments WHERE symbol = ? AND exchange = 'bybit_futures'",
+            (symbol.replace("/", ""),),
+        ).fetchone()
+        if not inst or inst["atr"] is None:
+            continue
+        tick_size = float(inst["tick_size"] or 1e-8)
+        atr_daily = float(inst["atr"])
+        sid = r["stable_level_id"]
+        rows_out.append(
+            LevelRow(
+                symbol=symbol,
+                level_type=str(r["level_type"]),
+                layer=str(r["layer"]),
+                tier=str(r["tier"]),
+                price=float(r["price"]),
+                volume_peak=float(r["volume_peak"]) if r["volume_peak"] is not None else None,
+                duration_hours=float(r["duration_hours"]) if r["duration_hours"] is not None else None,
+                t_end_unix=int(r["t_end_unix"]) if r["t_end_unix"] is not None else None,
+                tick_size=tick_size,
+                atr_daily=atr_daily,
+                stable_level_id_db=str(sid) if sid else None,
+            )
+        )
+    conn.close()
+    return rows_out, wstart, cycle_id
+
+
 def build_level_events(now_ts: Optional[int] = None) -> List[Dict[str, object]]:
     now = int(now_ts or time.time())
-    lookback_start = now - int(LEVEL_EVENTS_LOOKBACK_HOURS * 3600)
-    all_levels = load_active_levels_with_metrics()
-    if not all_levels:
-        return []
+    scope = (LEVEL_EVENTS_SCOPE or "all").strip().lower()
+    cycle_id: Optional[str] = None
+    if scope == "active_cycle":
+        all_levels, lookback_start, cycle_id = load_cycle_scoped_levels_and_window()
+        if not all_levels or lookback_start is None:
+            return []
+        if lookback_start >= now:
+            lookback_start = max(0, now - 3600)
+    else:
+        lookback_start = now - int(LEVEL_EVENTS_LOOKBACK_HOURS * 3600)
+        all_levels = load_active_levels_with_metrics()
+        if not all_levels:
+            return []
 
     symbol_candles: Dict[str, List[Dict[str, object]]] = {}
     for lv in all_levels:
@@ -243,42 +320,43 @@ def build_level_events(now_ts: Optional[int] = None) -> List[Dict[str, object]]:
             )
             event_counter += 1
             eid = f"{sid}_{touch_ts}_{event_counter}"
-            events.append(
-                {
-                    "event_id": eid,
-                    "stable_level_id": sid,
-                    "symbol": lv.symbol,
-                    "month_utc": _month_label(lv.t_end_unix),
-                    "level_type": lv.level_type,
-                    "layer": lv.layer,
-                    "tier": lv.tier,
-                    "level_price": lv.price,
-                    "event_status": event_status,
-                    "pre_side": pre_side_label,
-                    "volume_peak": lv.volume_peak,
-                    "duration_hours": lv.duration_hours,
-                    "atr_daily": lv.atr_daily,
-                    "atr_pct": (lv.atr_daily / lv.price * 100.0) if lv.price else None,
-                    "dist_start_atr": dist_start,
-                    "touch_time": touch_ts,
-                    "return_time": return_ts,
-                    "penetration_atr": penetration,
-                    "penetration_pct": (penetration * lv.atr_daily / lv.price * 100.0) if lv.price else None,
-                    "rebound_pure_atr": rebound_pure,
-                    "rebound_pure_pct": (rebound_pure * lv.atr_daily / lv.price * 100.0) if lv.price else None,
-                    "rebound_after_return_atr": rebound_after,
-                    "rebound_after_return_pct": (
-                        (float(rebound_after) * lv.atr_daily / lv.price * 100.0)
-                        if (rebound_after is not None and lv.price)
-                        else None
-                    ),
-                    "confirm_time": confirm_time,
-                    "confirm_time_sec": (int(confirm_time) - touch_ts) if confirm_time is not None else None,
-                    "touch_count_before_confirm": int(touch_count_before_confirm),
-                    "window_start": lookback_start,
-                    "window_end": now,
-                }
-            )
+            ev: Dict[str, object] = {
+                "event_id": eid,
+                "stable_level_id": sid,
+                "symbol": lv.symbol,
+                "month_utc": _month_label(lv.t_end_unix),
+                "level_type": lv.level_type,
+                "layer": lv.layer,
+                "tier": lv.tier,
+                "level_price": lv.price,
+                "event_status": event_status,
+                "pre_side": pre_side_label,
+                "volume_peak": lv.volume_peak,
+                "duration_hours": lv.duration_hours,
+                "atr_daily": lv.atr_daily,
+                "atr_pct": (lv.atr_daily / lv.price * 100.0) if lv.price else None,
+                "dist_start_atr": dist_start,
+                "touch_time": touch_ts,
+                "return_time": return_ts,
+                "penetration_atr": penetration,
+                "penetration_pct": (penetration * lv.atr_daily / lv.price * 100.0) if lv.price else None,
+                "rebound_pure_atr": rebound_pure,
+                "rebound_pure_pct": (rebound_pure * lv.atr_daily / lv.price * 100.0) if lv.price else None,
+                "rebound_after_return_atr": rebound_after,
+                "rebound_after_return_pct": (
+                    (float(rebound_after) * lv.atr_daily / lv.price * 100.0)
+                    if (rebound_after is not None and lv.price)
+                    else None
+                ),
+                "confirm_time": confirm_time,
+                "confirm_time_sec": (int(confirm_time) - touch_ts) if confirm_time is not None else None,
+                "touch_count_before_confirm": int(touch_count_before_confirm),
+                "window_start": lookback_start,
+                "window_end": now,
+            }
+            if cycle_id is not None:
+                ev["cycle_id"] = cycle_id
+            events.append(ev)
             i = j + 1 if j > i else i + 1
 
     # cluster size in LEVEL_EVENTS_WINDOW_HOURS from touch_time (sliding window).

@@ -8,6 +8,7 @@ from typing import Any, Optional
 import pandas as pd
 
 from trading_bot.data.db import get_connection
+from trading_bot.data.repositories import get_instruments_atr_bybit_futures_cur
 from trading_bot.data.schema import init_db, run_migrations
 
 # --- level_type (VP + экспериментальный HTF) ---
@@ -55,14 +56,8 @@ def _lookback_days_from_window(t_start: Optional[int], t_end: Optional[int]) -> 
 
 
 def _get_atr_daily(symbol: str, cur: Any) -> Optional[float]:
-    for sym in (symbol.replace("/", ""), symbol):
-        row = cur.execute(
-            "SELECT atr FROM instruments WHERE symbol = ? AND exchange = 'bybit_futures'",
-            (sym,),
-        ).fetchone()
-        if row is not None and row["atr"] is not None:
-            return float(row["atr"])
-    return None
+    """ATR из `instruments.atr` (Gerchik); пересчёт только daily job."""
+    return get_instruments_atr_bybit_futures_cur(cur, symbol)
 
 
 def _merge_epsilon_atr(
@@ -110,11 +105,19 @@ def save_volume_profile_peaks_levels_to_db(
     now_ts: Optional[int] = None,
     timeframe: Optional[str] = None,
     origin: str = ORIGIN_AUTO,
+    archive_active_when_empty: bool = False,
+    append_only: bool = False,
 ) -> None:
     """
     Сохраняет уровни VP с слиянием по цене: совпадение в пределах MERGE_DISTANCE_ATR_MULT * ATR(d).
     Цена существующей строки не меняется; обновляются сила/тир/окно/layer и last_matched_calc_at.
     Активные строки, не сматчившиеся с текущим расчётом → status=archived, is_active=0.
+    При append_only=True: существующие активные строки не архивируются и не обновляются, добавляются только
+    новые уровни, не попавшие в merge-диапазон к текущим активным.
+
+    Если `final_levels_df` пустой: по умолчанию **ничего не делаем** (оставляем последний валидный
+    активный снимок). Явное снятие активности — только с `archive_active_when_empty=True`
+    (так делает HTF-пайплайн при нуле уровней).
     """
     init_db()
     run_migrations()
@@ -124,19 +127,20 @@ def save_volume_profile_peaks_levels_to_db(
     cur = conn.cursor()
 
     if final_levels_df is None or final_levels_df.empty:
-        cur.execute(
-            """
-            UPDATE price_levels
-            SET is_active = 0,
-                status = ?,
-                updated_at = ?
-            WHERE symbol = ? AND level_type = ?
-              AND is_active = 1
-              AND status = ?
-            """,
-            (LEVEL_STATUS_ARCHIVED, created_at, symbol, level_type, LEVEL_STATUS_ACTIVE),
-        )
-        conn.commit()
+        if archive_active_when_empty:
+            cur.execute(
+                """
+                UPDATE price_levels
+                SET is_active = 0,
+                    status = ?,
+                    updated_at = ?
+                WHERE symbol = ? AND level_type = ?
+                  AND is_active = 1
+                  AND status = ?
+                """,
+                (LEVEL_STATUS_ARCHIVED, created_at, symbol, level_type, LEVEL_STATUS_ACTIVE),
+            )
+            conn.commit()
         conn.close()
         return
 
@@ -180,7 +184,8 @@ def save_volume_profile_peaks_levels_to_db(
                 best_d = d
         if best_id is not None:
             used_old.add(best_id)
-            updates.append((best_id, r))
+            if not append_only:
+                updates.append((best_id, r))
         else:
             inserts.append(r)
 
@@ -227,18 +232,19 @@ def save_volume_profile_peaks_levels_to_db(
             ),
         )
 
-    archive_ids = [int(o["id"]) for o in old_rows if int(o["id"]) not in used_old]
-    for aid in archive_ids:
-        cur.execute(
-            """
-            UPDATE price_levels
-            SET is_active = 0,
-                status = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (LEVEL_STATUS_ARCHIVED, created_at, aid),
-        )
+    if not append_only:
+        archive_ids = [int(o["id"]) for o in old_rows if int(o["id"]) not in used_old]
+        for aid in archive_ids:
+            cur.execute(
+                """
+                UPDATE price_levels
+                SET is_active = 0,
+                    status = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (LEVEL_STATUS_ARCHIVED, created_at, aid),
+            )
 
     for r in inserts:
         price = float(r["Price"])

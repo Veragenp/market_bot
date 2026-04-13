@@ -13,13 +13,15 @@ from typing import Any, Literal, Optional
 import numpy as np
 import pandas as pd
 
+from trading_bot.analytics.atr import GERCHIK_ATR_BARS, atr_gerchik_from_ohlcv_rows
+
 Timeframe = Literal["1d", "1w"]
 
 # Веса фракталов при суммировании силы зоны (W1/D1)
 FRACTAL_WEIGHT_D1 = 1.0
 FRACTAL_WEIGHT_W1 = 3.0
 
-# ATR(d14) × √5 для масштаба недельной зоны
+# ATR_d1 (Gerchik из БД или хвост D1) × √5 для масштаба недельной зоны
 W1_ATR_EQUIV_MULT = 2.23606797749979
 
 # Кластеризация: max(span зоны) <= cluster_atr_mult * ATR_масштаба
@@ -62,7 +64,7 @@ class FlipEvent:
 
 @dataclass
 class HumanLevelsResult:
-    """Итог пайплайна: зоны по D1/W1 и метрики ATR."""
+    """Итог пайплайна: зоны по D1/W1 и метрики ATR (Gerchik, как в `instruments`)."""
 
     zones_d1: list[HumanZone] = field(default_factory=list)
     zones_w1: list[HumanZone] = field(default_factory=list)
@@ -148,8 +150,8 @@ def wilder_atr(
     return atr
 
 
-def atr_w1_equiv_from_daily(atr_d14: float) -> float:
-    return float(atr_d14) * W1_ATR_EQUIV_MULT
+def atr_w1_equiv_from_daily(atr_d1: float) -> float:
+    return float(atr_d1) * W1_ATR_EQUIV_MULT
 
 
 def bill_williams_fractal_mask(
@@ -257,8 +259,23 @@ def cluster_fractal_prices_to_zones(
     return zones
 
 
+def gerchik_atr_from_d1_df(df_d1: pd.DataFrame) -> float:
+    """
+    Тот же Gerchik, что в `atr.py` / `instruments.atr`, по последним GERCHIK_ATR_BARS дневным барам.
+    Fallback, если для символа ещё нет строки в `instruments` (например макро/индексы).
+    """
+    if df_d1 is None or df_d1.empty or len(df_d1) < GERCHIK_ATR_BARS:
+        return 0.0
+    if "high" not in df_d1.columns or "low" not in df_d1.columns:
+        return 0.0
+    tail = df_d1.tail(GERCHIK_ATR_BARS)
+    rows = tail[["high", "low"]].to_dict("records")
+    v = atr_gerchik_from_ohlcv_rows(rows)
+    return float(v) if v is not None else 0.0
+
+
 def last_valid_atr_d1(df_d1: pd.DataFrame, *, atr_period: int = 14) -> float:
-    """Последнее валидное значение ATR(14) по дневным барам."""
+    """Устарело: для пайплайна используйте `gerchik_atr_from_d1_df` или `atr_d1` из БД. Оставлено для тестов Wilder."""
     if df_d1 is None or df_d1.empty:
         return 0.0
     high = df_d1["high"].to_numpy(dtype=float)
@@ -267,7 +284,6 @@ def last_valid_atr_d1(df_d1: pd.DataFrame, *, atr_period: int = 14) -> float:
     atr = wilder_atr(high, low, close, atr_period)
     if not np.any(np.isfinite(atr)):
         return 0.0
-    # последний конечный ATR
     idx = np.where(np.isfinite(atr))[0]
     return float(atr[idx[-1]])
 
@@ -281,7 +297,7 @@ def build_zones_for_timeframe(
 ) -> tuple[list[HumanZone], list[HumanFractal]]:
     """
     Фракталы с df данного ТФ; ширина кластера cluster_eps_price задаётся снаружи.
-    Для W1 зон eps = cluster_atr_mult * ATR_D1(14) * √5 (передаётся в cluster_eps_price).
+    Для W1 зон eps = cluster_atr_mult * ATR_d1 * √5 (передаётся в cluster_eps_price).
     """
     if df is None or df.empty:
         return [], []
@@ -371,17 +387,19 @@ def run_human_levels_pipeline(
     df_d1: pd.DataFrame,
     df_w1: pd.DataFrame,
     *,
-    atr_period: int = 14,
+    atr_d1: Optional[float] = None,
     cluster_atr_mult: float = DEFAULT_CLUSTER_ATR_MULT,
     zone_min_gap_atr_d1: float = 0.0,
 ) -> HumanLevelsResult:
     """
-    Полный прогон v1: ATR(14) только с дневок; кластер D1 — от ATR_D1,
-    кластер W1 — от ATR_W1_equiv = ATR_D1 × √5 (фракталы с недельных баров).
-    После кластеризации D1-зоны опционально разреживаются по центрам (см. deduplicate_zones_by_vertical_gap);
-    W1 не трогаем.
+    Полный прогон v1: масштаб — **Gerchik** как в `instruments.atr`.
+    Если передан `atr_d1` (>0), берётся он (типично из БД); иначе — Gerchik по хвосту `df_d1`.
+    Кластер W1: ATR_W1_equiv = ATR_d1 × √5.
     """
-    atr_d = last_valid_atr_d1(df_d1, atr_period=atr_period)
+    if atr_d1 is not None and float(atr_d1) > 0:
+        atr_d = float(atr_d1)
+    else:
+        atr_d = gerchik_atr_from_d1_df(df_d1)
     eps_d1 = float(cluster_atr_mult) * atr_d if atr_d > 0 else 0.0
     atr_w1_eq = atr_w1_equiv_from_daily(atr_d) if atr_d > 0 else 0.0
     eps_w1 = float(cluster_atr_mult) * atr_w1_eq if atr_w1_eq > 0 else 0.0
@@ -446,6 +464,7 @@ def human_levels_from_ohlcv_rows(
             return pd.DataFrame()
         return pd.DataFrame(rows)
 
+    kwargs.pop("atr_period", None)
     return run_human_levels_pipeline(_df(d1_rows), _df(w1_rows), **kwargs)
 
 
@@ -468,6 +487,7 @@ __all__ = [
     "detect_flip_events",
     "extract_fractals",
     "filter_human_zones",
+    "gerchik_atr_from_d1_df",
     "human_levels_from_ohlcv_rows",
     "last_valid_atr_d1",
     "run_human_levels_pipeline",

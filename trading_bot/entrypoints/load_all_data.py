@@ -14,6 +14,9 @@ Binance futures OI (история), Bybit OI/инструменты.
   python trading_bot/entrypoints/load_all_data.py       # из корня репо (рядом с config.py)
   python trading_bot/entrypoints/load_all_data.py --full
   python trading_bot/entrypoints/load_all_data.py --bybit-ws-liquidations
+
+  Шаг «Binance futures open interest (history)» можно отключить: LOAD_ALL_SKIP_BINANCE_FUTURES_OI=1 в .env
+  (остальной пайплайн, включая Bybit OI, без изменений).
 """
 
 from __future__ import annotations
@@ -109,8 +112,19 @@ def main() -> None:
         logger.info("=== TradingView indices (collector) ===")
         update_indices()
 
-    logger.info("=== Binance futures open interest (history) ===")
-    _safe("update_all_futures_data", lambda: update_all_futures_data(days_back=90))
+    _skip_binance_futures_oi = (os.getenv("LOAD_ALL_SKIP_BINANCE_FUTURES_OI") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if _skip_binance_futures_oi:
+        logger.info(
+            "Skipped Binance futures open interest (LOAD_ALL_SKIP_BINANCE_FUTURES_OI=1; см. collectors.update_all_futures_data)"
+        )
+    else:
+        logger.info("=== Binance futures open interest (history) ===")
+        _safe("update_all_futures_data", lambda: update_all_futures_data(days_back=90))
 
     logger.info("=== Open interest incremental (Bybit) — все TRADING_SYMBOLS ===")
     _safe("update_incremental_oi", lambda: mgr.update_incremental_oi(symbols=symbols_spot))

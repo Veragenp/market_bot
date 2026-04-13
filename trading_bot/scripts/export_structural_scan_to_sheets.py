@@ -93,9 +93,11 @@ def main() -> None:
     pool_mad_w = float(res.get("pool_mad") or 0.0)
     pool_m_r = float(res.get("pool_median_r") or 0.0)
     pool_mad_r = float(res.get("pool_mad_r") or 0.0)
-    mad_k = float((sc["pool_k"] if sc and sc["pool_k"] is not None else (pj.get("mad_k") or 0.0)) or 0.0)
+    mad_k = float(
+        (sc["pool_k"] if sc and sc["pool_k"] is not None else pj.get("z_w_ok_threshold", 1.0)) or 1.0
+    )
     center_k = float(pj.get("center_mad_k") or 0.0)
-    center_enabled = bool(pj.get("center_filter_enabled"))
+    center_enabled = bool(pj.get("center_filter_enabled", False))
     records = []
     for r in rows:
         lp = r["L_price"]

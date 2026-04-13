@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from trading_bot.analytics.atr import GERCHIK_ATR_BARS, atr_gerchik_from_ohlcv_rows
 from trading_bot.config.settings import DB_PATH
 
 # ========== CONFIG ==========
@@ -36,32 +37,25 @@ WEIGHT_LVN = 0.2
 WEIGHT_GLOBAL_BONUS = 0.1
 
 
-def get_atr(cursor: sqlite3.Cursor, symbol: str, date_str: str, period: int = 14) -> Optional[float]:
+def get_gerchik_atr_d1_before(cursor: sqlite3.Cursor, symbol: str, date_str: str) -> Optional[float]:
+    """Gerchik H−L / 10 (как в `instruments.atr`) по последним закрытым дневкам до date_str."""
     ts = int(datetime.strptime(date_str, "%Y-%m-%d").timestamp())
     cursor.execute(
         """
-        SELECT high, low, close
+        SELECT high, low
         FROM ohlcv
         WHERE symbol = ? AND timeframe = '1d' AND timestamp < ?
         ORDER BY timestamp DESC
         LIMIT ?
         """,
-        (symbol, ts, period + 1),
+        (symbol, ts, GERCHIK_ATR_BARS),
     )
-    rows = cursor.fetchall()
-    if len(rows) < period + 1:
+    raw = list(reversed(cursor.fetchall()))
+    if len(raw) < GERCHIK_ATR_BARS:
         return None
-
-    df = pd.DataFrame(rows, columns=["high", "low", "close"]).iloc[::-1].reset_index(drop=True)
-    tr = np.maximum(
-        df["high"] - df["low"],
-        np.abs(df["high"] - df["close"].shift(1)),
-        np.abs(df["low"] - df["close"].shift(1)),
-    )
-    atr = tr.iloc[1 : period + 1].mean()
-    if pd.isna(atr) or float(atr) <= 0:
-        return None
-    return float(atr)
+    rows = [{"high": float(r[0]), "low": float(r[1])} for r in raw]
+    v = atr_gerchik_from_ohlcv_rows(rows)
+    return float(v) if v is not None and v > 0 else None
 
 
 def load_ohlcv(
@@ -261,7 +255,7 @@ def process_symbol(cursor: sqlite3.Cursor, symbol_cfg: dict[str, Any], start_dat
     for dt in date_range:
         t_ts = int(dt.timestamp())
         t_date = dt.strftime("%Y-%m-%d")
-        atr_val = get_atr(cursor, symbol, t_date, period=14)
+        atr_val = get_gerchik_atr_d1_before(cursor, symbol, t_date)
         if atr_val is None:
             continue
         bin_size = atr_val / BIN_SIZE_ATR_FACTOR
@@ -333,7 +327,7 @@ def evaluate_all_levels(cursor: sqlite3.Cursor) -> None:
     rows = cursor.fetchall()
     for row_id, symbol, level_ts, price, lookahead in rows:
         level_date = datetime.fromtimestamp(int(level_ts)).strftime("%Y-%m-%d")
-        atr_val = get_atr(cursor, str(symbol), level_date, period=14)
+        atr_val = get_gerchik_atr_d1_before(cursor, str(symbol), level_date)
         if atr_val is None:
             continue
         hit_ts, hit_price, reversal = evaluate_success(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Any, Sequence
 
 import pandas as pd
 
@@ -61,3 +61,8 @@ class SheetsExporter:
         else:
             values = [list(df.columns)] + df.where(pd.notnull(df), "").values.tolist()
         ws.update(values=values, range_name="A1")
+
+    def append_row(self, worksheet_name: str, values: Sequence[Any]) -> None:
+        """Добавить одну строку в конец листа (для журналов событий)."""
+        ws = self._get_or_create_worksheet(worksheet_name)
+        ws.append_row([str(v) if v is not None else "" for v in values], value_input_option="USER_ENTERED")

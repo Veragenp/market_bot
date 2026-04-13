@@ -239,12 +239,13 @@ def run_htf_volume_levels_batch(
             layer=layer,
             level_type=lt,
             timeframe=tf,
+            archive_active_when_empty=True,
         )
         if out is not None and not out.empty:
             saved_with_levels += 1
             logger.info("HTF saved %s: levels=%s layer=%s", symbol, len(out), layer)
         else:
-            logger.info("HTF %s: no levels, active merged set archived (level_type=%s)", symbol, lt)
+            logger.info("HTF %s: no levels, active archived (level_type=%s)", symbol, lt)
 
         if out is not None and not out.empty:
             exported_at = datetime.now(timezone.utc).isoformat()

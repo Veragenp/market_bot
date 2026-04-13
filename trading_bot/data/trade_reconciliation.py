@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Any, Dict, List, Optional
+
+from trading_bot.config import settings as st
+from trading_bot.tools import bybit_trading as bt
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_num(v: Any) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def _fetch_exec_orders_to_reconcile(cur, *, lookback_hours: int) -> List[Dict[str, Any]]:
+    cutoff = int(time.time()) - int(max(1, lookback_hours)) * 3600
+    rows = cur.execute(
+        """
+        SELECT id, bybit_order_id, symbol, side, status, cycle_id, structural_cycle_id, position_record_id
+        FROM exec_orders
+        WHERE bybit_order_id IS NOT NULL
+          AND bybit_order_id != ''
+          AND created_at >= ?
+          AND status IN ('submitted', 'partially_filled', 'open')
+        ORDER BY created_at DESC
+        """,
+        (cutoff,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _upsert_fill(cur, *, order: Dict[str, Any], ex: Dict[str, Any]) -> None:
+    trade_id = str(ex.get("execId") or ex.get("tradeId") or "")
+    if not trade_id:
+        return
+    ts_ms = ex.get("execTime") or ex.get("createdTime") or ex.get("updatedTime")
+    if ts_ms is None:
+        ts = int(time.time())
+    else:
+        ts = int(_safe_num(ts_ms) / 1000.0)
+    cur.execute(
+        """
+        INSERT INTO exec_fills (
+            exec_order_id, position_record_id, cycle_id, structural_cycle_id,
+            symbol, side, trade_id, fill_price, fill_qty, fee, fee_currency, ts, raw_json
+        )
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM exec_fills WHERE exec_order_id = ? AND trade_id = ?
+        )
+        """,
+        (
+            int(order["id"]),
+            order.get("position_record_id"),
+            order.get("cycle_id"),
+            order.get("structural_cycle_id"),
+            str(order.get("symbol") or ""),
+            str(order.get("side") or ""),
+            trade_id,
+            _safe_num(ex.get("execPrice") or ex.get("price")),
+            _safe_num(ex.get("execQty") or ex.get("qty")),
+            _safe_num(ex.get("execFee") or ex.get("fee")),
+            str(ex.get("feeCurrency") or ex.get("feeCoin") or ""),
+            ts,
+            json.dumps(ex, ensure_ascii=False)[:8000],
+            int(order["id"]),
+            trade_id,
+        ),
+    )
+
+
+def _refresh_exec_order_from_fills(cur, *, exec_order_id: int) -> Dict[str, Any]:
+    row = cur.execute(
+        """
+        SELECT
+            COALESCE(SUM(fill_qty), 0) AS filled_qty,
+            CASE WHEN COALESCE(SUM(fill_qty), 0) > 0
+                 THEN SUM(fill_price * fill_qty) / SUM(fill_qty)
+                 ELSE NULL END AS avg_fill_price
+        FROM exec_fills
+        WHERE exec_order_id = ?
+        """,
+        (exec_order_id,),
+    ).fetchone()
+    filled_qty = float(row["filled_qty"] or 0.0) if row else 0.0
+    avg_fill_price = float(row["avg_fill_price"]) if row and row["avg_fill_price"] is not None else None
+    order = cur.execute(
+        "SELECT qty FROM exec_orders WHERE id = ?",
+        (exec_order_id,),
+    ).fetchone()
+    qty = float(order["qty"] or 0.0) if order else 0.0
+    if qty > 0 and filled_qty >= qty * 0.999:
+        status = "filled"
+    elif filled_qty > 0:
+        status = "partially_filled"
+    else:
+        status = "submitted"
+    cur.execute(
+        """
+        UPDATE exec_orders
+        SET filled_qty = ?, avg_fill_price = ?, status = ?, exchange_status = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (filled_qty, avg_fill_price, status, status, int(time.time()), exec_order_id),
+    )
+    return {"status": status, "filled_qty": filled_qty, "avg_fill_price": avg_fill_price}
+
+
+def _refresh_position_from_orders(cur, *, position_record_id: int) -> None:
+    pos = cur.execute(
+        """
+        SELECT id, status, qty, entry_exec_order_id, exit_exec_order_id
+        FROM position_records
+        WHERE id = ?
+        """,
+        (position_record_id,),
+    ).fetchone()
+    if not pos:
+        return
+    now = int(time.time())
+    if pos["entry_exec_order_id"]:
+        e = cur.execute(
+            "SELECT status, filled_qty, avg_fill_price FROM exec_orders WHERE id = ?",
+            (int(pos["entry_exec_order_id"]),),
+        ).fetchone()
+        if e:
+            e_status = str(e["status"] or "")
+            e_filled = float(e["filled_qty"] or 0.0)
+            e_price = float(e["avg_fill_price"]) if e["avg_fill_price"] is not None else None
+            if e_status in ("filled", "partially_filled") and e_filled > 0:
+                cur.execute(
+                    """
+                    UPDATE position_records
+                    SET status = CASE WHEN status = 'pending' THEN 'open' ELSE status END,
+                        filled_qty = ?,
+                        entry_price_fact = COALESCE(entry_price_fact, ?),
+                        opened_at = COALESCE(opened_at, ?),
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (e_filled, e_price, now, now, int(position_record_id)),
+                )
+    if pos["exit_exec_order_id"]:
+        x = cur.execute(
+            "SELECT status, filled_qty, avg_fill_price FROM exec_orders WHERE id = ?",
+            (int(pos["exit_exec_order_id"]),),
+        ).fetchone()
+        if x and str(x["status"] or "") in ("filled", "partially_filled") and float(x["filled_qty"] or 0.0) > 0:
+            cur.execute(
+                """
+                UPDATE position_records
+                SET status = 'closed',
+                    exit_price_fact = COALESCE(exit_price_fact, ?),
+                    closed_at = COALESCE(closed_at, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    (float(x["avg_fill_price"]) if x["avg_fill_price"] is not None else None),
+                    now,
+                    now,
+                    int(position_record_id),
+                ),
+            )
+
+
+def reconcile_recent_exec_orders(cur, *, lookback_hours: int = 24) -> Dict[str, Any]:
+    """
+    Сверка локальных exec_orders с фактическими сделками Bybit (fills).
+    Безопасный no-op, если execution/ключи выключены.
+    """
+    if not st.BYBIT_EXECUTION_ENABLED:
+        return {"ok": True, "skipped": "execution_disabled"}
+    try:
+        _ = bt._session()  # проверка ключей/доступа
+    except Exception:
+        return {"ok": False, "error": "bybit_session_unavailable"}
+
+    orders = _fetch_exec_orders_to_reconcile(cur, lookback_hours=lookback_hours)
+    if not orders:
+        return {"ok": True, "orders_checked": 0, "fills_upserted": 0}
+
+    fills_upserted = 0
+    checked = 0
+    for o in orders:
+        checked += 1
+        symbol_trade = str(o.get("symbol") or "")
+        symbol_trade = symbol_trade if "/" in symbol_trade else symbol_trade.replace("USDT", "/USDT")
+        bybit_oid = str(o.get("bybit_order_id") or "")
+        try:
+            ex_resp = bt._session().get_executions(
+                category="linear",
+                symbol=bt.to_bybit_symbol(symbol_trade),
+                orderId=bybit_oid,
+                limit=50,
+            )
+            ex_list = ((ex_resp or {}).get("result") or {}).get("list") or []
+        except Exception:
+            logger.exception("reconcile executions failed for order_id=%s", bybit_oid)
+            continue
+        before = cur.execute(
+            "SELECT COUNT(*) AS c FROM exec_fills WHERE exec_order_id = ?",
+            (int(o["id"]),),
+        ).fetchone()
+        before_n = int(before["c"] or 0) if before else 0
+        for ex in ex_list:
+            _upsert_fill(cur, order=o, ex=ex)
+        after = cur.execute(
+            "SELECT COUNT(*) AS c FROM exec_fills WHERE exec_order_id = ?",
+            (int(o["id"]),),
+        ).fetchone()
+        after_n = int(after["c"] or 0) if after else 0
+        fills_upserted += max(0, after_n - before_n)
+        _refresh_exec_order_from_fills(cur, exec_order_id=int(o["id"]))
+        if o.get("position_record_id"):
+            _refresh_position_from_orders(cur, position_record_id=int(o["position_record_id"]))
+    return {
+        "ok": True,
+        "orders_checked": checked,
+        "fills_upserted": fills_upserted,
+    }
+
+
+__all__ = ["reconcile_recent_exec_orders"]

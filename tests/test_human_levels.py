@@ -75,7 +75,7 @@ def test_cluster_merges_close_prices():
 
 
 def test_pipeline_from_trivial_daily():
-    # Достаточно дневных баров для ATR(14) + пара фракталов
+    # Достаточно дневных баров для Gerchik (10) + пара фракталов
     rows_d1 = []
     base = 1000
     for i in range(20):

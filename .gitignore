@@ -20,11 +20,25 @@ credentials.json
 *.key
 *.pem
 
+# Supervisor / runtime logs (новый файл на каждый запуск)
+trading_bot/logs/*.log
+
 # Local databases and artifacts
 data/*.db
 trading_bot/data/*.db
 *.sqlite
 *.sqlite3
+*.db-shm
+*.db-wal
+trading_bot/data/exports/
+
+# Repo-root scratch
+market_data.db
+GoogleTest.xlsx
+peak_levels_*.txt
+peak_levels_*.csv
+.tmp_*.py
+tmp_*.py
 
 # OS files
 .DS_Store

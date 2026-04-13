@@ -275,6 +275,16 @@ def init_db() -> None:
             cycle_phase TEXT NOT NULL DEFAULT 'arming' CHECK (cycle_phase IN ('arming', 'in_position', 'closed')),
             levels_frozen INTEGER NOT NULL DEFAULT 0,
             cycle_version INTEGER NOT NULL DEFAULT 0,
+            channel_mode TEXT NOT NULL DEFAULT 'two_sided' CHECK (channel_mode IN ('two_sided', 'single_sided')),
+            known_side TEXT NOT NULL DEFAULT 'both' CHECK (known_side IN ('none', 'long', 'short', 'both')),
+            need_rebuild_opposite INTEGER NOT NULL DEFAULT 0,
+            opposite_rebuild_deadline_ts INTEGER,
+            opposite_rebuild_attempts INTEGER NOT NULL DEFAULT 0,
+            last_rebuild_reason TEXT,
+            last_group_touch_event_ts INTEGER,
+            last_group_touch_cycle_id TEXT,
+            last_group_touch_source TEXT,
+            last_group_touch_symbols_json TEXT,
             close_reason TEXT,
             last_transition_at INTEGER,
             updated_at INTEGER NOT NULL
@@ -284,6 +294,36 @@ def init_db() -> None:
     _ts_cols = _column_names(cursor, "trading_state")
     if _ts_cols and "structural_cycle_id" not in _ts_cols:
         cursor.execute("ALTER TABLE trading_state ADD COLUMN structural_cycle_id TEXT")
+    _ts_cols = _column_names(cursor, "trading_state")
+    if _ts_cols and "channel_mode" not in _ts_cols:
+        cursor.execute("ALTER TABLE trading_state ADD COLUMN channel_mode TEXT NOT NULL DEFAULT 'two_sided'")
+    _ts_cols = _column_names(cursor, "trading_state")
+    if _ts_cols and "known_side" not in _ts_cols:
+        cursor.execute("ALTER TABLE trading_state ADD COLUMN known_side TEXT NOT NULL DEFAULT 'both'")
+    _ts_cols = _column_names(cursor, "trading_state")
+    if _ts_cols and "need_rebuild_opposite" not in _ts_cols:
+        cursor.execute("ALTER TABLE trading_state ADD COLUMN need_rebuild_opposite INTEGER NOT NULL DEFAULT 0")
+    _ts_cols = _column_names(cursor, "trading_state")
+    if _ts_cols and "opposite_rebuild_deadline_ts" not in _ts_cols:
+        cursor.execute("ALTER TABLE trading_state ADD COLUMN opposite_rebuild_deadline_ts INTEGER")
+    _ts_cols = _column_names(cursor, "trading_state")
+    if _ts_cols and "opposite_rebuild_attempts" not in _ts_cols:
+        cursor.execute("ALTER TABLE trading_state ADD COLUMN opposite_rebuild_attempts INTEGER NOT NULL DEFAULT 0")
+    _ts_cols = _column_names(cursor, "trading_state")
+    if _ts_cols and "last_rebuild_reason" not in _ts_cols:
+        cursor.execute("ALTER TABLE trading_state ADD COLUMN last_rebuild_reason TEXT")
+    _ts_cols = _column_names(cursor, "trading_state")
+    if _ts_cols and "last_group_touch_event_ts" not in _ts_cols:
+        cursor.execute("ALTER TABLE trading_state ADD COLUMN last_group_touch_event_ts INTEGER")
+    _ts_cols = _column_names(cursor, "trading_state")
+    if _ts_cols and "last_group_touch_cycle_id" not in _ts_cols:
+        cursor.execute("ALTER TABLE trading_state ADD COLUMN last_group_touch_cycle_id TEXT")
+    _ts_cols = _column_names(cursor, "trading_state")
+    if _ts_cols and "last_group_touch_source" not in _ts_cols:
+        cursor.execute("ALTER TABLE trading_state ADD COLUMN last_group_touch_source TEXT")
+    _ts_cols = _column_names(cursor, "trading_state")
+    if _ts_cols and "last_group_touch_symbols_json" not in _ts_cols:
+        cursor.execute("ALTER TABLE trading_state ADD COLUMN last_group_touch_symbols_json TEXT")
     cursor.execute(
         """
         INSERT OR IGNORE INTO trading_state (id, cycle_id, structural_cycle_id, position_state, cycle_phase, levels_frozen, cycle_version, close_reason, last_transition_at, updated_at)
@@ -416,6 +456,30 @@ def init_db() -> None:
     )
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_structural_events_symbol_ts ON structural_events(symbol, ts)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ops_stage_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT,
+            cycle_id TEXT,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            severity TEXT,
+            message TEXT,
+            details_json TEXT,
+            started_at INTEGER,
+            finished_at INTEGER,
+            duration_ms INTEGER,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ops_stage_cycle_created ON ops_stage_runs(cycle_id, created_at DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ops_stage_stage_created ON ops_stage_runs(stage, created_at DESC)"
     )
 
     conn.commit()
@@ -1015,6 +1079,370 @@ def run_migrations() -> None:
             cursor.execute("ALTER TABLE trading_state ADD COLUMN structural_cycle_id TEXT")
         cursor.execute(
             "INSERT INTO db_version (version, applied_at) VALUES (13, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 14:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entry_detector_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                cycle_id TEXT NOT NULL,
+                structural_cycle_id TEXT,
+                symbol TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                price REAL,
+                long_level_price REAL,
+                short_level_price REAL,
+                atr_used REAL,
+                distance_to_long_atr REAL,
+                distance_to_short_atr REAL,
+                meta_json TEXT
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entry_det_cycle_ts ON entry_detector_events(cycle_id, ts DESC)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entry_det_symbol_ts ON entry_detector_events(symbol, ts DESC)"
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exec_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                cycle_id TEXT,
+                structural_cycle_id TEXT,
+                position_record_id INTEGER,
+                order_role TEXT,
+                parent_exec_order_id INTEGER,
+                client_order_id TEXT,
+                bybit_order_id TEXT,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                order_type TEXT NOT NULL,
+                qty REAL NOT NULL,
+                price REAL,
+                status TEXT NOT NULL,
+                exchange_status TEXT,
+                filled_qty REAL,
+                avg_fill_price REAL,
+                reduce_only INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                raw_json TEXT
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_exec_orders_client ON exec_orders(client_order_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exec_orders_bybit ON exec_orders(bybit_order_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exec_orders_pos ON exec_orders(position_record_id)"
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS position_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                cycle_id TEXT,
+                structural_cycle_id TEXT,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL CHECK (side IN ('long', 'short')),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'open', 'closed', 'cancelled')),
+                qty REAL NOT NULL,
+                entry_price REAL,
+                entry_price_fact REAL,
+                exit_price REAL,
+                exit_price_fact REAL,
+                filled_qty REAL,
+                entry_exec_order_id INTEGER,
+                stop_exec_order_id INTEGER,
+                exit_exec_order_id INTEGER,
+                opened_at INTEGER,
+                closed_at INTEGER,
+                realized_pnl REAL,
+                fees REAL,
+                close_reason TEXT,
+                notes TEXT,
+                meta_json TEXT
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_position_records_symbol ON position_records(symbol, updated_at DESC)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_position_records_status ON position_records(status)"
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_statistics_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period_start INTEGER NOT NULL,
+                period_end INTEGER NOT NULL,
+                scope TEXT NOT NULL,
+                metrics_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trade_stats_period ON trade_statistics_snapshots(period_end DESC)"
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exec_fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exec_order_id INTEGER,
+                position_record_id INTEGER,
+                cycle_id TEXT,
+                structural_cycle_id TEXT,
+                symbol TEXT NOT NULL,
+                side TEXT,
+                trade_id TEXT,
+                fill_price REAL,
+                fill_qty REAL,
+                fee REAL,
+                fee_currency TEXT,
+                ts INTEGER NOT NULL,
+                raw_json TEXT
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exec_fills_order_ts ON exec_fills(exec_order_id, ts DESC)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exec_fills_cycle_ts ON exec_fills(cycle_id, ts DESC)"
+        )
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (14, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 15:
+        _ts15 = _column_names(cursor, "trading_state")
+        if _ts15 and "allow_long_entry" not in _ts15:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN allow_long_entry INTEGER NOT NULL DEFAULT 1"
+            )
+        _ts15 = _column_names(cursor, "trading_state")
+        if _ts15 and "allow_short_entry" not in _ts15:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN allow_short_entry INTEGER NOT NULL DEFAULT 1"
+            )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entry_gate_confirmations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                cycle_id TEXT NOT NULL,
+                structural_cycle_id TEXT,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('long', 'short')),
+                level_price REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                atr REAL,
+                long_atr_threshold_pct REAL,
+                short_atr_threshold_pct REAL,
+                meta_json TEXT
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entry_gate_conf_cycle ON entry_gate_confirmations(cycle_id, ts DESC)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entry_gate_conf_sym ON entry_gate_confirmations(symbol, ts DESC)"
+        )
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (15, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 16:
+        _pr16 = _column_names(cursor, "position_records")
+        if _pr16 and "entry_gate_confirmation_id" not in _pr16:
+            cursor.execute(
+                "ALTER TABLE position_records ADD COLUMN entry_gate_confirmation_id INTEGER"
+            )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_position_records_gate_conf "
+            "ON position_records(entry_gate_confirmation_id)"
+        )
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (16, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 17:
+        _ts17 = _column_names(cursor, "trading_state")
+        if _ts17 and "last_group_touch_event_ts" not in _ts17:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN last_group_touch_event_ts INTEGER"
+            )
+        _ts17 = _column_names(cursor, "trading_state")
+        if _ts17 and "last_group_touch_cycle_id" not in _ts17:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN last_group_touch_cycle_id TEXT"
+            )
+        _ts17 = _column_names(cursor, "trading_state")
+        if _ts17 and "last_group_touch_source" not in _ts17:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN last_group_touch_source TEXT"
+            )
+        _ts17 = _column_names(cursor, "trading_state")
+        if _ts17 and "last_group_touch_symbols_json" not in _ts17:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN last_group_touch_symbols_json TEXT"
+            )
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (17, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 18:
+        _ts18 = _column_names(cursor, "trading_state")
+        if _ts18 and "channel_mode" not in _ts18:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN channel_mode TEXT NOT NULL DEFAULT 'two_sided'"
+            )
+        _ts18 = _column_names(cursor, "trading_state")
+        if _ts18 and "known_side" not in _ts18:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN known_side TEXT NOT NULL DEFAULT 'both'"
+            )
+        _ts18 = _column_names(cursor, "trading_state")
+        if _ts18 and "need_rebuild_opposite" not in _ts18:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN need_rebuild_opposite INTEGER NOT NULL DEFAULT 0"
+            )
+        _ts18 = _column_names(cursor, "trading_state")
+        if _ts18 and "opposite_rebuild_deadline_ts" not in _ts18:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN opposite_rebuild_deadline_ts INTEGER"
+            )
+        _ts18 = _column_names(cursor, "trading_state")
+        if _ts18 and "opposite_rebuild_attempts" not in _ts18:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN opposite_rebuild_attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        _ts18 = _column_names(cursor, "trading_state")
+        if _ts18 and "last_rebuild_reason" not in _ts18:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN last_rebuild_reason TEXT"
+            )
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (18, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 19:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ops_stage_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                cycle_id TEXT,
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL,
+                severity TEXT,
+                message TEXT,
+                details_json TEXT,
+                started_at INTEGER,
+                finished_at INTEGER,
+                duration_ms INTEGER,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ops_stage_cycle_created ON ops_stage_runs(cycle_id, created_at DESC)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ops_stage_stage_created ON ops_stage_runs(stage, created_at DESC)"
+        )
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (19, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 20:
+        _eo20 = _column_names(cursor, "exec_orders")
+        if _eo20 and "order_role" not in _eo20:
+            cursor.execute("ALTER TABLE exec_orders ADD COLUMN order_role TEXT")
+        _eo20 = _column_names(cursor, "exec_orders")
+        if _eo20 and "parent_exec_order_id" not in _eo20:
+            cursor.execute("ALTER TABLE exec_orders ADD COLUMN parent_exec_order_id INTEGER")
+        _eo20 = _column_names(cursor, "exec_orders")
+        if _eo20 and "exchange_status" not in _eo20:
+            cursor.execute("ALTER TABLE exec_orders ADD COLUMN exchange_status TEXT")
+        _eo20 = _column_names(cursor, "exec_orders")
+        if _eo20 and "filled_qty" not in _eo20:
+            cursor.execute("ALTER TABLE exec_orders ADD COLUMN filled_qty REAL")
+        _eo20 = _column_names(cursor, "exec_orders")
+        if _eo20 and "avg_fill_price" not in _eo20:
+            cursor.execute("ALTER TABLE exec_orders ADD COLUMN avg_fill_price REAL")
+
+        _pr20 = _column_names(cursor, "position_records")
+        if _pr20 and "entry_price_fact" not in _pr20:
+            cursor.execute("ALTER TABLE position_records ADD COLUMN entry_price_fact REAL")
+        _pr20 = _column_names(cursor, "position_records")
+        if _pr20 and "exit_price_fact" not in _pr20:
+            cursor.execute("ALTER TABLE position_records ADD COLUMN exit_price_fact REAL")
+        _pr20 = _column_names(cursor, "position_records")
+        if _pr20 and "filled_qty" not in _pr20:
+            cursor.execute("ALTER TABLE position_records ADD COLUMN filled_qty REAL")
+        _pr20 = _column_names(cursor, "position_records")
+        if _pr20 and "stop_exec_order_id" not in _pr20:
+            cursor.execute("ALTER TABLE position_records ADD COLUMN stop_exec_order_id INTEGER")
+        _pr20 = _column_names(cursor, "position_records")
+        if _pr20 and "close_reason" not in _pr20:
+            cursor.execute("ALTER TABLE position_records ADD COLUMN close_reason TEXT")
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exec_fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exec_order_id INTEGER,
+                position_record_id INTEGER,
+                cycle_id TEXT,
+                structural_cycle_id TEXT,
+                symbol TEXT NOT NULL,
+                side TEXT,
+                trade_id TEXT,
+                fill_price REAL,
+                fill_qty REAL,
+                fee REAL,
+                fee_currency TEXT,
+                ts INTEGER NOT NULL,
+                raw_json TEXT
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exec_fills_order_ts ON exec_fills(exec_order_id, ts DESC)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exec_fills_cycle_ts ON exec_fills(cycle_id, ts DESC)"
+        )
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (20, ?)",
             (int(time.time()),),
         )
         conn.commit()

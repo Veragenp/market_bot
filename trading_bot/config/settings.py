@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 # Пути:
 #   TRADING_BOT_DIR — каталог пакета `trading_bot` (config/, data/, entrypoints/, …).
@@ -30,6 +31,14 @@ try:
         load_dotenv(_env_extra, override=True)
 except ImportError:
     pass
+
+
+def _env_strip_quotes(val: str) -> str:
+    s = (val or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1].strip()
+    return s
+
 
 # SQLite: по умолчанию только внутри `trading_bot/data/` (не в корне репозитория).
 # Переопределение: MARKET_BOT_DATA_DIR или MARKET_BOT_DB_PATH (абсолютный путь к файлу).
@@ -111,8 +120,99 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
 # Bybit
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+BYBIT_API_KEY = _env_strip_quotes(os.getenv("BYBIT_API_KEY", ""))
+BYBIT_API_SECRET = _env_strip_quotes(os.getenv("BYBIT_API_SECRET", ""))
+# Demo trading (api-demo.bybit.com, ключи из основного аккаунта в режиме Demo)
+BYBIT_API_KEY_TEST = _env_strip_quotes(os.getenv("BYBIT_API_KEY_TEST", ""))
+BYBIT_API_SECRET_TEST = _env_strip_quotes(os.getenv("BYBIT_API_SECRET_TEST", ""))
+BYBIT_USE_DEMO = os.getenv("BYBIT_USE_DEMO", "0").strip().lower() in ("1", "true", "yes", "on")
+# Реальные ордера: только при явном включении (демо или прод — по BYBIT_USE_DEMO)
+BYBIT_EXECUTION_ENABLED = os.getenv("BYBIT_EXECUTION_ENABLED", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# После группового LONG/SHORT в entry_gate: авто-открытие по строкам entry_gate_confirmations (нужен BYBIT_EXECUTION_ENABLED=1).
+ENTRY_AUTO_OPEN_AFTER_GATE = os.getenv("ENTRY_AUTO_OPEN_AFTER_GATE", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# True — лимит по цене из position_math (GTC); False — рыночный вход + стоп как в create_draft (execute_market).
+ENTRY_AUTO_OPEN_USE_LIMIT = os.getenv("ENTRY_AUTO_OPEN_USE_LIMIT", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Детектор подхода к уровням cycle_levels (после freeze) — legacy near-band (см. level_cross_monitor)
+ENTRY_DETECTOR_POLL_SEC = float(os.getenv("ENTRY_DETECTOR_POLL_SEC", "3"))
+ENTRY_DETECTOR_NEAR_ATR = float(os.getenv("ENTRY_DETECTOR_NEAR_ATR", "0.12"))
+ENTRY_DETECTOR_DEBOUNCE_SEC = int(os.getenv("ENTRY_DETECTOR_DEBOUNCE_SEC", "30"))
+
+# Tutorial V3 → level cross monitor (traiding_monitor.py): окно и групповой порог по числу монет
+# Совместимость с именами env из tutorial_v3/config.py
+# Частота опроса цен/уровней для детектора пересечений.
+LEVEL_CROSS_POLL_SEC = float(os.getenv("LEVEL_CROSS_POLL_SEC", os.getenv("MONITOR_POLL_SEC", "10")))
+# Окно свежести алертов (в минутах) для группового сигнала.
+LEVEL_CROSS_ALERT_TIMEOUT_MINUTES = float(
+    os.getenv("LEVEL_CROSS_ALERT_TIMEOUT_MINUTES", os.getenv("ALERT_TIMEOUT_MINUTES", "30"))
+)
+# Минимум разных монет с алертом для подтверждения группового сигнала.
+LEVEL_CROSS_MIN_ALERTS_COUNT = int(
+    os.getenv("LEVEL_CROSS_MIN_ALERTS_COUNT", os.getenv("MIN_ALERTS_COUNT", "3"))
+)
+# Сколько дополнительных алертов допускаем после первого срабатывания.
+LEVEL_CROSS_MAX_ADDITIONAL_ALERTS = int(
+    os.getenv("LEVEL_CROSS_MAX_ADDITIONAL_ALERTS", os.getenv("MAX_ADDITIONAL_ALERTS", "3"))
+)
+
+# Tutorial V3 → entry gate (trade_signal_processor.py): ATR %% от уровня
+ENTRY_GATE_LONG_ATR_THRESHOLD_PCT = float(
+    os.getenv("ENTRY_GATE_LONG_ATR_THRESHOLD_PCT", os.getenv("LONG_ATR_THRESHOLD_PERCENT", "2"))
+)
+ENTRY_GATE_SHORT_ATR_THRESHOLD_PCT = float(
+    os.getenv("ENTRY_GATE_SHORT_ATR_THRESHOLD_PCT", os.getenv("SHORT_ATR_THRESHOLD_PERCENT", "2"))
+)
+# Общий флаг Telegram-уведомлений для level-cross модуля.
+LEVEL_CROSS_TELEGRAM = os.getenv("LEVEL_CROSS_TELEGRAM", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Отдельный флаг для уведомлений о фактическом пересечении LONG/SHORT уровней.
+LEVEL_CROSS_TELEGRAM_CROSSINGS = os.getenv("LEVEL_CROSS_TELEGRAM_CROSSINGS", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Старт тика entry detector (monitor + gate): уведомление в Telegram (часто — раз в SUPERVISOR_ENTRY_TICK_SEC).
+ENTRY_DETECTOR_TELEGRAM_START = os.getenv("ENTRY_DETECTOR_TELEGRAM_START", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Размер позиции / TP по карте tutorial_v3 (position_math + черновик position_records)
+# Фиксированный риск на сделку в USDT (не процент депозита).
+POSITION_RISK_USDT = float(os.getenv("POSITION_RISK_USDT", "1"))
+# Стоп-лосс в ATR от точки входа (1.0 = расстояние 1*ATR).
+POSITION_STOP_ATR_MULT = float(os.getenv("POSITION_STOP_ATR_MULT", "0.2"))
+# Цели TP в ATR от входа.
+POSITION_TP1_ATR_MULT = float(os.getenv("POSITION_TP1_ATR_MULT", "3"))
+POSITION_TP2_ATR_MULT = float(os.getenv("POSITION_TP2_ATR_MULT", "2"))
+POSITION_TP3_ATR_MULT = float(os.getenv("POSITION_TP3_ATR_MULT", "3"))
+# Доли фиксации объема на TP1/TP2 (остаток идет на TP3).
+POSITION_TP1_SHARE_PCT = float(os.getenv("POSITION_TP1_SHARE_PCT", "100"))
+POSITION_TP2_SHARE_PCT = float(os.getenv("POSITION_TP2_SHARE_PCT", "0"))
+# Люфт входа X только в % от уровня K (Y = K +/- X, X = K * pct / 100).
+POSITION_ENTRY_OFFSET_PCT = float(os.getenv("POSITION_ENTRY_OFFSET_PCT", "0"))
 
 YFINANCE_TICKERS: dict[str, str] = {
     "SP500": "^GSPC",
@@ -153,8 +253,7 @@ YFINANCE_TIMEZONE = MACRO_TIMEZONE
 # Volume Profile Peaks (HVN) tuning (для поиска `final=2/3/...`)
 # -----------------------------------------------------------------------------
 #
-# Важно: ранее эти параметры читались из env `PRO_LEVELS_*`.
-# Сейчас они задаются в конфиге, чтобы расчет был встроен в проект.
+# Эти параметры можно переопределять через env `PRO_LEVELS_*`.
 # Любой параметр = None означает: использовать adaptive-значение из
 # `get_adaptive_params()` (см. `analytics/volume_profile_peaks.py`).
 #
@@ -162,8 +261,33 @@ YFINANCE_TIMEZONE = MACRO_TIMEZONE
 #   - если PRO_LEVELS_LOOKBACK_DAYS/HOURS = None → берём предыдущий календарный месяц
 #   - если задано → окно считается от последней 1m-свечи в БД (anchor)
 
-PRO_LEVELS_LOOKBACK_DAYS = 30  # 30 дней от последней 1m-свечи в БД
-PRO_LEVELS_LOOKBACK_HOURS = None
+def _env_opt_float(name: str, default: float | None) -> float | None:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    if raw.lower() in ("none", "null"):
+        return None
+    return float(raw)
+
+
+def _env_opt_int(name: str, default: int | None) -> int | None:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    if raw.lower() in ("none", "null"):
+        return None
+    return int(raw)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+PRO_LEVELS_LOOKBACK_DAYS = _env_opt_int("PRO_LEVELS_LOOKBACK_DAYS", 30)  # 30 дней от последней 1m-свечи в БД
+PRO_LEVELS_LOOKBACK_HOURS = _env_opt_int("PRO_LEVELS_LOOKBACK_HOURS", None)
 
 # Плановый пересчёт vp_local → `price_levels` (см. `data/scheduler.py`).
 # >0: интервал в часах (например 1 или 4). 0: только ежедневный слот 02:45 UTC.
@@ -187,34 +311,34 @@ VP_OHLC_MEDIAN_RANGE_MIN = float(os.getenv("VP_OHLC_MEDIAN_RANGE_MIN", "1e-7"))
 VP_OHLC_RESAMPLE_MIN_1M_BARS = int(os.getenv("VP_OHLC_RESAMPLE_MIN_1M_BARS", "120"))
 
 # Core toggles / thresholds
-PRO_LEVELS_HEIGHT_MULT = None
-PRO_LEVELS_DISTANCE_PCT = None
-PRO_LEVELS_VALLEY_THRESHOLD = None
+PRO_LEVELS_HEIGHT_MULT = _env_opt_float("PRO_LEVELS_HEIGHT_MULT", None)
+PRO_LEVELS_DISTANCE_PCT = _env_opt_float("PRO_LEVELS_DISTANCE_PCT", None)
+PRO_LEVELS_VALLEY_THRESHOLD = _env_opt_float("PRO_LEVELS_VALLEY_THRESHOLD", None)
 
-PRO_LEVELS_MIN_DURATION_HOURS = None
-PRO_LEVELS_MAX_LEVELS = None
-PRO_LEVELS_INCLUDE_ALL_TIERS = None
+PRO_LEVELS_MIN_DURATION_HOURS = _env_opt_float("PRO_LEVELS_MIN_DURATION_HOURS", None)
+PRO_LEVELS_MAX_LEVELS = _env_opt_int("PRO_LEVELS_MAX_LEVELS", 18)
+PRO_LEVELS_INCLUDE_ALL_TIERS = _env_opt_int("PRO_LEVELS_INCLUDE_ALL_TIERS", None)
 
-PRO_LEVELS_FINAL_MERGE_PCT = None  # если None — берётся dynamic_merge_pct (adaptive)
-PRO_LEVELS_VALLEY_MERGE_THRESHOLD = None
-PRO_LEVELS_ENABLE_VALLEY_MERGE = True
+PRO_LEVELS_FINAL_MERGE_PCT = _env_opt_float("PRO_LEVELS_FINAL_MERGE_PCT", 0.002)
+PRO_LEVELS_VALLEY_MERGE_THRESHOLD = _env_opt_float("PRO_LEVELS_VALLEY_MERGE_THRESHOLD", None)
+PRO_LEVELS_ENABLE_VALLEY_MERGE = _env_bool("PRO_LEVELS_ENABLE_VALLEY_MERGE", False)
 
-PRO_LEVELS_DEDUP_ROUND_PCT = None
-PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD = None
+PRO_LEVELS_DEDUP_ROUND_PCT = _env_opt_float("PRO_LEVELS_DEDUP_ROUND_PCT", None)
+PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD = _env_opt_float("PRO_LEVELS_FINAL_MERGE_VALLEY_THRESHOLD", None)
 
-PRO_LEVELS_LEGACY_WEAK_MERGE = False
-PRO_LEVELS_RUN_SOFT_PASS = True
+PRO_LEVELS_LEGACY_WEAK_MERGE = _env_bool("PRO_LEVELS_LEGACY_WEAK_MERGE", False)
+PRO_LEVELS_RUN_SOFT_PASS = _env_bool("PRO_LEVELS_RUN_SOFT_PASS", True)
 
-PRO_LEVELS_STRICT_HEIGHT_WEAK = None
-PRO_LEVELS_STRICT_HEIGHT_MULT = None
+PRO_LEVELS_STRICT_HEIGHT_WEAK = _env_opt_float("PRO_LEVELS_STRICT_HEIGHT_WEAK", None)
+PRO_LEVELS_STRICT_HEIGHT_MULT = _env_opt_float("PRO_LEVELS_STRICT_HEIGHT_MULT", None)
 
-PRO_LEVELS_SOFT_HEIGHT_STRONG = None
-PRO_LEVELS_SOFT_HEIGHT_WEAK = None
-PRO_LEVELS_SOFT_HEIGHT_MULT = None
-PRO_LEVELS_SOFT_FINAL_MERGE_PCT = None
+PRO_LEVELS_SOFT_HEIGHT_STRONG = _env_opt_float("PRO_LEVELS_SOFT_HEIGHT_STRONG", None)
+PRO_LEVELS_SOFT_HEIGHT_WEAK = _env_opt_float("PRO_LEVELS_SOFT_HEIGHT_WEAK", None)
+PRO_LEVELS_SOFT_HEIGHT_MULT = _env_opt_float("PRO_LEVELS_SOFT_HEIGHT_MULT", None)
+PRO_LEVELS_SOFT_FINAL_MERGE_PCT = _env_opt_float("PRO_LEVELS_SOFT_FINAL_MERGE_PCT", None)
 
-PRO_LEVELS_EXCLUDE_RESERVED_PCT = None
-PRO_LEVELS_WEAK_MIN_DURATION = None
+PRO_LEVELS_EXCLUDE_RESERVED_PCT = _env_opt_float("PRO_LEVELS_EXCLUDE_RESERVED_PCT", None)
+PRO_LEVELS_WEAK_MIN_DURATION = _env_opt_float("PRO_LEVELS_WEAK_MIN_DURATION", None)
 
 # Level events analytics (daily batch over 1m candles)
 LEVEL_EVENTS_WINDOW_HOURS = 4
@@ -352,73 +476,226 @@ CYCLE_LEVELS_REBUILD_ENABLED = os.getenv("CYCLE_LEVELS_REBUILD_ENABLED", "0").st
     "on",
 )
 
-# Structural cycle (§3 cycle_structural_start_spec): пул (L,U), MAD, mid-полоса → freeze в cycle_levels.
-# Источник ref для скана кандидатов из price_levels: `db_1m_close` — как vp_local (Binance spot в БД);
-# `price_feed` — Bybit WS/REST (может расходиться со spot-уровнями).
+# Structural cycle: эталон W*=(U-L)/ATR (медиана по голосующим), люфт, mid-band → freeze в cycle_levels.
+# Источник ref: `price_feed` (WS/REST); при отсутствии тика — fallback последний 1m close из БД (см. structural_cycle_db).
 STRUCTURAL_REF_PRICE_SOURCE = (
-    os.getenv("STRUCTURAL_REF_PRICE_SOURCE", "db_1m_close").strip().lower() or "db_1m_close"
+    os.getenv("STRUCTURAL_REF_PRICE_SOURCE", "price_feed").strip().lower() or "price_feed"
 )
-# Отдельно от CYCLE_LEVELS_ALLOWED_LEVEL_TYPES. Human (D1/W1) в structural по умолчанию не берём —
-# только vp_local + ручные глобальные HVN. При экстремальной цене vp_local часто не закрывает обе
-# стороны: это ограничение исходных уровней, не «узкое окно» N_touch (оно другое).
 STRUCTURAL_ALLOWED_LEVEL_TYPES: list[str] = _parse_csv_types(
     os.getenv("STRUCTURAL_ALLOWED_LEVEL_TYPES", ""),
     "vp_local,manual_global_hvn",
 )
-# Минимум кандидатов с каждой стороны от ref (для входа в пул достаточно 1+1; top-K — отдельно).
 STRUCTURAL_MIN_CANDIDATES_PER_SIDE = int(os.getenv("STRUCTURAL_MIN_CANDIDATES_PER_SIDE", "1"))
 STRUCTURAL_TOP_K = int(os.getenv("STRUCTURAL_TOP_K", "5"))
+# Минимум монет с парой W∈[W_MIN,W_MAX] для медианы W* (эталон в один срез).
+STRUCTURAL_N_ETALON = int(os.getenv("STRUCTURAL_N_ETALON", "3"))
+STRUCTURAL_W_MIN = float(os.getenv("STRUCTURAL_W_MIN", "0.7"))
+STRUCTURAL_W_MAX = float(os.getenv("STRUCTURAL_W_MAX", "2.5"))
+# Доля от W*: effective_slack = max(STRUCTURAL_W_SLACK_ABS_MIN, W* * PCT/100).
+STRUCTURAL_W_SLACK_PCT = float(os.getenv("STRUCTURAL_W_SLACK_PCT", "15"))
+# Нижняя граница люфта в единицах W (ширина канала в ATR), независимо от W*.
+STRUCTURAL_W_SLACK_ABS_MIN = float(os.getenv("STRUCTURAL_W_SLACK_ABS_MIN", "0.3"))
+# Полоса «у линии L/U» для событий края: ± (PCT_ATR/100) * ATR в цене (по умолчанию 15% ATR).
+_STRUCT_EDGE_PCT = os.getenv("STRUCTURAL_EDGE_ATR_PCT", "15").strip()
+STRUCTURAL_EDGE_ATR_FRAC = float(_STRUCT_EDGE_PCT) / 100.0 if _STRUCT_EDGE_PCT else 0.15
+# В отчётах z_w = |W-W*|/slack; ok при z_w <= threshold (дублируется в колонке pool_k).
+STRUCTURAL_Z_W_OK_THRESHOLD = float(os.getenv("STRUCTURAL_Z_W_OK_THRESHOLD", "1"))
+STRUCTURAL_STRENGTH_FIRST_ENABLED = os.getenv("STRUCTURAL_STRENGTH_FIRST_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+STRUCTURAL_MIN_POOL_SYMBOLS = int(os.getenv("STRUCTURAL_MIN_POOL_SYMBOLS", "3"))
+STRUCTURAL_MID_BAND_PCT = float(os.getenv("STRUCTURAL_MID_BAND_PCT", "15"))
+# Используется в cycle_levels_db при дозаполнении противоположной стороны (не в эталоне structural).
 STRUCTURAL_MAD_K = float(os.getenv("STRUCTURAL_MAD_K", "3"))
-STRUCTURAL_CENTER_FILTER_ENABLED = os.getenv("STRUCTURAL_CENTER_FILTER_ENABLED", "0").strip().lower() in (
+STRUCTURAL_REFINE_MAX_ROUNDS = int(os.getenv("STRUCTURAL_REFINE_MAX_ROUNDS", "3"))
+# Авто-отбор входного пула символов перед structural:
+# 1) ликвидность avg_volume_24h, 2) корреляция к benchmark, 3) "скорость корреляции".
+STRUCTURAL_POOL_SELECTOR_ENABLED = os.getenv("STRUCTURAL_POOL_SELECTOR_ENABLED", "0").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
-STRUCTURAL_CENTER_MAD_K = float(os.getenv("STRUCTURAL_CENTER_MAD_K", "2.5"))
-STRUCTURAL_TARGET_ALIGN_ENABLED = os.getenv("STRUCTURAL_TARGET_ALIGN_ENABLED", "1").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
+STRUCTURAL_POOL_TARGET_SIZE = int(os.getenv("STRUCTURAL_POOL_TARGET_SIZE", "30"))
+STRUCTURAL_POOL_MIN_SIZE = int(os.getenv("STRUCTURAL_POOL_MIN_SIZE", "15"))
+STRUCTURAL_POOL_TIMEFRAME = os.getenv("STRUCTURAL_POOL_TIMEFRAME", "1h").strip() or "1h"
+STRUCTURAL_POOL_CORR_LOOKBACK_BARS = int(os.getenv("STRUCTURAL_POOL_CORR_LOOKBACK_BARS", "168"))
+STRUCTURAL_POOL_CORR_VELOCITY_WINDOW_BARS = int(os.getenv("STRUCTURAL_POOL_CORR_VELOCITY_WINDOW_BARS", "24"))
+STRUCTURAL_POOL_BENCHMARK_SYMBOLS: list[str] = _parse_csv_types(
+    os.getenv("STRUCTURAL_POOL_BENCHMARK_SYMBOLS", ""),
+    "BTC/USDT,ETH/USDT",
 )
-STRUCTURAL_ANCHOR_SYMBOLS: list[str] = _parse_csv_types(
-    os.getenv("STRUCTURAL_ANCHOR_SYMBOLS", ""),
-    "BTC/USDT,ETH/USDT,SOL/USDT,ADA/USDT",
-)
-STRUCTURAL_TARGET_W_BAND_K = float(os.getenv("STRUCTURAL_TARGET_W_BAND_K", "2.5"))
-STRUCTURAL_TARGET_CENTER_WEIGHT = float(os.getenv("STRUCTURAL_TARGET_CENTER_WEIGHT", "1.0"))
-STRUCTURAL_TARGET_WIDTH_WEIGHT = float(os.getenv("STRUCTURAL_TARGET_WIDTH_WEIGHT", "0.6"))
-STRUCTURAL_MIN_POOL_SYMBOLS = int(os.getenv("STRUCTURAL_MIN_POOL_SYMBOLS", "5"))
-STRUCTURAL_MID_BAND_PCT = float(os.getenv("STRUCTURAL_MID_BAND_PCT", "2"))
-STRUCTURAL_REFINE_MAX_ROUNDS = int(os.getenv("STRUCTURAL_REFINE_MAX_ROUNDS", "5"))
+STRUCTURAL_POOL_CORR_WEIGHT = float(os.getenv("STRUCTURAL_POOL_CORR_WEIGHT", "0.8"))
+STRUCTURAL_POOL_VELOCITY_WEIGHT = float(os.getenv("STRUCTURAL_POOL_VELOCITY_WEIGHT", "0.2"))
 STRUCTURAL_AUTO_FREEZE_ON_SCAN = os.getenv("STRUCTURAL_AUTO_FREEZE_ON_SCAN", "1").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
-STRUCTURAL_N_TOUCH = int(os.getenv("STRUCTURAL_N_TOUCH", "5"))
-STRUCTURAL_TOUCH_WINDOW_SEC = int(os.getenv("STRUCTURAL_TOUCH_WINDOW_SEC", "900"))
+# Групповой триггер mid-touch: минимум уникальных монет, коснувшихся своей mid-band.
+STRUCTURAL_N_TOUCH = int(os.getenv("STRUCTURAL_N_TOUCH", "3"))
+# Окно времени для набора N касаний (сек): если за это время N не набралось, триггера нет.
+STRUCTURAL_TOUCH_WINDOW_SEC = int(os.getenv("STRUCTURAL_TOUCH_WINDOW_SEC", "43200"))
+# После набора N: буфер-стабилизация перед входным этапом (сек).
+# В это время structural еще контролирует отмену цикла при коллективном пробое.
 STRUCTURAL_ENTRY_TIMER_SEC = int(os.getenv("STRUCTURAL_ENTRY_TIMER_SEC", "300"))
-STRUCTURAL_N_ABORT = int(os.getenv("STRUCTURAL_N_ABORT", "5"))
-STRUCTURAL_ABORT_DIST_ATR = float(os.getenv("STRUCTURAL_ABORT_DIST_ATR", "0.3"))
+# Коллективная отмена: если в текущем срезе пробилось >= N символов.
+STRUCTURAL_N_ABORT = int(os.getenv("STRUCTURAL_N_ABORT", "3"))
+# Порог пробоя от границ канала в ATR (L-... или U+...).
+STRUCTURAL_ABORT_DIST_ATR = float(os.getenv("STRUCTURAL_ABORT_DIST_ATR", "0.25"))
+# Дебаунс повторного mid-touch по одному и тому же символу (сек).
 STRUCTURAL_TOUCH_DEBOUNCE_SEC = int(os.getenv("STRUCTURAL_TOUCH_DEBOUNCE_SEC", "5"))
 STRUCTURAL_POLL_SEC = float(os.getenv("STRUCTURAL_POLL_SEC", "1.0"))
-STRUCTURAL_MAX_RUNTIME_SEC = int(os.getenv("STRUCTURAL_MAX_RUNTIME_SEC", "7200"))
+STRUCTURAL_MAX_RUNTIME_SEC = int(os.getenv("STRUCTURAL_MAX_RUNTIME_SEC", "72000"))
+# Историческое восстановление группового mid-touch события (например после рестарта):
+# если за lookback уже было >= N уникальных касаний, сразу переходим к entry_timer.
+STRUCTURAL_TOUCH_HISTORY_LOOKBACK_SEC = int(os.getenv("STRUCTURAL_TOUCH_HISTORY_LOOKBACK_SEC", "14400"))
+STRUCTURAL_TOUCH_HISTORY_MIN_SYMBOLS = int(
+    os.getenv("STRUCTURAL_TOUCH_HISTORY_MIN_SYMBOLS", str(STRUCTURAL_N_TOUCH))
+)
+# Дедуп группового события в одном цикле.
+STRUCTURAL_GROUP_TOUCH_DEDUP_SEC = int(os.getenv("STRUCTURAL_GROUP_TOUCH_DEDUP_SEC", "300"))
+# После группового триггера: не слать повторный сигнал N сек (0 = без блокировки повтора).
+STRUCTURAL_TRIGGER_TIMEOUT_SEC = int(os.getenv("STRUCTURAL_TRIGGER_TIMEOUT_SEC", "300"))
+
+
+@dataclass(frozen=True)
+class StructuralSettings:
+    """Снимок параметров structural v2 (эталон W*, зоны, групповые триггеры)."""
+
+    N_ETALON_MIN: int
+    W_GLOBAL_MIN: float
+    W_GLOBAL_MAX: float
+    W_SLACK_FRAC: float
+    W_SLACK_ABS_MIN: float
+    MID_BAND_PCT: float
+    EDGE_TOLERANCE_ATR_FRAC: float
+    N_TRIGGER: int
+    N_BREAKOUT: int
+    TRIGGER_TIMEOUT_SEC: int
+    BREAKOUT_ATR_FRAC: float
+    TOP_K_PER_SIDE: int
+    ALLOWED_LEVEL_TYPES: tuple[str, ...]
+    MIN_CANDIDATES_PER_SIDE: int
+
+
+STRUCTURAL_SETTINGS = StructuralSettings(
+    N_ETALON_MIN=STRUCTURAL_N_ETALON,
+    W_GLOBAL_MIN=STRUCTURAL_W_MIN,
+    W_GLOBAL_MAX=STRUCTURAL_W_MAX,
+    W_SLACK_FRAC=STRUCTURAL_W_SLACK_PCT / 100.0,
+    W_SLACK_ABS_MIN=STRUCTURAL_W_SLACK_ABS_MIN,
+    MID_BAND_PCT=STRUCTURAL_MID_BAND_PCT,
+    EDGE_TOLERANCE_ATR_FRAC=STRUCTURAL_EDGE_ATR_FRAC,
+    N_TRIGGER=STRUCTURAL_N_TOUCH,
+    N_BREAKOUT=STRUCTURAL_N_ABORT,
+    TRIGGER_TIMEOUT_SEC=STRUCTURAL_TRIGGER_TIMEOUT_SEC,
+    BREAKOUT_ATR_FRAC=STRUCTURAL_ABORT_DIST_ATR,
+    TOP_K_PER_SIDE=STRUCTURAL_TOP_K,
+    ALLOWED_LEVEL_TYPES=tuple(STRUCTURAL_ALLOWED_LEVEL_TYPES),
+    MIN_CANDIDATES_PER_SIDE=STRUCTURAL_MIN_CANDIDATES_PER_SIDE,
+)
+
+# Контур слоя 4: дозаполнение недостающей противоположной стороны канала после входа/переворота.
+STRUCTURAL_OPPOSITE_REBUILD_ENABLED = os.getenv("STRUCTURAL_OPPOSITE_REBUILD_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+STRUCTURAL_OPPOSITE_REBUILD_DEADLINE_SEC = int(
+    os.getenv("STRUCTURAL_OPPOSITE_REBUILD_DEADLINE_SEC", "14400")
+)
 
 # Отчёт structural-scan → Google Sheets (лист по умолчанию; переименование через env).
 STRUCTURAL_LEVELS_REPORT_WORKSHEET = (
     os.getenv("STRUCTURAL_LEVELS_REPORT_WORKSHEET", "structural_levels_report").strip()
     or "structural_levels_report"
 )
+# Операционный контур: лог + Telegram + Google Sheets (без смешивания с сигналами входа).
+STRUCTURAL_OPS_LOG = os.getenv("STRUCTURAL_OPS_LOG", "1").strip().lower() in ("1", "true", "yes", "on")
+STRUCTURAL_OPS_TELEGRAM = os.getenv("STRUCTURAL_OPS_TELEGRAM", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+STRUCTURAL_OPS_SHEETS_LEVELS = os.getenv("STRUCTURAL_OPS_SHEETS_LEVELS", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+STRUCTURAL_OPS_SHEETS_LOG = os.getenv("STRUCTURAL_OPS_SHEETS_LOG", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Каждое mid_touch в Telegram (шумно); по умолчанию только entry_timer (N_touch).
+STRUCTURAL_OPS_TELEGRAM_EACH_MID_TOUCH = os.getenv(
+    "STRUCTURAL_OPS_TELEGRAM_EACH_MID_TOUCH", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+STRUCTURAL_OPS_LOG_WORKSHEET = (
+    os.getenv("STRUCTURAL_OPS_LOG_WORKSHEET", "structural_ops_log").strip() or "structural_ops_log"
+)
+# Журнал каждого mid_touch в Sheets (очень шумно); по умолчанию только фазы и пробои.
+STRUCTURAL_OPS_SHEETS_LOG_EACH_MID_TOUCH = os.getenv(
+    "STRUCTURAL_OPS_SHEETS_LOG_EACH_MID_TOUCH", "0"
+).strip().lower() in ("1", "true", "yes", "on")
 
-def _env_strip_quotes(val: str) -> str:
-    s = (val or "").strip()
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
-        s = s[1:-1].strip()
-    return s
+# -----------------------------------------------------------------------------
+# Ops stage telemetry (pipeline-level observability, low-noise)
+# -----------------------------------------------------------------------------
+OPS_STAGE_LOG = os.getenv("OPS_STAGE_LOG", "1").strip().lower() in ("1", "true", "yes", "on")
+OPS_STAGE_TELEGRAM = os.getenv("OPS_STAGE_TELEGRAM", "0").strip().lower() in ("1", "true", "yes", "on")
+# When enabled, Telegram only receives end-of-stage statuses and failures (no start spam).
+OPS_STAGE_TELEGRAM_ONLY_FINAL = os.getenv("OPS_STAGE_TELEGRAM_ONLY_FINAL", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+OPS_STAGE_SHEETS = os.getenv("OPS_STAGE_SHEETS", "0").strip().lower() in ("1", "true", "yes", "on")
+OPS_STAGE_WORKSHEET = os.getenv("OPS_STAGE_WORKSHEET", "ops_stages").strip() or "ops_stages"
 
+# -----------------------------------------------------------------------------
+# Supervisor loop (единый авто-оркестратор на базе существующих модулей)
+# -----------------------------------------------------------------------------
+SUPERVISOR_LOOP_ENABLED = os.getenv("SUPERVISOR_LOOP_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+SUPERVISOR_POLL_SEC = float(os.getenv("SUPERVISOR_POLL_SEC", "2"))
+# Как часто обновлять базовые данные (spot/macro/indices/oi/instruments), сек.
+SUPERVISOR_DATA_REFRESH_SEC = int(os.getenv("SUPERVISOR_DATA_REFRESH_SEC", "900"))
+# Как часто пересчитывать vp_local в БД и выгружать vp_local_levels, сек.
+SUPERVISOR_LEVELS_REBUILD_SEC = int(os.getenv("SUPERVISOR_LEVELS_REBUILD_SEC", "3600"))
+# Как часто запускать structural цикл (scan/realtime/freeze), сек.
+SUPERVISOR_STRUCTURAL_SEC = int(os.getenv("SUPERVISOR_STRUCTURAL_SEC", "3600"))
+# Не запускать плановый structural, пока freeze активен и цикл не закрыт (arming = ждём V3-вход; in_position = в сделке).
+# Новый полный structural после cycle_phase=closed (и обычно levels_frozen=0). Противоположная сторона — maintenance в entry-тике.
+SUPERVISOR_STRUCTURAL_SKIP_WHEN_CYCLE_ACTIVE = os.getenv(
+    "SUPERVISOR_STRUCTURAL_SKIP_WHEN_CYCLE_ACTIVE", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+# Если structural пропущен из‑за активного цикла — через сколько секунд снова проверить условие (не ждать полный STRUCTURAL_SEC).
+SUPERVISOR_STRUCTURAL_RETRY_WHEN_BLOCKED_SEC = int(
+    os.getenv("SUPERVISOR_STRUCTURAL_RETRY_WHEN_BLOCKED_SEC", "120")
+)
+# Как часто выполнять тик entry detector (monitor + gate + maintenance + reconcile), сек.
+SUPERVISOR_ENTRY_TICK_SEC = int(os.getenv("SUPERVISOR_ENTRY_TICK_SEC", "10"))
+# Перед запуском structural: выгрузка актуальных vp_local из БД в Google Sheet (лист как в export_volume_peaks_to_sheets_only).
+SUPERVISOR_EXPORT_VP_LOCAL_BEFORE_STRUCTURAL = os.getenv(
+    "SUPERVISOR_EXPORT_VP_LOCAL_BEFORE_STRUCTURAL", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+# Лимит открытых позиций в одном направлении (инвариант из tutorial_v3/вашей политики).
+MAX_POSITIONS_PER_SIDE = int(os.getenv("MAX_POSITIONS_PER_SIDE", "10"))
 
 # -----------------------------------------------------------------------------
 # Google: сервисный аккаунт (Sheets и др.)

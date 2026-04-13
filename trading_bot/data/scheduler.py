@@ -14,6 +14,7 @@ from trading_bot.config.settings import (
     OI_UPDATE_INTERVAL,
     REPO_ROOT,
     TIMEFRAMES_BY_CATEGORY,
+    VP_LOCAL_REBUILD_INTERVAL_HOURS,
 )
 from trading_bot.data.data_loader import DataLoaderManager
 from trading_bot.data.collectors import (
@@ -139,7 +140,8 @@ def run_scheduler_forever() -> None:
       - 1d: daily at 01:00 UTC
       - instruments (Bybit + ATR по spot 1d): daily at 01:30 UTC
       - macro (yfinance): daily at 02:30 UTC
-      - volume profile peaks → price_levels: daily at 02:45 UTC
+      - volume profile peaks (vp_local) → price_levels: каждые VP_LOCAL_REBUILD_INTERVAL_HOURS ч
+        (по умолчанию 4; env 0 = только ежедневно 02:45 UTC)
       - human levels (D1/W1) → price_levels + Sheets: daily at 03:00 UTC
       - level events analytics (1m + ATR): daily at 03:10 UTC
       - Google Sheets export: daily at 03:25 UTC (отключить: SCHEDULER_DISABLE_SHEETS_EXPORT=1;
@@ -170,7 +172,13 @@ def run_scheduler_forever() -> None:
     schedule.every().day.at("01:00").do(_run_binance_batch, timeframe="1d")
     schedule.every().day.at("01:30").do(manager.update_instruments_daily)
     schedule.every().day.at("02:30").do(_run_macro_yfinance_batch)
-    schedule.every().day.at("02:45").do(_run_rebuild_volume_profile_peaks_batch)
+    _vp_h = int(VP_LOCAL_REBUILD_INTERVAL_HOURS)
+    if _vp_h > 0:
+        schedule.every(_vp_h).hours.do(_run_rebuild_volume_profile_peaks_batch)
+        logger.info("vp_local rebuild: every %s hours", _vp_h)
+    else:
+        schedule.every().day.at("02:45").do(_run_rebuild_volume_profile_peaks_batch)
+        logger.info("vp_local rebuild: daily at 02:45 UTC (VP_LOCAL_REBUILD_INTERVAL_HOURS=0)")
     schedule.every().day.at("03:00").do(_run_human_levels_batch)
     schedule.every().day.at("03:10").do(_run_level_events_analytics_batch)
     schedule.every().day.at("03:25").do(_run_export_to_sheets_batch)

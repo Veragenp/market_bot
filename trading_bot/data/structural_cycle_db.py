@@ -3,20 +3,81 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from trading_bot.analytics.entry_gate import signal_structural_ready
 from trading_bot.analytics.structural_cycle import (
+    StrongLevel,
+    StructuralCycle,
     StructuralParams,
     StructuralSymbolResult,
+    SymbolPair,
+    check_breakout,
+    compute_initial_zones,
     compute_structural_symbol_results,
+    fire_if_enough_in_mid,
+    symbols_past_breakout_threshold,
+    update_trigger_counts,
 )
 from trading_bot.config.settings import STRUCTURAL_ALLOWED_LEVEL_TYPES
 from trading_bot.config.symbols import TRADING_SYMBOLS
 from trading_bot.data.db import get_connection
 from trading_bot.data.schema import init_db, run_migrations
+from trading_bot.data.cycle_levels_db import export_cycle_levels_sheets_snapshot
+from trading_bot.data.ops_stage import record_stage_event
+from trading_bot.data.structural_ops_notify import (
+    export_levels_snapshot,
+    notify_no_valid_ref_prices,
+    on_structural_event,
+)
 from trading_bot.tools.price_feed import PricePoint, get_price_feed
+
+logger = logging.getLogger(__name__)
+
+
+def _rows_to_symbol_pairs(rows: List[Dict[str, Any]]) -> Dict[str, SymbolPair]:
+    """Снимок structural_cycle_symbols / Row → SymbolPair для realtime."""
+    out: Dict[str, SymbolPair] = {}
+    for r in rows:
+        if r.get("L_price") is None or r.get("U_price") is None:
+            continue
+        lb = r.get("level_below_id")
+        la = r.get("level_above_id")
+        if lb is None or la is None:
+            continue
+        sym = str(r["symbol"])
+        atr = float(r["atr"])
+        out[sym] = SymbolPair(
+            symbol=sym,
+            level_below=StrongLevel(
+                id=int(lb),
+                price=float(r["L_price"]),
+                volume_peak=float(r.get("volume_peak_below") or 0),
+                strength=0.0,
+                tier=str(r.get("tier_below") or ""),
+                level_type="",
+            ),
+            level_above=StrongLevel(
+                id=int(la),
+                price=float(r["U_price"]),
+                volume_peak=float(r.get("volume_peak_above") or 0),
+                strength=0.0,
+                tier=str(r.get("tier_above") or ""),
+                level_type="",
+            ),
+            W=float(r["W_atr"])
+            if r.get("W_atr") is not None
+            else (float(r["U_price"]) - float(r["L_price"])) / atr,
+            atr=atr,
+            ref_price=float(r["ref_price_ws"])
+            if r.get("ref_price_ws") is not None
+            else float((float(r["L_price"]) + float(r["U_price"])) / 2.0),
+        )
+    return out
 
 
 def _now_ts() -> int:
@@ -26,21 +87,22 @@ def _now_ts() -> int:
 def _default_structural_params() -> StructuralParams:
     from trading_bot.config import settings as st
 
+    w_slack_frac = float(st.STRUCTURAL_W_SLACK_PCT) / 100.0
+    w_slack_abs_min = float(st.STRUCTURAL_W_SLACK_ABS_MIN)
     return StructuralParams(
         min_candidates_per_side=st.STRUCTURAL_MIN_CANDIDATES_PER_SIDE,
         top_k=st.STRUCTURAL_TOP_K,
-        mad_k=st.STRUCTURAL_MAD_K,
-        center_filter_enabled=st.STRUCTURAL_CENTER_FILTER_ENABLED,
-        center_mad_k=st.STRUCTURAL_CENTER_MAD_K,
-        target_align_enabled=st.STRUCTURAL_TARGET_ALIGN_ENABLED,
-        anchor_symbols=tuple(st.STRUCTURAL_ANCHOR_SYMBOLS),
-        target_w_band_k=st.STRUCTURAL_TARGET_W_BAND_K,
-        target_center_weight=st.STRUCTURAL_TARGET_CENTER_WEIGHT,
-        target_width_weight=st.STRUCTURAL_TARGET_WIDTH_WEIGHT,
         min_pool_symbols=st.STRUCTURAL_MIN_POOL_SYMBOLS,
+        n_etalon=st.STRUCTURAL_N_ETALON,
+        w_min=st.STRUCTURAL_W_MIN,
+        w_max=st.STRUCTURAL_W_MAX,
+        w_slack=w_slack_frac,
+        w_slack_abs_min=w_slack_abs_min,
         mid_band_pct=st.STRUCTURAL_MID_BAND_PCT,
-        refine_max_rounds=st.STRUCTURAL_REFINE_MAX_ROUNDS,
+        edge_atr_frac=st.STRUCTURAL_EDGE_ATR_FRAC,
         allowed_level_types=tuple(STRUCTURAL_ALLOWED_LEVEL_TYPES),
+        strength_first_enabled=st.STRUCTURAL_STRENGTH_FIRST_ENABLED,
+        z_w_ok_threshold=st.STRUCTURAL_Z_W_OK_THRESHOLD,
     )
 
 
@@ -48,18 +110,17 @@ def _params_dict(p: StructuralParams) -> Dict[str, Any]:
     return {
         "min_candidates_per_side": p.min_candidates_per_side,
         "top_k": p.top_k,
-        "mad_k": p.mad_k,
-        "center_filter_enabled": p.center_filter_enabled,
-        "center_mad_k": p.center_mad_k,
-        "target_align_enabled": p.target_align_enabled,
-        "anchor_symbols": list(p.anchor_symbols),
-        "target_w_band_k": p.target_w_band_k,
-        "target_center_weight": p.target_center_weight,
-        "target_width_weight": p.target_width_weight,
         "min_pool_symbols": p.min_pool_symbols,
+        "n_etalon": p.n_etalon,
+        "w_min": p.w_min,
+        "w_max": p.w_max,
+        "w_slack": p.w_slack,
+        "w_slack_abs_min": p.w_slack_abs_min,
         "mid_band_pct": p.mid_band_pct,
-        "refine_max_rounds": p.refine_max_rounds,
+        "edge_atr_frac": p.edge_atr_frac,
         "allowed_level_types": list(p.allowed_level_types),
+        "strength_first_enabled": p.strength_first_enabled,
+        "z_w_ok_threshold": p.z_w_ok_threshold,
     }
 
 
@@ -86,6 +147,10 @@ def _insert_event(
             json.dumps(meta, ensure_ascii=False) if meta else None,
         ),
     )
+    try:
+        on_structural_event(cycle_id, event_type, ts, symbol=symbol, price=price, meta=meta)
+    except Exception:
+        logger.exception("structural_ops on_event failed (event still in DB transaction)")
 
 
 def _persist_symbol_rows(cur, cycle_id: str, rows: List[StructuralSymbolResult], now_ts: int) -> None:
@@ -220,7 +285,8 @@ def run_structural_pipeline(
     """
     init_db()
     run_migrations()
-    syms = list(symbols) if symbols is not None else list(TRADING_SYMBOLS)
+    syms_requested = list(symbols) if symbols is not None else list(TRADING_SYMBOLS)
+    syms = syms_requested
     from trading_bot.config import settings as st
 
     do_freeze = st.STRUCTURAL_AUTO_FREEZE_ON_SCAN if auto_freeze is None else bool(auto_freeze)
@@ -228,8 +294,19 @@ def run_structural_pipeline(
 
     now_ts = _now_ts()
     cycle_id = str(uuid.uuid4())
+    stage_started = now_ts
     conn = get_connection()
     cur = conn.cursor()
+    record_stage_event(
+        cur,
+        stage="STRUCTURAL_SCAN",
+        status="started",
+        cycle_id=cycle_id,
+        run_id=cycle_id,
+        message="Structural scan started",
+        details={"symbols_requested": len(syms_requested)},
+        started_at=stage_started,
+    )
 
     ref_by_symbol: Dict[str, float] = {}
     ref_source = "override"
@@ -282,8 +359,33 @@ def run_structural_pipeline(
             ref_source = "mixed_price_feed_db_1m_close"
 
     syms = [s for s in syms if ref_by_symbol.get(s, 0) > 0]
+    if p.min_pool_symbols > len(syms):
+        logger.warning(
+            "STRUCTURAL_MIN_POOL_SYMBOLS (%s) больше числа символов с валидной ref-ценой (%s): "
+            "успешный пул формально недостижим.",
+            p.min_pool_symbols,
+            len(syms),
+        )
     if not syms:
+        record_stage_event(
+            cur,
+            stage="STRUCTURAL_SCAN",
+            status="failed",
+            cycle_id=cycle_id,
+            run_id=cycle_id,
+            severity="error",
+            message="No valid ref prices",
+            details={"ref_source": ref_source, "symbols_requested": len(syms_requested)},
+            started_at=stage_started,
+            finished_at=_now_ts(),
+        )
+        conn.commit()
         conn.close()
+        notify_no_valid_ref_prices(
+            ref_source=ref_source,
+            symbols_requested=len(syms_requested),
+            symbols_with_ref=0,
+        )
         return {
             "error": "no_valid_ref_prices",
             "structural_cycle_id": None,
@@ -301,7 +403,7 @@ def run_structural_pipeline(
         )
         VALUES (?, 'scanning', ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL)
         """,
-        (cycle_id, now_ts, now_ts, json.dumps(_params_dict(p), ensure_ascii=False), p.mad_k),
+        (cycle_id, now_ts, now_ts, json.dumps(_params_dict(p), ensure_ascii=False), p.z_w_ok_threshold),
     )
     _insert_event(cur, cycle_id, "phase_change", now_ts, meta={"to": "scanning"})
 
@@ -319,7 +421,7 @@ def run_structural_pipeline(
             now_ts,
             pool_stats["pool_median_w"],
             pool_stats["pool_mad"],
-            p.mad_k,
+            p.z_w_ok_threshold,
             valid_n,
             cycle_id,
         ),
@@ -334,8 +436,50 @@ def run_structural_pipeline(
         "pool_mad": pool_stats["pool_mad"],
         "pool_median_r": pool_stats.get("pool_median_r", 0.0),
         "pool_mad_r": pool_stats.get("pool_mad_r", 0.0),
+        "w_star": pool_stats.get("w_star", 0.0),
         "ref_price_source": ref_source,
     }
+
+    etalon_failed = bool(pool_stats.get("etalon_failed"))
+    if etalon_failed:
+        cur.execute(
+            """
+            UPDATE structural_cycles
+            SET phase = 'cancelled', updated_at = ?, cancel_reason = ?
+            WHERE id = ?
+            """,
+            (now_ts, "insufficient_etalon", cycle_id),
+        )
+        _insert_event(
+            cur,
+            cycle_id,
+            "phase_change",
+            now_ts,
+            meta={"to": "cancelled", "reason": "insufficient_etalon"},
+        )
+        record_stage_event(
+            cur,
+            stage="STRUCTURAL_SCAN",
+            status="failed",
+            cycle_id=cycle_id,
+            run_id=cycle_id,
+            severity="error",
+            message="Insufficient etalon voters (W in band)",
+            details={"n_etalon": p.n_etalon},
+            started_at=stage_started,
+            finished_at=now_ts,
+        )
+        conn.commit()
+        conn.close()
+        out["phase"] = "cancelled"
+        out["cycle_levels_rows"] = 0
+        out["frozen"] = False
+        if not os.getenv("PYTEST_CURRENT_TEST"):
+            try:
+                export_levels_snapshot(cycle_id, out)
+            except Exception:
+                logger.exception("structural_ops export_levels_snapshot failed")
+        return out
 
     if valid_n < p.min_pool_symbols:
         cur.execute(
@@ -344,20 +488,37 @@ def run_structural_pipeline(
             SET phase = 'cancelled', updated_at = ?, cancel_reason = ?
             WHERE id = ?
             """,
-            (now_ts, "insufficient_pool_after_mad", cycle_id),
+            (now_ts, "insufficient_pool_after_fit", cycle_id),
         )
         _insert_event(
             cur,
             cycle_id,
             "phase_change",
             now_ts,
-            meta={"to": "cancelled", "reason": "insufficient_pool_after_mad"},
+            meta={"to": "cancelled", "reason": "insufficient_pool_after_fit"},
+        )
+        record_stage_event(
+            cur,
+            stage="STRUCTURAL_SCAN",
+            status="failed",
+            cycle_id=cycle_id,
+            run_id=cycle_id,
+            severity="error",
+            message="Insufficient pool after W* fit",
+            details={"symbols_ok": valid_n, "min_pool": p.min_pool_symbols},
+            started_at=stage_started,
+            finished_at=now_ts,
         )
         conn.commit()
         conn.close()
         out["phase"] = "cancelled"
         out["cycle_levels_rows"] = 0
         out["frozen"] = False
+        if not os.getenv("PYTEST_CURRENT_TEST"):
+            try:
+                export_levels_snapshot(cycle_id, out)
+            except Exception:
+                logger.exception("structural_ops export_levels_snapshot failed")
         return out
 
     cur.execute(
@@ -378,13 +539,45 @@ def run_structural_pipeline(
         out["phase"] = "armed"
         out["cycle_levels_rows"] = n_ins
         out["frozen"] = True
+        record_stage_event(
+            cur,
+            stage="STRUCTURAL_FREEZE",
+            status="ok",
+            cycle_id=cycle_id,
+            run_id=cycle_id,
+            message="Cycle levels frozen after scan",
+            details={"cycle_levels_rows": n_ins, "symbols_ok": valid_n},
+            started_at=now_ts,
+            finished_at=now_ts,
+        )
+        if st.OPS_STAGE_SHEETS and not os.getenv("PYTEST_CURRENT_TEST"):
+            try:
+                export_cycle_levels_sheets_snapshot()
+            except Exception:
+                logger.exception("cycle levels sheets snapshot export failed after structural freeze")
     else:
         out["phase"] = "armed"
         out["cycle_levels_rows"] = 0
         out["frozen"] = False
 
+    record_stage_event(
+        cur,
+        stage="STRUCTURAL_SCAN",
+        status="ok",
+        cycle_id=cycle_id,
+        run_id=cycle_id,
+        message="Structural scan completed",
+        details={"symbols_ok": valid_n, "frozen": bool(do_freeze)},
+        started_at=stage_started,
+        finished_at=now_ts,
+    )
     conn.commit()
     conn.close()
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        try:
+            export_levels_snapshot(cycle_id, out)
+        except Exception:
+            logger.exception("structural_ops export_levels_snapshot failed")
     return out
 
 
@@ -432,6 +625,68 @@ def _load_ok_symbol_rows(cur, cycle_id: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _record_group_touch_event_state(
+    cur,
+    *,
+    cycle_id: str,
+    now_ts: int,
+    source: str,
+    symbols: Sequence[str],
+) -> None:
+    cur.execute(
+        """
+        UPDATE trading_state
+        SET last_group_touch_event_ts = ?,
+            last_group_touch_cycle_id = ?,
+            last_group_touch_source = ?,
+            last_group_touch_symbols_json = ?,
+            updated_at = ?
+        WHERE id = 1
+        """,
+        (now_ts, cycle_id, source, json.dumps(sorted(set(symbols)), ensure_ascii=False), now_ts),
+    )
+
+
+def _has_recent_group_touch_in_cycle(cur, *, cycle_id: str, now_ts: int) -> bool:
+    from trading_bot.config import settings as st
+
+    row = cur.execute(
+        """
+        SELECT last_group_touch_event_ts, last_group_touch_cycle_id
+        FROM trading_state
+        WHERE id = 1
+        """
+    ).fetchone()
+    if not row:
+        return False
+    last_ts = row["last_group_touch_event_ts"]
+    last_cycle = row["last_group_touch_cycle_id"]
+    if not last_ts or not last_cycle:
+        return False
+    if str(last_cycle) != cycle_id:
+        return False
+    return (now_ts - int(last_ts)) <= int(st.STRUCTURAL_GROUP_TOUCH_DEDUP_SEC)
+
+
+def _collect_recent_mid_touch_symbols(cur, *, cycle_id: str, now_ts: int) -> List[str]:
+    from trading_bot.config import settings as st
+
+    lookback = int(st.STRUCTURAL_TOUCH_HISTORY_LOOKBACK_SEC)
+    rows = cur.execute(
+        """
+        SELECT DISTINCT symbol
+        FROM structural_events
+        WHERE cycle_id = ?
+          AND event_type = 'mid_touch'
+          AND ts BETWEEN ? AND ?
+          AND symbol IS NOT NULL
+          AND symbol != ''
+        """,
+        (cycle_id, now_ts - lookback, now_ts),
+    ).fetchall()
+    return [str(r["symbol"]) for r in rows]
+
+
 def _next_prices_from_override(
     tick_idx: int, price_ticks_override: Sequence[Mapping[str, PricePoint]]
 ) -> Tuple[Dict[str, PricePoint], int]:
@@ -440,6 +695,76 @@ def _next_prices_from_override(
     snap = price_ticks_override[tick_idx]
     out = {str(k): v for k, v in snap.items()}
     return out, tick_idx + 1
+
+
+def _latest_1m_close(cur, symbol: str) -> Optional[float]:
+    row = cur.execute(
+        """
+        SELECT close FROM ohlcv
+        WHERE symbol = ? AND timeframe = '1m'
+        ORDER BY timestamp DESC LIMIT 1
+        """,
+        (symbol,),
+    ).fetchone()
+    if row is None or row["close"] is None:
+        return None
+    v = float(row["close"])
+    return v if v > 0 else None
+
+
+def _price_map_for_symbols(
+    cur,
+    prices_pp: Mapping[str, PricePoint],
+    symbols: Sequence[str],
+) -> Dict[str, float]:
+    """WS/override цена; если нет — последний 1m close из БД."""
+    out: Dict[str, float] = {}
+    for s in symbols:
+        pp = prices_pp.get(s)
+        if pp is not None and float(pp.price) > 0:
+            out[s] = float(pp.price)
+            continue
+        fb = _latest_1m_close(cur, s)
+        if fb is not None:
+            out[s] = fb
+    return out
+
+
+def _collective_breakout_cancel(
+    cur,
+    *,
+    cycle_id: str,
+    now_ts: int,
+    started_at: int,
+    abort_count: int,
+) -> None:
+    cur.execute(
+        """
+        UPDATE structural_cycles
+        SET phase = 'cancelled', updated_at = ?, cancel_reason = ?
+        WHERE id = ?
+        """,
+        (now_ts, "collective_breakout", cycle_id),
+    )
+    _insert_event(
+        cur,
+        cycle_id,
+        "phase_change",
+        now_ts,
+        meta={"to": "cancelled", "reason": "collective_breakout", "abort_count": abort_count},
+    )
+    record_stage_event(
+        cur,
+        stage="MID_TOUCH_MONITOR",
+        status="failed",
+        cycle_id=cycle_id,
+        run_id=cycle_id,
+        severity="error",
+        message="Collective breakout cancellation",
+        details={"abort_count": abort_count},
+        started_at=started_at,
+        finished_at=now_ts,
+    )
 
 
 def run_structural_realtime_cycle(
@@ -467,6 +792,12 @@ def run_structural_realtime_cycle(
     if not cycle_id or base.get("phase") != "armed":
         base["frozen"] = False
         base["mode"] = "realtime"
+        if cycle_id:
+            if not os.getenv("PYTEST_CURRENT_TEST"):
+                try:
+                    export_levels_snapshot(cycle_id, base)
+                except Exception:
+                    logger.exception("structural_ops export_levels_snapshot failed")
         return base
 
     init_db()
@@ -477,6 +808,16 @@ def run_structural_realtime_cycle(
     cur.execute(
         "UPDATE structural_cycles SET phase = 'touch_window', updated_at = ? WHERE id = ?",
         (now_ts, cycle_id),
+    )
+    record_stage_event(
+        cur,
+        stage="MID_TOUCH_MONITOR",
+        status="started",
+        cycle_id=cycle_id,
+        run_id=cycle_id,
+        message="Realtime touch window started",
+        details={"symbols": len(base.get("symbols_ok") or []) if isinstance(base.get("symbols_ok"), list) else base.get("symbols_ok")},
+        started_at=now_ts,
     )
     _insert_event(cur, cycle_id, "phase_change", now_ts, meta={"to": "touch_window"})
     conn.commit()
@@ -494,20 +835,52 @@ def run_structural_realtime_cycle(
             _now_ts(),
             meta={"to": "cancelled", "reason": "no_ok_rows_for_touch_window"},
         )
+        record_stage_event(
+            cur,
+            stage="MID_TOUCH_MONITOR",
+            status="failed",
+            cycle_id=cycle_id,
+            run_id=cycle_id,
+            severity="error",
+            message="No ok rows for touch window",
+            started_at=now_ts,
+            finished_at=_now_ts(),
+        )
         conn.commit()
         conn.close()
         base.update({"phase": "cancelled", "frozen": False, "mode": "realtime"})
+        if not os.getenv("PYTEST_CURRENT_TEST"):
+            try:
+                export_levels_snapshot(cycle_id, base)
+            except Exception:
+                logger.exception("structural_ops export_levels_snapshot failed")
         return base
 
     feed = get_price_feed()
     syms = [r["symbol"] for r in rows]
-    touch_times: Dict[str, int] = {}
-    last_touch_emit_ts: Dict[str, int] = {}
+    if price_ticks_override is None:
+        feed.start_ws(syms)
+    pairs_map = _rows_to_symbol_pairs([dict(r) for r in rows])
     touch_started_at: Optional[int] = None
     entry_timer_until: Optional[int] = None
     tick_idx = 0
     started_at = _now_ts()
     timed_out = False
+    w_star_b = base.get("w_star")
+    scycle = StructuralCycle(
+        cycle_id=str(cycle_id),
+        start_time=float(started_at),
+        phase="touch_window",
+        w_star=float(w_star_b) if w_star_b is not None else None,
+        symbols_map=pairs_map,
+        trigger_state={},
+        trigger_count={},
+        last_trigger_time=None,
+        current_direction=None,
+        trigger_fired=False,
+        last_change_time=None,
+    )
+    bootstrapped = False
 
     while True:
         now_ts = _now_ts()
@@ -524,37 +897,33 @@ def run_structural_realtime_cycle(
         else:
             prices = feed.get_prices(syms)
 
-        abort_syms: set[str] = set()
-        for r in rows:
-            s = r["symbol"]
-            pp = prices.get(s)
-            if pp is None:
-                continue
-            px = float(pp.price)
-            if r["mid_band_low"] <= px <= r["mid_band_high"]:
-                prev_emit = last_touch_emit_ts.get(s, 0)
-                if now_ts - prev_emit >= int(st.STRUCTURAL_TOUCH_DEBOUNCE_SEC):
-                    touch_times[s] = now_ts
-                    last_touch_emit_ts[s] = now_ts
-                    _insert_event(cur, cycle_id, "mid_touch", now_ts, symbol=s, price=px)
-            lower_abort = r["L_price"] - float(st.STRUCTURAL_ABORT_DIST_ATR) * r["atr"]
-            upper_abort = r["U_price"] + float(st.STRUCTURAL_ABORT_DIST_ATR) * r["atr"]
-            if px <= lower_abort:
-                abort_syms.add(s)
-                _insert_event(cur, cycle_id, "breakout_lower", now_ts, symbol=s, price=px)
-            elif px >= upper_abort:
-                abort_syms.add(s)
-                _insert_event(cur, cycle_id, "breakout_upper", now_ts, symbol=s, price=px)
+        price_map = _price_map_for_symbols(cur, prices, syms)
 
-        if touch_started_at is None:
-            touch_times = {
-                s: ts
-                for s, ts in touch_times.items()
-                if now_ts - ts <= int(st.STRUCTURAL_TOUCH_WINDOW_SEC)
-            }
-            if len(touch_times) >= int(st.STRUCTURAL_N_TOUCH):
+        if not bootstrapped:
+            compute_initial_zones(
+                scycle,
+                price_map,
+                edge_atr_frac=float(st.STRUCTURAL_EDGE_ATR_FRAC),
+                now_ts=float(now_ts),
+            )
+            bootstrapped = True
+            if not scycle.trigger_fired and fire_if_enough_in_mid(
+                scycle, price_map, now_ts=float(now_ts)
+            ):
+                signal_structural_ready(cur, structural_cycle_id=str(cycle_id), direction="both")
+                scycle.phase = "ready_to_enter"
+                scycle.trigger_fired = True
+                scycle.last_trigger_time = float(now_ts)
+                touch_syms = [s for s in pairs_map if scycle.trigger_state.get(s) == "mid"]
                 touch_started_at = now_ts
                 entry_timer_until = now_ts + int(st.STRUCTURAL_ENTRY_TIMER_SEC)
+                _record_group_touch_event_state(
+                    cur,
+                    cycle_id=cycle_id,
+                    now_ts=now_ts,
+                    source="initial_mid_cluster",
+                    symbols=touch_syms,
+                )
                 cur.execute(
                     """
                     UPDATE structural_cycles
@@ -568,30 +937,156 @@ def run_structural_realtime_cycle(
                     cycle_id,
                     "phase_change",
                     now_ts,
-                    meta={"to": "entry_timer", "touch_count": len(touch_times)},
+                    meta={
+                        "to": "entry_timer",
+                        "source": "initial_mid_cluster",
+                        "touch_count": len(touch_syms),
+                        "touch_symbols": sorted(touch_syms),
+                    },
                 )
+                for s in touch_syms:
+                    px = price_map.get(s)
+                    if px is not None:
+                        _insert_event(cur, cycle_id, "mid_touch", now_ts, symbol=s, price=float(px))
                 conn.commit()
-        else:
-            if len(abort_syms) >= int(st.STRUCTURAL_N_ABORT):
+                if price_ticks_override is None:
+                    time.sleep(max(0.1, float(st.STRUCTURAL_POLL_SEC)))
+                continue
+
+        bdist = float(st.STRUCTURAL_ABORT_DIST_ATR)
+        broken_syms = symbols_past_breakout_threshold(
+            pairs_map, price_map, breakout_atr_frac=bdist
+        )
+        for s in broken_syms:
+            px = price_map.get(s)
+            if px is None:
+                continue
+            pair = pairs_map.get(s)
+            if pair is None:
+                continue
+            lp = pair.level_below.price
+            up = pair.level_above.price
+            dist = bdist * pair.atr
+            if float(px) <= lp - dist:
+                _insert_event(cur, cycle_id, "breakout_lower", now_ts, symbol=s, price=px)
+            else:
+                _insert_event(cur, cycle_id, "breakout_upper", now_ts, symbol=s, price=px)
+
+        if check_breakout(pairs_map, price_map, breakout_atr_frac=bdist):
+            logger.info(
+                "Структурный пробой: %s монет за пределами канала (порог отмены %s), цикл отменён",
+                len(broken_syms),
+                int(st.STRUCTURAL_N_ABORT),
+            )
+            _collective_breakout_cancel(
+                cur,
+                cycle_id=cycle_id,
+                now_ts=now_ts,
+                started_at=started_at,
+                abort_count=len(broken_syms),
+            )
+            conn.commit()
+            conn.close()
+            base.update({"phase": "cancelled", "frozen": False, "mode": "realtime"})
+            if not os.getenv("PYTEST_CURRENT_TEST"):
+                try:
+                    export_levels_snapshot(cycle_id, base)
+                except Exception:
+                    logger.exception("structural_ops export_levels_snapshot failed")
+            return base
+
+        if touch_started_at is None:
+            if not _has_recent_group_touch_in_cycle(cur, cycle_id=cycle_id, now_ts=now_ts):
+                touched_syms = _collect_recent_mid_touch_symbols(cur, cycle_id=cycle_id, now_ts=now_ts)
+                history_min_n = int(st.STRUCTURAL_TOUCH_HISTORY_MIN_SYMBOLS)
+                if len(touched_syms) >= history_min_n:
+                    signal_structural_ready(cur, structural_cycle_id=str(cycle_id), direction="both")
+                    scycle.phase = "ready_to_enter"
+                    scycle.trigger_fired = True
+                    scycle.last_trigger_time = float(now_ts)
+                    touch_started_at = now_ts
+                    entry_timer_until = now_ts + int(st.STRUCTURAL_ENTRY_TIMER_SEC)
+                    _record_group_touch_event_state(
+                        cur,
+                        cycle_id=cycle_id,
+                        now_ts=now_ts,
+                        source="history_recovered",
+                        symbols=touched_syms,
+                    )
+                    cur.execute(
+                        """
+                        UPDATE structural_cycles
+                        SET phase = 'entry_timer', touch_started_at = ?, entry_timer_until = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (touch_started_at, entry_timer_until, now_ts, cycle_id),
+                    )
+                    _insert_event(
+                        cur,
+                        cycle_id,
+                        "phase_change",
+                        now_ts,
+                        meta={
+                            "to": "entry_timer",
+                            "source": "history_recovered",
+                            "touch_count": len(touched_syms),
+                            "touch_symbols": sorted(touched_syms),
+                        },
+                    )
+                    conn.commit()
+                    continue
+
+            triggered, _zone, transitioned = update_trigger_counts(
+                scycle,
+                price_map,
+                now_ts=float(now_ts),
+                edge_atr_frac=float(st.STRUCTURAL_EDGE_ATR_FRAC),
+            )
+            cluster_mid = fire_if_enough_in_mid(scycle, price_map, now_ts=float(now_ts))
+            group_ready = bool(triggered or cluster_mid)
+
+            for s in transitioned:
+                px = price_map.get(s)
+                _insert_event(cur, cycle_id, "mid_touch", now_ts, symbol=s, price=px)
+            if cluster_mid and not triggered:
+                for s in pairs_map:
+                    if scycle.trigger_state.get(s) != "mid":
+                        continue
+                    px = price_map.get(s)
+                    if px is None:
+                        continue
+                    _insert_event(cur, cycle_id, "mid_touch", now_ts, symbol=s, price=float(px))
+
+            if group_ready:
+                signal_structural_ready(cur, structural_cycle_id=str(cycle_id), direction="both")
+                scycle.phase = "ready_to_enter"
+                touch_syms = [s for s in pairs_map if scycle.trigger_state.get(s) == "mid"]
+                touch_started_at = now_ts
+                entry_timer_until = now_ts + int(st.STRUCTURAL_ENTRY_TIMER_SEC)
+                _record_group_touch_event_state(
+                    cur,
+                    cycle_id=cycle_id,
+                    now_ts=now_ts,
+                    source="online",
+                    symbols=touch_syms,
+                )
                 cur.execute(
                     """
                     UPDATE structural_cycles
-                    SET phase = 'cancelled', updated_at = ?, cancel_reason = ?
+                    SET phase = 'entry_timer', touch_started_at = ?, entry_timer_until = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (now_ts, "collective_breakout", cycle_id),
+                    (touch_started_at, entry_timer_until, now_ts, cycle_id),
                 )
                 _insert_event(
                     cur,
                     cycle_id,
                     "phase_change",
                     now_ts,
-                    meta={"to": "cancelled", "reason": "collective_breakout", "abort_count": len(abort_syms)},
+                    meta={"to": "entry_timer", "touch_count": len(touch_syms)},
                 )
                 conn.commit()
-                conn.close()
-                base.update({"phase": "cancelled", "frozen": False, "mode": "realtime"})
-                return base
+        else:
             if entry_timer_until is not None and now_ts >= entry_timer_until:
                 break
 
@@ -610,9 +1105,25 @@ def run_structural_realtime_cycle(
             _now_ts(),
             meta={"to": "cancelled", "reason": "touch_window_timeout"},
         )
+        record_stage_event(
+            cur,
+            stage="MID_TOUCH_MONITOR",
+            status="failed",
+            cycle_id=cycle_id,
+            run_id=cycle_id,
+            severity="error",
+            message="Touch window timeout",
+            started_at=started_at,
+            finished_at=_now_ts(),
+        )
         conn.commit()
         conn.close()
         base.update({"phase": "cancelled", "frozen": False, "mode": "realtime"})
+        if not os.getenv("PYTEST_CURRENT_TEST"):
+            try:
+                export_levels_snapshot(cycle_id, base)
+            except Exception:
+                logger.exception("structural_ops export_levels_snapshot failed")
         return base
 
     now_ts = _now_ts()
@@ -651,8 +1162,39 @@ def run_structural_realtime_cycle(
             )
         frozen_rows = _freeze_cycle_levels(cur, cycle_id, persisted, now_ts, "structural_snapshot")
         _insert_event(cur, cycle_id, "phase_change", now_ts, meta={"action": "freeze", "cycle_levels_rows": frozen_rows})
+        record_stage_event(
+            cur,
+            stage="STRUCTURAL_FREEZE",
+            status="ok",
+            cycle_id=cycle_id,
+            run_id=cycle_id,
+            message="Realtime freeze completed",
+            details={"cycle_levels_rows": frozen_rows},
+            started_at=now_ts,
+            finished_at=now_ts,
+        )
+        if st.OPS_STAGE_SHEETS and not os.getenv("PYTEST_CURRENT_TEST"):
+            try:
+                export_cycle_levels_sheets_snapshot()
+            except Exception:
+                logger.exception("cycle levels sheets snapshot export failed after realtime freeze")
 
+    record_stage_event(
+        cur,
+        stage="MID_TOUCH_MONITOR",
+        status="ok",
+        cycle_id=cycle_id,
+        run_id=cycle_id,
+        message="Touch window completed",
+        started_at=started_at,
+        finished_at=now_ts,
+    )
     conn.commit()
     conn.close()
     base.update({"phase": "armed", "frozen": bool(force_freeze), "cycle_levels_rows": frozen_rows, "mode": "realtime"})
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        try:
+            export_levels_snapshot(cycle_id, base)
+        except Exception:
+            logger.exception("structural_ops export_levels_snapshot failed")
     return base

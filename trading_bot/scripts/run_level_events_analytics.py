@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Пересчёт level_events. Режим: LEVEL_EVENTS_SCOPE=all (vp_local) или active_cycle (только cycle_levels)."""
+
 import logging
 
 from trading_bot.analytics.level_events import build_level_events

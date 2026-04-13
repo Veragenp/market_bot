@@ -175,7 +175,7 @@ def run_human_levels_and_save(
     *,
     layer: Optional[str] = None,
     now_ts: Optional[int] = None,
-    atr_period: int = 14,
+    atr_d1: Optional[float] = None,
     cluster_atr_mult: float = DEFAULT_CLUSTER_ATR_MULT,
     min_fractal_count: Optional[int] = None,
     min_strength: Optional[float] = None,
@@ -183,6 +183,7 @@ def run_human_levels_and_save(
 ) -> HumanLevelsResult:
     """
     Пайплайн human_levels + сохранение в БД.
+    `atr_d1` — Gerchik из `instruments.atr`, если передан; иначе тот же Gerchik по хвосту df_d1.
     Окно t_start/t_end — по min/max timestamp среди D1 и W1 (если есть колонка).
     Перед сохранением зоны фильтруются по HUMAN_LEVELS_MIN_* из settings,
     если не переданы явные min_fractal_count / min_strength.
@@ -192,7 +193,7 @@ def run_human_levels_and_save(
     result = run_human_levels_pipeline(
         df_d1,
         df_w1,
-        atr_period=atr_period,
+        atr_d1=atr_d1,
         cluster_atr_mult=cluster_atr_mult,
         zone_min_gap_atr_d1=zgap,
     )

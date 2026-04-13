@@ -11,8 +11,11 @@
       используется календарный месяц `DYNAMIC_ZONES_YEAR` / `DYNAMIC_ZONES_MONTH`
       (fallback как в `export_to_sheets.py`).
 
+Планировщик: `VP_LOCAL_REBUILD_INTERVAL_HOURS` (по умолчанию 4) в `trading_bot.config.settings`.
+Пустой find_pro_levels: при `VP_LOCAL_CLEAR_ON_EMPTY_REBUILD=1` активные vp_local по символу архивируются.
+
 Сохранение в БД:
-  - `price_levels.level_type` = `volume_profile_peaks` (фиксировано)
+  - `price_levels.level_type` = `vp_local` / `volume_profile_peaks` (константа в коде)
   - `price_levels.is_active`:
       перед вставкой новых строк деактивируем старые активные записи этого `symbol`+`level_type`
       (история остается).
@@ -23,6 +26,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +63,7 @@ from config import (
     PRO_LEVELS_SOFT_FINAL_MERGE_PCT,
     PRO_LEVELS_EXCLUDE_RESERVED_PCT,
     PRO_LEVELS_WEAK_MIN_DURATION,
+    VP_LOCAL_CLEAR_ON_EMPTY_REBUILD,
 )
 from trading_bot.analytics.dynamic_accumulation_zones import slice_calendar_month_utc
 from trading_bot.analytics.vp_ohlc_source import select_vp_ohlcv_dataframe
@@ -69,6 +74,51 @@ from trading_bot.data.volume_profile_peaks_db import (
     LEVEL_TYPE_VOLUME_PROFILE_PEAKS,
     save_volume_profile_peaks_levels_to_db,
 )
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    return int(raw)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    return float(raw)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _active_vp_local_count(symbol: str) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    row = cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM price_levels
+        WHERE symbol = ? AND level_type = ? AND is_active = 1 AND status = 'active'
+        """,
+        (symbol, LEVEL_TYPE_VOLUME_PROFILE_PEAKS),
+    ).fetchone()
+    conn.close()
+    return int(row[0] if row else 0)
+
+
+def _build_params(work: pd.DataFrame, symbol: str, overrides: dict | None = None) -> dict:
+    common = _compute_find_pro_params(work, symbol)
+    if overrides:
+        for key, value in overrides.items():
+            if value is not None:
+                common[key] = value
+    return common
 
 
 def _default_prev_calendar_month_utc() -> tuple[int, int]:
@@ -249,9 +299,16 @@ def _compute_find_pro_params(work: pd.DataFrame, symbol: str) -> dict:
     }
 
 
-def main() -> None:
-    init_db()
-
+def _run_for_symbols(
+    symbols: list[str],
+    *,
+    min_levels_per_symbol: int,
+    pass_name: str,
+    param_overrides: dict | None = None,
+    archive_on_empty: bool,
+    keep_if_worse: bool = False,
+    append_only: bool = False,
+) -> list[str]:
     lookback_days = PRO_LEVELS_LOOKBACK_DAYS
     lookback_hours = PRO_LEVELS_LOOKBACK_HOURS
     use_lookback = (lookback_days is not None) or (lookback_hours is not None)
@@ -264,7 +321,7 @@ def main() -> None:
         year, month = _default_prev_calendar_month_utc()
         lookback_seconds = None
 
-    for symbol in TRADING_SYMBOLS:
+    for symbol in symbols:
         if use_lookback:
             end_ts = _get_last_ts_1m(symbol)
             if end_ts is None:
@@ -297,10 +354,36 @@ def main() -> None:
         df_vp, tf_used, vp_diag = select_vp_ohlcv_dataframe(df)
         layer = f"{base_layer}_5mrs" if tf_used == "5m" else base_layer
 
-        common = _compute_find_pro_params(df_vp, symbol)
+        common = _build_params(df_vp, symbol, overrides=param_overrides)
         final_levels = find_pro_levels(df_vp, symbol=symbol, **common)
         if final_levels is None or final_levels.empty:
-            print(f"SKIP {symbol}: find_pro_levels() returned no levels")
+            if archive_on_empty and VP_LOCAL_CLEAR_ON_EMPTY_REBUILD:
+                save_volume_profile_peaks_levels_to_db(
+                    symbol,
+                    pd.DataFrame(),
+                    layer=f"{layer}_no_levels",
+                    level_type=LEVEL_TYPE_VOLUME_PROFILE_PEAKS,
+                    timeframe=tf_used,
+                    archive_active_when_empty=True,
+                )
+                print(
+                    f"SKIP {symbol}: find_pro_levels() empty — активные vp_local сняты "
+                    f"(VP_LOCAL_CLEAR_ON_EMPTY_REBUILD)"
+                )
+            else:
+                print(
+                    f"SKIP {symbol}: find_pro_levels() empty — активные vp_local не трогаем "
+                    f"({pass_name})"
+                )
+            continue
+
+        old_count = _active_vp_local_count(symbol)
+        new_count = len(final_levels)
+        if keep_if_worse and old_count > 0 and new_count < old_count:
+            print(
+                f"SKIP {symbol}: keep previous vp_local (old={old_count} > new={new_count}) "
+                f"({pass_name})"
+            )
             continue
 
         save_volume_profile_peaks_levels_to_db(
@@ -309,15 +392,86 @@ def main() -> None:
             layer=layer,
             level_type=LEVEL_TYPE_VOLUME_PROFILE_PEAKS,
             timeframe=tf_used,
+            append_only=append_only,
         )
 
         src = vp_diag.get("vp_source", "")
         q1 = vp_diag.get("quality_1m") or {}
         print(
-            f"OK: {symbol} layer={layer} tf={tf_used} vp_src={src} "
+            f"OK[{pass_name}]: {symbol} layer={layer} tf={tf_used} vp_src={src} "
             f"1m_flat={q1.get('flat_frac')} 1m_mrng={q1.get('median_rel_range')} "
             f"final={0 if final_levels is None else len(final_levels)}"
         )
+
+    low_symbols: list[str] = []
+    for symbol in symbols:
+        cnt = _active_vp_local_count(symbol)
+        if cnt < min_levels_per_symbol:
+            low_symbols.append(symbol)
+    return low_symbols
+
+
+def main() -> None:
+    init_db()
+    min_levels = _env_int("VP_LOCAL_MIN_LEVELS_PER_SYMBOL", 4)
+    run_refine_passes = _env_bool("VP_LOCAL_ENABLE_REFINE_PASSES", True)
+
+    symbols = list(TRADING_SYMBOLS)
+    print(f"VP_LOCAL pass#1 (base) symbols={len(symbols)} min_levels={min_levels}")
+    low = _run_for_symbols(
+        symbols,
+        min_levels_per_symbol=min_levels,
+        pass_name="base",
+        param_overrides=None,
+        archive_on_empty=not run_refine_passes,
+    )
+    print(f"VP_LOCAL after pass#1: below_min={len(low)}")
+
+    if not run_refine_passes or not low:
+        return
+
+    pass2_overrides = {
+        "max_levels": _env_int("VP_LOCAL_REFINE_PASS2_MAX_LEVELS", 28),
+        "final_merge_pct": _env_float("VP_LOCAL_REFINE_PASS2_FINAL_MERGE_PCT", 0.0015),
+        "enable_valley_merge": _env_bool("VP_LOCAL_REFINE_PASS2_ENABLE_VALLEY_MERGE", False),
+        "exclude_reserved_pct": _env_float("VP_LOCAL_REFINE_PASS2_EXCLUDE_RESERVED_PCT", 0.0),
+        "run_soft_pass": _env_bool("VP_LOCAL_REFINE_PASS2_RUN_SOFT_PASS", True),
+    }
+    print(f"VP_LOCAL pass#2 (refine-soft) symbols={len(low)}")
+    low = _run_for_symbols(
+        low,
+        min_levels_per_symbol=min_levels,
+        pass_name="refine_soft",
+        param_overrides=pass2_overrides,
+        archive_on_empty=False,
+        keep_if_worse=True,
+        append_only=True,
+    )
+    print(f"VP_LOCAL after pass#2: below_min={len(low)}")
+    if not low:
+        return
+
+    pass3_overrides = {
+        "max_levels": _env_int("VP_LOCAL_REFINE_PASS3_MAX_LEVELS", 40),
+        "final_merge_pct": _env_float("VP_LOCAL_REFINE_PASS3_FINAL_MERGE_PCT", 0.0010),
+        "enable_valley_merge": _env_bool("VP_LOCAL_REFINE_PASS3_ENABLE_VALLEY_MERGE", False),
+        "exclude_reserved_pct": _env_float("VP_LOCAL_REFINE_PASS3_EXCLUDE_RESERVED_PCT", 0.0),
+        "run_soft_pass": _env_bool("VP_LOCAL_REFINE_PASS3_RUN_SOFT_PASS", True),
+        "distance_pct": _env_float("VP_LOCAL_REFINE_PASS3_DISTANCE_PCT", 0.20),
+    }
+    print(f"VP_LOCAL pass#3 (refine-ultra) symbols={len(low)}")
+    low = _run_for_symbols(
+        low,
+        min_levels_per_symbol=min_levels,
+        pass_name="refine_ultra",
+        param_overrides=pass3_overrides,
+        archive_on_empty=False,
+        keep_if_worse=True,
+        append_only=True,
+    )
+    print(f"VP_LOCAL after pass#3: below_min={len(low)}")
+    if low:
+        print("VP_LOCAL unresolved symbols:", ",".join(low))
 
 
 if __name__ == "__main__":

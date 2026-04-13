@@ -1,10 +1,17 @@
-"""ATR: вариант в стиле Герчика (размах H−L, сортировка, отброс min/max) и классический SMA(TR)."""
+"""
+ATR для торгового контура: **только стиль Герчика** (см. ниже) — единственное определение, которое
+пишется в `instruments.atr` (ежедневно из `DataLoaderManager.update_instruments_atr_for_trading_symbols`)
+и читается из БД во всех модулях (cycle_levels, VP, level_events, human levels batch и т.д.).
+
+Функции `true_range_*` / `atr_sma_*` оставлены как вспомогательные (тесты, внешние сравнения);
+**не используйте их** для заполнения `instruments` или для масштабов уровней в боте.
+"""
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-# Для ATR в `instruments` и экспорта: всегда ровно последние 10 дневных свечей (не параметризуется).
+# Для ATR в `instruments`: ровно последние 10 дневных свечей (не параметризуется).
 GERCHIK_ATR_BARS = 10
 
 

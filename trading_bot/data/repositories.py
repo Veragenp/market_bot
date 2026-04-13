@@ -47,6 +47,27 @@ def save_ohlcv(symbol: str, timeframe: str, records: List[Dict[str, Any]]) -> No
     conn.close()
 
 
+def get_instruments_atr_bybit_futures_cur(cursor, symbol_internal: str) -> Optional[float]:
+    """
+    Дневной ATR из `instruments.atr` (bybit_futures): тот же Gerchik, что считает daily job.
+    Не пересчитывает — только чтение из БД.
+    """
+    for sym in (symbol_internal.replace("/", ""), symbol_internal):
+        row = cursor.execute(
+            """
+            SELECT atr FROM instruments
+            WHERE symbol = ? AND exchange = 'bybit_futures'
+            LIMIT 1
+            """,
+            (sym,),
+        ).fetchone()
+        if row is not None and row["atr"] is not None:
+            v = float(row["atr"])
+            if v > 0:
+                return v
+    return None
+
+
 def get_ohlcv(
     symbol: str,
     timeframe: str,
@@ -55,6 +76,8 @@ def get_ohlcv(
     limit: Optional[int] = None,
     source: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    """Ряд по возрастанию времени. Если задан только `limit` без `start`/`end`, это **первые**
+    (самые ранние) `limit` баров; для хвоста истории см. `get_ohlcv_tail`."""
     _ensure_db()
     conn = get_connection()
     cursor = conn.cursor()
@@ -79,6 +102,40 @@ def get_ohlcv(
         params.append(limit)
     cursor.execute(query, params)
     rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_ohlcv_tail(
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    source: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Последние `limit` баров по времени, в порядке возрастания timestamp.
+
+    В отличие от `get_ohlcv(..., limit=n)` без start/end (который отрезает **начало** истории),
+    здесь берётся хвост ряда — нужно для ATR и любых индикаторов «по последним N свечам».
+    """
+    if limit < 1:
+        return []
+    _ensure_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+    query = """
+        SELECT timestamp, open, high, low, close, volume
+        FROM ohlcv
+        WHERE symbol = ? AND timeframe = ?
+    """
+    params: List[Any] = [symbol, timeframe]
+    if source is not None:
+        query += " AND ifnull(source, '') = ?"
+        params.append(source)
+    query += " ORDER BY timestamp DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, params)
+    rows = list(reversed(cursor.fetchall()))
     conn.close()
     return [dict(row) for row in rows]
 

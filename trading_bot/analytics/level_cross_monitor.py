@@ -1,0 +1,431 @@
+"""
+Монитор пересечений уровней LONG/SHORT по логике tutorial_v3/traiding_monitor.py.
+
+Источник уровней: замороженные строки `cycle_levels` + `trading_state` (без изменений structural).
+Групповой порог: число уникальных монет с алертом за окно (len(long_alerts) == MIN_ALERTS_COUNT
+для старта окна), затем ожидание ALERT_TIMEOUT_MINUTES; отмена при избытке символов в окне.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+
+def _utc_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+from typing import Any, Dict, List, Optional, Tuple
+
+from trading_bot.config import settings as st
+from trading_bot.tools.telegram_notify import escape_html_telegram, get_telegram_notifier
+
+logger = logging.getLogger(__name__)
+
+
+def load_cycle_level_pairs(cur, cycle_id: str) -> Dict[str, Dict[str, float]]:
+    rows = cur.execute(
+        """
+        SELECT symbol, direction, level_price
+        FROM cycle_levels
+        WHERE cycle_id = ? AND is_active = 1 AND level_step = 1
+        """,
+        (cycle_id,),
+    ).fetchall()
+    out: Dict[str, Dict[str, float]] = {}
+    for r in rows:
+        sym = str(r["symbol"])
+        d = str(r["direction"])
+        out.setdefault(sym, {})[d] = float(r["level_price"])
+    return {k: v for k, v in out.items() if "long" in v and "short" in v}
+
+
+def _log_v3_event(
+    cur,
+    *,
+    cycle_id: str,
+    structural_cycle_id: Optional[str],
+    event_type: str,
+    symbol: Optional[str],
+    price: Optional[float],
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    ts = int(time.time())
+    cur.execute(
+        """
+        INSERT INTO entry_detector_events (
+            ts, cycle_id, structural_cycle_id, symbol, event_type,
+            price, long_level_price, short_level_price, atr_used,
+            distance_to_long_atr, distance_to_short_atr, meta_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?)
+        """,
+        (
+            ts,
+            cycle_id,
+            structural_cycle_id,
+            symbol or "",
+            event_type,
+            price,
+            json.dumps(meta, ensure_ascii=False) if meta else None,
+        ),
+    )
+
+
+@dataclass
+class LevelCrossMonitor:
+    """Состояние цикла мониторинга (как TradingMonitor; in-memory)."""
+
+    levels: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    cycle_id: str = ""
+    structural_cycle_id: Optional[str] = None
+    prev_prices: Dict[str, Optional[float]] = field(default_factory=dict)
+    alerted: Dict[str, Dict[str, bool]] = field(default_factory=dict)
+    alerts_history: List[Dict[str, Any]] = field(default_factory=list)
+    last_alert_count: int = 0
+    long_alerts: Dict[str, List[datetime]] = field(default_factory=dict)
+    short_alerts: Dict[str, List[datetime]] = field(default_factory=dict)
+    long_window_start: Optional[datetime] = None
+    short_window_start: Optional[datetime] = None
+
+    def reset(self) -> None:
+        self.cycle_id = ""
+        self.structural_cycle_id = None
+        self.levels.clear()
+        self.prev_prices.clear()
+        self.alerted.clear()
+        self.alerts_history.clear()
+        self.last_alert_count = 0
+        self.long_alerts.clear()
+        self.short_alerts.clear()
+        self.long_window_start = None
+        self.short_window_start = None
+
+    def sync_cycle(
+        self,
+        cur,
+        *,
+        cycle_id: str,
+        structural_cycle_id: Optional[str],
+        levels: Dict[str, Dict[str, float]],
+    ) -> None:
+        if cycle_id != self.cycle_id:
+            self.reset()
+            self.cycle_id = cycle_id
+            self.structural_cycle_id = structural_cycle_id
+            self.levels = dict(levels)
+            for sym in self.levels:
+                self.prev_prices[sym] = None
+                self.alerted[sym] = {"long": False, "short": False}
+            logger.info("LevelCrossMonitor: new cycle_id=%s symbols=%s", cycle_id, len(self.levels))
+        else:
+            self.levels = dict(levels)
+            self.structural_cycle_id = structural_cycle_id
+            for sym in self.levels:
+                if sym not in self.prev_prices:
+                    self.prev_prices[sym] = None
+                self.alerted.setdefault(sym, {"long": False, "short": False})
+
+    def get_alerted_status(self, symbol: str, signal_type: str) -> bool:
+        return self.alerted.get(symbol, {}).get(signal_type.lower(), False)
+
+    def check_levels(
+        self,
+        cur,
+        *,
+        symbol: str,
+        current_price: float,
+        allow_long: bool,
+        allow_short: bool,
+    ) -> None:
+        levels = self.levels.get(symbol, {})
+        long_level = levels.get("long")
+        short_level = levels.get("short")
+
+        if self.prev_prices.get(symbol) is None:
+            self.prev_prices[symbol] = current_price
+            return
+
+        prev = float(self.prev_prices[symbol])
+        timestamp = _utc_naive()
+
+        if allow_long and long_level is not None and not self.alerted[symbol]["long"]:
+            if prev > long_level and current_price <= long_level:
+                msg = f"Пересечение уровня LONG для {symbol}: цена {current_price} <= {long_level}"
+                logger.info("%s", msg)
+                self.alerts_history.append(
+                    {
+                        "symbol": symbol,
+                        "type": "LONG",
+                        "price": current_price,
+                        "level": long_level,
+                        "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                )
+                _log_v3_event(
+                    cur,
+                    cycle_id=self.cycle_id,
+                    structural_cycle_id=self.structural_cycle_id,
+                    event_type="v3_cross_long",
+                    symbol=symbol,
+                    price=current_price,
+                    meta={"level": long_level, "prev": prev},
+                )
+                self.alerted[symbol]["long"] = True
+                if st.LEVEL_CROSS_TELEGRAM and st.LEVEL_CROSS_TELEGRAM_CROSSINGS:
+                    get_telegram_notifier().send_message(
+                        f"<pre>{escape_html_telegram(msg)}</pre>",
+                        parse_mode="HTML",
+                    )
+        elif (
+            not allow_long
+            and long_level is not None
+            and prev > long_level
+            and current_price <= long_level
+        ):
+            logger.info("LONG cross %s ignored: allow_long_entry=False", symbol)
+
+        if allow_short and short_level is not None and not self.alerted[symbol]["short"]:
+            if prev < short_level and current_price >= short_level:
+                msg = f"Пересечение уровня SHORT для {symbol}: цена {current_price} >= {short_level}"
+                logger.info("%s", msg)
+                self.alerts_history.append(
+                    {
+                        "symbol": symbol,
+                        "type": "SHORT",
+                        "price": current_price,
+                        "level": short_level,
+                        "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                )
+                _log_v3_event(
+                    cur,
+                    cycle_id=self.cycle_id,
+                    structural_cycle_id=self.structural_cycle_id,
+                    event_type="v3_cross_short",
+                    symbol=symbol,
+                    price=current_price,
+                    meta={"level": short_level, "prev": prev},
+                )
+                self.alerted[symbol]["short"] = True
+                if st.LEVEL_CROSS_TELEGRAM and st.LEVEL_CROSS_TELEGRAM_CROSSINGS:
+                    get_telegram_notifier().send_message(
+                        f"<pre>{escape_html_telegram(msg)}</pre>",
+                        parse_mode="HTML",
+                    )
+        elif (
+            not allow_short
+            and short_level is not None
+            and prev < short_level
+            and current_price >= short_level
+        ):
+            logger.info("SHORT cross %s ignored: allow_short_entry=False", symbol)
+
+        self.prev_prices[symbol] = current_price
+
+    def process_alerts(self) -> None:
+        current_alert_count = len(self.alerts_history)
+        if current_alert_count <= self.last_alert_count:
+            return
+        new_alerts = self.alerts_history[self.last_alert_count : current_alert_count]
+        min_n = int(st.LEVEL_CROSS_MIN_ALERTS_COUNT)
+        for alert in new_alerts:
+            symbol = alert["symbol"]
+            alert_type = alert["type"]
+            timestamp = datetime.strptime(alert["timestamp"], "%Y-%m-%d %H:%M:%S")
+            if alert_type == "LONG":
+                self.long_alerts.setdefault(symbol, []).append(timestamp)
+                if len(self.long_alerts) == min_n and self.long_window_start is None:
+                    self.long_window_start = timestamp
+            elif alert_type == "SHORT":
+                self.short_alerts.setdefault(symbol, []).append(timestamp)
+                if len(self.short_alerts) == min_n and self.short_window_start is None:
+                    self.short_window_start = timestamp
+        self.last_alert_count = current_alert_count
+
+    def check_entry_conditions(self, cur) -> List[str]:
+        out: List[str] = []
+        current_time = _utc_naive()
+        min_n = int(st.LEVEL_CROSS_MIN_ALERTS_COUNT)
+        timeout_min = float(st.LEVEL_CROSS_ALERT_TIMEOUT_MINUTES)
+
+        if self.long_window_start:
+            long_count = len(self.long_alerts)
+            time_diff = (current_time - self.long_window_start).total_seconds() / 60.0
+            if long_count >= min_n and time_diff >= timeout_min:
+                logger.info("V3: entry signal LONG (group)")
+                if st.LEVEL_CROSS_TELEGRAM:
+                    get_telegram_notifier().send_message(
+                        f"<pre>{escape_html_telegram('Сигнал на вход в сделку LONG')}</pre>",
+                        parse_mode="HTML",
+                    )
+                _log_v3_event(
+                    cur,
+                    cycle_id=self.cycle_id,
+                    structural_cycle_id=self.structural_cycle_id,
+                    event_type="v3_entry_signal_long",
+                    symbol=None,
+                    price=None,
+                    meta={"symbols": list(self.long_alerts.keys()), "count": long_count},
+                )
+                out.append("LONG")
+                self.long_alerts.clear()
+                self.long_window_start = None
+
+        if self.short_window_start:
+            short_count = len(self.short_alerts)
+            time_diff = (current_time - self.short_window_start).total_seconds() / 60.0
+            if short_count >= min_n and time_diff >= timeout_min:
+                logger.info("V3: entry signal SHORT (group)")
+                if st.LEVEL_CROSS_TELEGRAM:
+                    get_telegram_notifier().send_message(
+                        f"<pre>{escape_html_telegram('Сигнал на вход в сделку SHORT')}</pre>",
+                        parse_mode="HTML",
+                    )
+                _log_v3_event(
+                    cur,
+                    cycle_id=self.cycle_id,
+                    structural_cycle_id=self.structural_cycle_id,
+                    event_type="v3_entry_signal_short",
+                    symbol=None,
+                    price=None,
+                    meta={"symbols": list(self.short_alerts.keys()), "count": short_count},
+                )
+                out.append("SHORT")
+                self.short_alerts.clear()
+                self.short_window_start = None
+
+        return out
+
+    def check_cancellation_conditions(self, cur) -> List[str]:
+        out: List[str] = []
+        current_time = _utc_naive()
+        min_n = int(st.LEVEL_CROSS_MIN_ALERTS_COUNT)
+        max_add = int(st.LEVEL_CROSS_MAX_ADDITIONAL_ALERTS)
+        timeout_min = float(st.LEVEL_CROSS_ALERT_TIMEOUT_MINUTES)
+
+        if self.long_window_start:
+            time_diff = (current_time - self.long_window_start).total_seconds() / 60.0
+            long_count = len(self.long_alerts)
+            if time_diff <= timeout_min and long_count >= min_n:
+                other_long_count = long_count - min_n
+                if other_long_count >= max_add:
+                    logger.info("V3: cancel LONG scenario (too many symbols in window)")
+                    if st.LEVEL_CROSS_TELEGRAM:
+                        get_telegram_notifier().send_message(
+                            f"<pre>{escape_html_telegram('Отмена сценария LONG')}</pre>",
+                            parse_mode="HTML",
+                        )
+                    _log_v3_event(
+                        cur,
+                        cycle_id=self.cycle_id,
+                        structural_cycle_id=self.structural_cycle_id,
+                        event_type="v3_cancel_long",
+                        symbol=None,
+                        price=None,
+                        meta={"long_count": long_count},
+                    )
+                    out.append("CANCEL_LONG")
+                    self.long_alerts.clear()
+                    self.long_window_start = None
+
+        if self.short_window_start:
+            time_diff = (current_time - self.short_window_start).total_seconds() / 60.0
+            short_count = len(self.short_alerts)
+            if time_diff <= timeout_min and short_count >= min_n:
+                other_short_count = short_count - min_n
+                if other_short_count >= max_add:
+                    logger.info("V3: cancel SHORT scenario (too many symbols in window)")
+                    if st.LEVEL_CROSS_TELEGRAM:
+                        get_telegram_notifier().send_message(
+                            f"<pre>{escape_html_telegram('Отмена сценария SHORT')}</pre>",
+                            parse_mode="HTML",
+                        )
+                    _log_v3_event(
+                        cur,
+                        cycle_id=self.cycle_id,
+                        structural_cycle_id=self.structural_cycle_id,
+                        event_type="v3_cancel_short",
+                        symbol=None,
+                        price=None,
+                        meta={"short_count": short_count},
+                    )
+                    out.append("CANCEL_SHORT")
+                    self.short_alerts.clear()
+                    self.short_window_start = None
+
+        return out
+
+
+_GLOBAL_MONITOR: Optional[LevelCrossMonitor] = None
+
+
+def get_level_cross_monitor() -> LevelCrossMonitor:
+    global _GLOBAL_MONITOR
+    if _GLOBAL_MONITOR is None:
+        _GLOBAL_MONITOR = LevelCrossMonitor()
+    return _GLOBAL_MONITOR
+
+
+def run_level_cross_tick(
+    cur,
+    *,
+    prices: Dict[str, float],
+    monitor: Optional[LevelCrossMonitor] = None,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    Один тик: обновить пересечения, вернуть сигналы для EntryGate.
+    `cur` — открытый cursor в транзакции; вызывающий делает commit.
+    """
+    mon = monitor or get_level_cross_monitor()
+    row = cur.execute(
+        """
+        SELECT cycle_id, structural_cycle_id, levels_frozen,
+               COALESCE(allow_long_entry, 1) AS allow_long_entry,
+               COALESCE(allow_short_entry, 1) AS allow_short_entry
+        FROM trading_state WHERE id = 1
+        """
+    ).fetchone()
+    summary: Dict[str, Any] = {"skipped": None, "signals": []}
+    if not row or not row["cycle_id"]:
+        summary["skipped"] = "no_cycle_id"
+        return [], summary
+    if not int(row["levels_frozen"] or 0):
+        summary["skipped"] = "levels_not_frozen"
+        return [], summary
+
+    cycle_id = str(row["cycle_id"])
+    scid = row["structural_cycle_id"]
+    scid = str(scid) if scid else None
+    allow_long = bool(int(row["allow_long_entry"] or 0))
+    allow_short = bool(int(row["allow_short_entry"] or 0))
+    levels = load_cycle_level_pairs(cur, cycle_id)
+    if not levels:
+        summary["skipped"] = "no_cycle_levels"
+        return [], summary
+
+    mon.sync_cycle(cur, cycle_id=cycle_id, structural_cycle_id=scid, levels=levels)
+
+    for sym in mon.levels:
+        px = prices.get(sym)
+        if px is None or float(px) <= 0:
+            continue
+        mon.check_levels(cur, symbol=sym, current_price=float(px), allow_long=allow_long, allow_short=allow_short)
+
+    mon.process_alerts()
+    signals: List[str] = []
+    signals.extend(mon.check_entry_conditions(cur))
+    signals.extend(mon.check_cancellation_conditions(cur))
+    summary["signals"] = list(signals)
+    summary["symbols"] = len(mon.levels)
+    return signals, summary
+
+
+__all__ = [
+    "LevelCrossMonitor",
+    "get_level_cross_monitor",
+    "load_cycle_level_pairs",
+    "run_level_cross_tick",
+]

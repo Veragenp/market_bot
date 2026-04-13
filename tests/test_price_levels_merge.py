@@ -103,3 +103,87 @@ def test_vp_merge_updates_price_and_archives_unmatched(clean_db):
     assert any(float(r["price"]) == 51000.0 for r in archived)
     assert 52000.0 in by_price
     assert len(active_only) == 2
+
+
+def test_vp_empty_save_preserves_active_by_default(clean_db):
+    """Пустой save для vp_local не должен архивировать последний валидный снимок."""
+    conn = get_connection()
+    cur = conn.cursor()
+    sym = "WIF/USDT"
+    cur.execute(
+        """
+        INSERT INTO instruments (symbol, exchange, tick_size, atr, updated_at)
+        VALUES (?, 'bybit_futures', 0.01, 1.0, 0)
+        """,
+        (sym.replace("/", ""),),
+    )
+    conn.commit()
+    conn.close()
+
+    df1 = pd.DataFrame(
+        [
+            {
+                "Price": 0.5,
+                "Volume": 1.0,
+                "Duration_Hrs": 10.0,
+                "Tier": "T1",
+                "start_utc": "2024-01-01T00:00:00+00:00",
+                "end_utc": "2024-01-30T00:00:00+00:00",
+            },
+        ]
+    )
+    save_volume_profile_peaks_levels_to_db(sym, df1, layer="L1", level_type=LEVEL_TYPE_VP_LOCAL, timeframe="1m")
+
+    save_volume_profile_peaks_levels_to_db(
+        sym, pd.DataFrame(), layer="L_empty", level_type=LEVEL_TYPE_VP_LOCAL, timeframe="1m"
+    )
+
+    conn = get_connection()
+    cur = conn.cursor()
+    n = int(_row(cur, "SELECT COUNT(*) AS c FROM price_levels WHERE is_active=1", ())["c"])
+    conn.close()
+    assert n == 1
+
+
+def test_vp_empty_save_archives_when_flag_true(clean_db):
+    conn = get_connection()
+    cur = conn.cursor()
+    sym = "OP/USDT"
+    cur.execute(
+        """
+        INSERT INTO instruments (symbol, exchange, tick_size, atr, updated_at)
+        VALUES (?, 'bybit_futures', 0.01, 1.0, 0)
+        """,
+        (sym.replace("/", ""),),
+    )
+    conn.commit()
+    conn.close()
+
+    df1 = pd.DataFrame(
+        [
+            {
+                "Price": 1.0,
+                "Volume": 1.0,
+                "Duration_Hrs": 10.0,
+                "Tier": "T1",
+                "start_utc": "2024-01-01T00:00:00+00:00",
+                "end_utc": "2024-01-30T00:00:00+00:00",
+            },
+        ]
+    )
+    save_volume_profile_peaks_levels_to_db(sym, df1, layer="L1", level_type=LEVEL_TYPE_VP_LOCAL, timeframe="1m")
+
+    save_volume_profile_peaks_levels_to_db(
+        sym,
+        pd.DataFrame(),
+        layer="L_empty",
+        level_type=LEVEL_TYPE_VP_LOCAL,
+        timeframe="1m",
+        archive_active_when_empty=True,
+    )
+
+    conn = get_connection()
+    cur = conn.cursor()
+    n = int(_row(cur, "SELECT COUNT(*) AS c FROM price_levels WHERE is_active=1", ())["c"])
+    conn.close()
+    assert n == 0
