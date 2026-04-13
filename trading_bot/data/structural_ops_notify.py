@@ -193,6 +193,32 @@ def export_levels_snapshot(cycle_id: str, pipeline_out: Optional[Dict[str, Any]]
     logger.info("Structural ops: levels sheet %s rows=%s cycle_id=%s", ws, len(df), cycle_id)
 
 
+def export_levels_snapshot_v2() -> None:
+    from trading_bot.analytics.structural_cycle_v2 import build_structural_v2_report_df
+    from trading_bot.config import settings as st
+    from trading_bot.data.db import get_connection
+    from trading_bot.tools.sheets_exporter import SheetsExporter
+
+    if not st.STRUCTURAL_OPS_SHEETS_LEVELS:
+        return
+    es = _load_export_to_sheets()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        df = build_structural_v2_report_df(cur)
+    finally:
+        conn.close()
+    exporter = SheetsExporter(
+        credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH", es.CREDENTIALS_PATH),
+        spreadsheet_title=es.SHEET_TITLE,
+        spreadsheet_url=os.getenv("MARKET_AUDIT_SHEET_URL") or es.SHEET_URL,
+        spreadsheet_id=os.getenv("MARKET_AUDIT_SHEET_ID") or es.SHEET_ID,
+    )
+    ws = os.getenv("STRUCTURAL_LEVELS_REPORT_V2_WORKSHEET", st.STRUCTURAL_LEVELS_REPORT_V2_WORKSHEET)
+    exporter.export_dataframe_to_sheet(df, es.SHEET_TITLE, ws)
+    logger.info("Structural ops: levels v2 sheet %s rows=%s", ws, len(df))
+
+
 def _human_message(
     event_type: str,
     cycle_id: str,
@@ -357,6 +383,7 @@ def notify_no_valid_ref_prices(
 
 __all__ = [
     "export_levels_snapshot",
+    "export_levels_snapshot_v2",
     "notify_no_valid_ref_prices",
     "on_structural_event",
 ]

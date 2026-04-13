@@ -245,9 +245,7 @@ def fit_pair_to_etalon(
     above = _fetch_top_levels(cur, symbol, ref_price, "short", types, top_k)
     if not below or not above or atr <= 0:
         return None
-    delta = slack
-    lo = max(w_lo_global, w_star - delta)
-    hi = min(w_hi_global, w_star + delta)
+    lo, hi = _w_fit_bounds(w_star, w_lo_global, w_hi_global, slack)
     for b in below:
         for a in above:
             if b.price >= ref_price or a.price <= ref_price:
@@ -263,6 +261,37 @@ def fit_pair_to_etalon(
                     ref_price=ref_price,
                 )
     return None
+
+
+def _w_fit_bounds(w_star: float, w_lo_global: float, w_hi_global: float, slack: float) -> Tuple[float, float]:
+    lo = max(float(w_lo_global), float(w_star) - float(slack))
+    hi = min(float(w_hi_global), float(w_star) + float(slack))
+    return lo, hi
+
+
+def _pick_best_opposite_level(
+    candidates: Sequence[StrongLevel],
+    anchor_price: float,
+    atr: float,
+    lo: float,
+    hi: float,
+    opposite_side: str,
+) -> Optional[StrongLevel]:
+    if atr <= 0:
+        return None
+    best: Optional[StrongLevel] = None
+    best_vol = float("-inf")
+    for lvl in candidates:
+        if opposite_side == "above":
+            w = (lvl.price - anchor_price) / atr
+        else:
+            w = (anchor_price - lvl.price) / atr
+        if lo <= w <= hi:
+            vol = float(lvl.volume_peak)
+            if vol > best_vol:
+                best = lvl
+                best_vol = vol
+    return best
 
 
 def symbol_pair_to_zone_bounds(pair: SymbolPair, mid_band_pct: float) -> Tuple[float, float, float]:
@@ -731,8 +760,7 @@ def rebuild_opposite_zone_on_cursor(cur, cycle_id: str, entered_direction: str) 
         eff_slack = max(slack_abs_min, w_star * w_slack_frac)
         w_lo = settings_pkg.STRUCTURAL_SETTINGS.W_GLOBAL_MIN
         w_hi = settings_pkg.STRUCTURAL_SETTINGS.W_GLOBAL_MAX
-        lo = max(w_lo, w_star - eff_slack)
-        hi = min(w_hi, w_star + eff_slack)
+        lo, hi = _w_fit_bounds(w_star, w_lo, w_hi, eff_slack)
         now_ts = int(time.time())
         updated = 0
 
@@ -745,12 +773,14 @@ def rebuild_opposite_zone_on_cursor(cur, cycle_id: str, entered_direction: str) 
             if entered_direction == "long":
                 anchor = float(r["L_price"])
                 cands = _fetch_top_levels(cur, sym, anchor, "short", types, top_k)
-                best = None
-                for a in cands:
-                    w = (a.price - anchor) / atr
-                    if lo <= w <= hi:
-                        best = a
-                        break
+                best = _pick_best_opposite_level(
+                    candidates=cands,
+                    anchor_price=anchor,
+                    atr=atr,
+                    lo=lo,
+                    hi=hi,
+                    opposite_side="above",
+                )
                 if not best:
                     continue
                 cur.execute(
@@ -775,12 +805,14 @@ def rebuild_opposite_zone_on_cursor(cur, cycle_id: str, entered_direction: str) 
             else:
                 anchor = float(r["U_price"])
                 cands = _fetch_top_levels(cur, sym, anchor, "long", types, top_k)
-                best = None
-                for b in cands:
-                    w = (anchor - b.price) / atr
-                    if lo <= w <= hi:
-                        best = b
-                        break
+                best = _pick_best_opposite_level(
+                    candidates=cands,
+                    anchor_price=anchor,
+                    atr=atr,
+                    lo=lo,
+                    hi=hi,
+                    opposite_side="below",
+                )
                 if not best:
                     continue
                 cur.execute(

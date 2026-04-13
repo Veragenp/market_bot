@@ -125,28 +125,39 @@ BYBIT_API_SECRET = _env_strip_quotes(os.getenv("BYBIT_API_SECRET", ""))
 # Demo trading (api-demo.bybit.com, ключи из основного аккаунта в режиме Demo)
 BYBIT_API_KEY_TEST = _env_strip_quotes(os.getenv("BYBIT_API_KEY_TEST", ""))
 BYBIT_API_SECRET_TEST = _env_strip_quotes(os.getenv("BYBIT_API_SECRET_TEST", ""))
-BYBIT_USE_DEMO = os.getenv("BYBIT_USE_DEMO", "0").strip().lower() in ("1", "true", "yes", "on")
+BYBIT_USE_DEMO = os.getenv("BYBIT_USE_DEMO", "1").strip().lower() in ("1", "true", "yes", "on")
 # Реальные ордера: только при явном включении (демо или прод — по BYBIT_USE_DEMO)
-BYBIT_EXECUTION_ENABLED = os.getenv("BYBIT_EXECUTION_ENABLED", "0").strip().lower() in (
+BYBIT_EXECUTION_ENABLED = os.getenv("BYBIT_EXECUTION_ENABLED", "1").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
 # После группового LONG/SHORT в entry_gate: авто-открытие по строкам entry_gate_confirmations (нужен BYBIT_EXECUTION_ENABLED=1).
-ENTRY_AUTO_OPEN_AFTER_GATE = os.getenv("ENTRY_AUTO_OPEN_AFTER_GATE", "0").strip().lower() in (
+ENTRY_AUTO_OPEN_AFTER_GATE = os.getenv("ENTRY_AUTO_OPEN_AFTER_GATE", "1").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
-# True — лимит по цене из position_math (GTC); False — рыночный вход + стоп как в create_draft (execute_market).
-ENTRY_AUTO_OPEN_USE_LIMIT = os.getenv("ENTRY_AUTO_OPEN_USE_LIMIT", "1").strip().lower() in (
+# Групповой сигнал LONG при пакете short (и наоборот): сначала reduce-only market + отмена pending лимитов, сброс single_sided.
+ENTRY_CLOSE_OPPOSITE_ON_FLIP_SIGNAL = os.getenv(
+    "ENTRY_CLOSE_OPPOSITE_ON_FLIP_SIGNAL", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+# После reconcile: если пакет flat (нет open/pending), закрыть freeze-эпоху:
+# cycle_phase=closed + levels_frozen=0 + сброс cycle_id/structural_cycle_id.
+ENTRY_PACKAGE_FLAT_TRANSITION = os.getenv("ENTRY_PACKAGE_FLAT_TRANSITION", "1").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
+# Если нет position_records по циклу — опрос Bybit get_positions по пулу (нужны API-ключи).
+# По умолчанию выкл.: при «бумажном» in_position биржа пустая — иначе сразу ушли бы в arming.
+# Вкл. явно или автоматически при BYBIT_EXECUTION_ENABLED=1 (см. entry_gate).
+ENTRY_PACKAGE_FLAT_USE_BYBIT_POSITIONS = os.getenv(
+    "ENTRY_PACKAGE_FLAT_USE_BYBIT_POSITIONS", "0"
+).strip().lower() in ("1", "true", "yes", "on")
 
 # Детектор подхода к уровням cycle_levels (после freeze) — legacy near-band (см. level_cross_monitor)
 ENTRY_DETECTOR_POLL_SEC = float(os.getenv("ENTRY_DETECTOR_POLL_SEC", "3"))
@@ -159,15 +170,22 @@ ENTRY_DETECTOR_DEBOUNCE_SEC = int(os.getenv("ENTRY_DETECTOR_DEBOUNCE_SEC", "30")
 LEVEL_CROSS_POLL_SEC = float(os.getenv("LEVEL_CROSS_POLL_SEC", os.getenv("MONITOR_POLL_SEC", "10")))
 # Окно свежести алертов (в минутах) для группового сигнала.
 LEVEL_CROSS_ALERT_TIMEOUT_MINUTES = float(
-    os.getenv("LEVEL_CROSS_ALERT_TIMEOUT_MINUTES", os.getenv("ALERT_TIMEOUT_MINUTES", "30"))
+    os.getenv("LEVEL_CROSS_ALERT_TIMEOUT_MINUTES", os.getenv("ALERT_TIMEOUT_MINUTES", "5"))
 )
 # Минимум разных монет с алертом для подтверждения группового сигнала.
 LEVEL_CROSS_MIN_ALERTS_COUNT = int(
-    os.getenv("LEVEL_CROSS_MIN_ALERTS_COUNT", os.getenv("MIN_ALERTS_COUNT", "3"))
+    os.getenv("LEVEL_CROSS_MIN_ALERTS_COUNT", os.getenv("MIN_ALERTS_COUNT", "2"))
 )
 # Сколько дополнительных алертов допускаем после первого срабатывания.
 LEVEL_CROSS_MAX_ADDITIONAL_ALERTS = int(
     os.getenv("LEVEL_CROSS_MAX_ADDITIONAL_ALERTS", os.getenv("MAX_ADDITIONAL_ALERTS", "3"))
+)
+# Одна строка INFO на тик: счётчики алертов, окно до группового сигнала, причина если сигнала ещё нет.
+LEVEL_CROSS_TICK_SUMMARY_LOG = os.getenv("LEVEL_CROSS_TICK_SUMMARY_LOG", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
 )
 
 # Tutorial V3 → entry gate (trade_signal_processor.py): ATR %% от уровня
@@ -184,7 +202,7 @@ LEVEL_CROSS_TELEGRAM = os.getenv("LEVEL_CROSS_TELEGRAM", "1").strip().lower() in
     "yes",
     "on",
 )
-# Отдельный флаг для уведомлений о фактическом пересечении LONG/SHORT уровней.
+# Отдельный флаг: уведомления о каждом пересечении LONG/SHORT уровня (шумно). Минимум — выкл.
 LEVEL_CROSS_TELEGRAM_CROSSINGS = os.getenv("LEVEL_CROSS_TELEGRAM_CROSSINGS", "1").strip().lower() in (
     "1",
     "true",
@@ -241,6 +259,18 @@ TRADINGVIEW_WS_TIMEOUT = int(os.getenv("TRADINGVIEW_WS_TIMEOUT", "60"))
 API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY = 2
 BYBIT_BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
+# Публичный WebSocket V5 (pybit): при ошибках подключения / 404 от ELB попробуйте BYBIT_WS_DOMAIN=bytick
+# (эффект только при BYBIT_USE_DEMO=0; в демо bytick для WS не подставляется — см. bybit_ws.public_linear_websocket_kwargs).
+BYBIT_WS_DOMAIN = os.getenv("BYBIT_WS_DOMAIN", "").strip().lower()
+BYBIT_WS_TRACE_LOGGING = os.getenv("BYBIT_WS_TRACE_LOGGING", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+BYBIT_WS_PING_INTERVAL = int(os.getenv("BYBIT_WS_PING_INTERVAL", "20"))
+BYBIT_WS_PING_TIMEOUT = int(os.getenv("BYBIT_WS_PING_TIMEOUT", "10"))
+BYBIT_WS_RETRIES = int(os.getenv("BYBIT_WS_RETRIES", "10"))
 COINGECKO_DELAY = 10
 COINGLASS_DELAY = 5
 COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY", "")
@@ -467,6 +497,13 @@ CYCLE_LEVELS_REFERENCE_PRICE_SOURCE = (
 )
 PRICE_FEED_WS_WARMUP_SEC = int(os.getenv("PRICE_FEED_WS_WARMUP_SEC", "8"))
 PRICE_FEED_MAX_STALE_SEC = int(os.getenv("PRICE_FEED_MAX_STALE_SEC", "30"))
+# 0 — не подключать Bybit WebSocket (только REST); если stream-demo/stream блокируется, без лишних ретраев pybit.
+PRICE_FEED_WEBSOCKET_ENABLED = os.getenv("PRICE_FEED_WEBSOCKET_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 # Гейт для legacy rebuild_cycle_levels (из price_levels -> cycle_levels).
 # False: разрешён только явный вызов с force=True (например из orchestrator/ручного скрипта).
 CYCLE_LEVELS_REBUILD_ENABLED = os.getenv("CYCLE_LEVELS_REBUILD_ENABLED", "0").strip().lower() in (
@@ -616,15 +653,19 @@ STRUCTURAL_LEVELS_REPORT_WORKSHEET = (
     os.getenv("STRUCTURAL_LEVELS_REPORT_WORKSHEET", "structural_levels_report").strip()
     or "structural_levels_report"
 )
+STRUCTURAL_LEVELS_REPORT_V2_WORKSHEET = (
+    os.getenv("STRUCTURAL_LEVELS_REPORT_V2_WORKSHEET", "structural_levels_report_v2").strip()
+    or "structural_levels_report_v2"
+)
 # Операционный контур: лог + Telegram + Google Sheets (без смешивания с сигналами входа).
 STRUCTURAL_OPS_LOG = os.getenv("STRUCTURAL_OPS_LOG", "1").strip().lower() in ("1", "true", "yes", "on")
-STRUCTURAL_OPS_TELEGRAM = os.getenv("STRUCTURAL_OPS_TELEGRAM", "0").strip().lower() in (
+STRUCTURAL_OPS_TELEGRAM = os.getenv("STRUCTURAL_OPS_TELEGRAM", "1").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
-STRUCTURAL_OPS_SHEETS_LEVELS = os.getenv("STRUCTURAL_OPS_SHEETS_LEVELS", "0").strip().lower() in (
+STRUCTURAL_OPS_SHEETS_LEVELS = os.getenv("STRUCTURAL_OPS_SHEETS_LEVELS", "1").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -652,6 +693,7 @@ STRUCTURAL_OPS_SHEETS_LOG_EACH_MID_TOUCH = os.getenv(
 # Ops stage telemetry (pipeline-level observability, low-noise)
 # -----------------------------------------------------------------------------
 OPS_STAGE_LOG = os.getenv("OPS_STAGE_LOG", "1").strip().lower() in ("1", "true", "yes", "on")
+# Telegram по этапам supervisor — по умолчанию выкл. (минимум шума); логи этапов в БД при OPS_STAGE_LOG=1.
 OPS_STAGE_TELEGRAM = os.getenv("OPS_STAGE_TELEGRAM", "0").strip().lower() in ("1", "true", "yes", "on")
 # When enabled, Telegram only receives end-of-stage statuses and failures (no start spam).
 OPS_STAGE_TELEGRAM_ONLY_FINAL = os.getenv("OPS_STAGE_TELEGRAM_ONLY_FINAL", "1").strip().lower() in (
@@ -660,8 +702,25 @@ OPS_STAGE_TELEGRAM_ONLY_FINAL = os.getenv("OPS_STAGE_TELEGRAM_ONLY_FINAL", "1").
     "yes",
     "on",
 )
-OPS_STAGE_SHEETS = os.getenv("OPS_STAGE_SHEETS", "0").strip().lower() in ("1", "true", "yes", "on")
+OPS_STAGE_SHEETS = os.getenv("OPS_STAGE_SHEETS", "1").strip().lower() in ("1", "true", "yes", "on")
 OPS_STAGE_WORKSHEET = os.getenv("OPS_STAGE_WORKSHEET", "ops_stages").strip() or "ops_stages"
+# После rebuild vp_local: выгрузка листа vp_local_levels (та же книга MARKET_AUDIT_*), независимо от OPS_STAGE_SHEETS.
+SUPERVISOR_EXPORT_VP_LOCAL_AFTER_LEVELS_REBUILD = os.getenv(
+    "SUPERVISOR_EXPORT_VP_LOCAL_AFTER_LEVELS_REBUILD", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# Entry-тик: открытые позиции по cycle_id + append закрытых в Google Sheets.
+SHEETS_TRADING_CYCLE_SYNC = os.getenv("SHEETS_TRADING_CYCLE_SYNC", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+CYCLE_OPEN_POSITIONS_WORKSHEET = (
+    os.getenv("CYCLE_OPEN_POSITIONS_WORKSHEET", "cycle_open_positions").strip() or "cycle_open_positions"
+)
+CYCLE_TRADING_STATS_WORKSHEET = (
+    os.getenv("CYCLE_TRADING_STATS_WORKSHEET", "cycle_trading_stats").strip() or "cycle_trading_stats"
+)
 
 # -----------------------------------------------------------------------------
 # Supervisor loop (единый авто-оркестратор на базе существующих модулей)
@@ -694,6 +753,36 @@ SUPERVISOR_ENTRY_TICK_SEC = int(os.getenv("SUPERVISOR_ENTRY_TICK_SEC", "10"))
 SUPERVISOR_EXPORT_VP_LOCAL_BEFORE_STRUCTURAL = os.getenv(
     "SUPERVISOR_EXPORT_VP_LOCAL_BEFORE_STRUCTURAL", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
+# Снимок structural (лист structural_levels_report): из trading_state.structural_cycle_id.
+# При пропуске scheduled structural (arming/in_position) пайплайн не дергается — supervisor
+# сам вызывает export_levels_snapshot. Уважает STRUCTURAL_OPS_SHEETS_LEVELS.
+SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT = os.getenv(
+    "SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V2 = os.getenv(
+    "SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V2", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+# Какие шаги делать в supervisor `DATA_REFRESH` (и в load_all_data incremental — те же имена).
+# 0 / false / no / off — пропустить; 1 / true / yes / on — выполнить.
+# По умолчанию: spot по TRADING_SYMBOLS + instruments + ATR — вкл.; макро, TV, OI, crypto_context spot — выкл.
+def _supervisor_data_refresh_on(name: str, *, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+
+SUPERVISOR_DATA_REFRESH_SPOT_MAIN = _supervisor_data_refresh_on("SUPERVISOR_DATA_REFRESH_SPOT_MAIN")
+SUPERVISOR_DATA_REFRESH_SPOT_CRYPTO_CONTEXT = _supervisor_data_refresh_on(
+    "SUPERVISOR_DATA_REFRESH_SPOT_CRYPTO_CONTEXT",
+    default="0",
+)
+SUPERVISOR_DATA_REFRESH_MACRO = _supervisor_data_refresh_on("SUPERVISOR_DATA_REFRESH_MACRO", default="0")
+SUPERVISOR_DATA_REFRESH_INDICES_TV = _supervisor_data_refresh_on(
+    "SUPERVISOR_DATA_REFRESH_INDICES_TV", default="0"
+)
+SUPERVISOR_DATA_REFRESH_OI_BYBIT = _supervisor_data_refresh_on("SUPERVISOR_DATA_REFRESH_OI_BYBIT", default="0")
+SUPERVISOR_DATA_REFRESH_INSTRUMENTS = _supervisor_data_refresh_on("SUPERVISOR_DATA_REFRESH_INSTRUMENTS")
+SUPERVISOR_DATA_REFRESH_INSTRUMENTS_ATR = _supervisor_data_refresh_on("SUPERVISOR_DATA_REFRESH_INSTRUMENTS_ATR")
+
 # Лимит открытых позиций в одном направлении (инвариант из tutorial_v3/вашей политики).
 MAX_POSITIONS_PER_SIDE = int(os.getenv("MAX_POSITIONS_PER_SIDE", "10"))
 
