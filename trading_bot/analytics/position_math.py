@@ -67,6 +67,10 @@ def compute_position_plan(
 ) -> PositionPlan:
     """
     K = base_price, Y = entry (смещение X или сырая цена), M = atr.
+    При ``use_entry_offset=True`` цена входа в ордере **всегда от уровня K** (``base_price``):
+    при ненулевом люфте X = K * (pct/100) + абсолютный ``entry_offset``; long Y=K+X, short Y=K−X;
+    при нулевом люфте Y = MROUND(K, tick). ``entry_price_raw`` используется только если
+    ``use_entry_offset=False`` (скрипты / ручной сценарий).
     Если tp_in_stop_ranges=True, TP-множители трактуются как число стоп-диапазонов
     (т.е. effective_tp_atr_mult = stop_atr_mult * tp_atr_mult).
     """
@@ -78,13 +82,16 @@ def compute_position_plan(
     k = float(base_price)
     x = float(entry_offset)
     if entry_offset_pct is not None and x == 0.0:
-        # Люфт в процентах задаём от ATR (а не от K), чтобы +5% означало 0.05 * ATR.
-        x = float(atr) * float(entry_offset_pct) / 100.0
-    if use_entry_offset and x != 0:
-        if side == "long":
-            y = mround(k + x, price_tick)
+        # Люфт X = K * pct/100 (POSITION_ENTRY_OFFSET_PCT в settings), не от ATR.
+        x = k * float(entry_offset_pct) / 100.0
+    if use_entry_offset:
+        if x != 0.0:
+            if side == "long":
+                y = mround(k + x, price_tick)
+            else:
+                y = mround(k - x, price_tick)
         else:
-            y = mround(k - x, price_tick)
+            y = mround(k, price_tick)
     else:
         y = mround(float(entry_price_raw), price_tick)
 

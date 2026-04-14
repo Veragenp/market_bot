@@ -221,7 +221,7 @@ ENTRY_DETECTOR_TELEGRAM_START = os.getenv("ENTRY_DETECTOR_TELEGRAM_START", "0").
 # Фиксированный риск на сделку в USDT (не процент депозита).
 POSITION_RISK_USDT = float(os.getenv("POSITION_RISK_USDT", "1"))
 # Стоп-лосс в ATR от точки входа (1.0 = расстояние 1*ATR).
-POSITION_STOP_ATR_MULT = float(os.getenv("POSITION_STOP_ATR_MULT", "0.2"))
+POSITION_STOP_ATR_MULT = float(os.getenv("POSITION_STOP_ATR_MULT", "0.3"))
 # Цели TP в ATR от входа.
 POSITION_TP1_ATR_MULT = float(os.getenv("POSITION_TP1_ATR_MULT", "3"))
 POSITION_TP2_ATR_MULT = float(os.getenv("POSITION_TP2_ATR_MULT", "2"))
@@ -229,7 +229,8 @@ POSITION_TP3_ATR_MULT = float(os.getenv("POSITION_TP3_ATR_MULT", "3"))
 # Доли фиксации объема на TP1/TP2 (остаток идет на TP3).
 POSITION_TP1_SHARE_PCT = float(os.getenv("POSITION_TP1_SHARE_PCT", "100"))
 POSITION_TP2_SHARE_PCT = float(os.getenv("POSITION_TP2_SHARE_PCT", "0"))
-# Люфт входа X только в % от уровня K (Y = K +/- X, X = K * pct / 100).
+# Люфт входа X в % от уровня K (X = K * pct / 100). Лимит на бирже: Y = MROUND(K) при pct=0,
+# иначе long Y=K+X / short Y=K−X (цена в gate — только для порога, не для цены ордера).
 POSITION_ENTRY_OFFSET_PCT = float(os.getenv("POSITION_ENTRY_OFFSET_PCT", "0"))
 
 YFINANCE_TICKERS: dict[str, str] = {
@@ -657,6 +658,18 @@ STRUCTURAL_LEVELS_REPORT_V2_WORKSHEET = (
     os.getenv("STRUCTURAL_LEVELS_REPORT_V2_WORKSHEET", "structural_levels_report_v2").strip()
     or "structural_levels_report_v2"
 )
+STRUCTURAL_LEVELS_REPORT_V3_WORKSHEET = (
+    os.getenv("STRUCTURAL_LEVELS_REPORT_V3_WORKSHEET", "structural_levels_report_v3").strip()
+    or "structural_levels_report_v3"
+)
+STRUCTURAL_LEVELS_REPORT_V4_WORKSHEET = (
+    os.getenv("STRUCTURAL_LEVELS_REPORT_V4_WORKSHEET", "structural_levels_report_v4").strip()
+    or "structural_levels_report_v4"
+)
+# v4: полоса от ref в ATR для выбора сильнейшего уровня ниже/выше (vp_local + manual_global_hvn).
+STRUCTURAL_V4_BAND_MIN_ATR = float(os.getenv("STRUCTURAL_V4_BAND_MIN_ATR", "1.5"))
+STRUCTURAL_V4_BAND_MAX_ATR = float(os.getenv("STRUCTURAL_V4_BAND_MAX_ATR", "3.5"))
+STRUCTURAL_V4_LEVELS_FETCH_LIMIT = int(os.getenv("STRUCTURAL_V4_LEVELS_FETCH_LIMIT", "2000"))
 # Операционный контур: лог + Telegram + Google Sheets (без смешивания с сигналами входа).
 STRUCTURAL_OPS_LOG = os.getenv("STRUCTURAL_OPS_LOG", "1").strip().lower() in ("1", "true", "yes", "on")
 STRUCTURAL_OPS_TELEGRAM = os.getenv("STRUCTURAL_OPS_TELEGRAM", "1").strip().lower() in (
@@ -761,6 +774,9 @@ SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT = os.getenv(
 ).strip().lower() not in ("0", "false", "no", "off")
 SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V2 = os.getenv(
     "SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V2", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V4 = os.getenv(
+    "SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V4", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
 
 # Какие шаги делать в supervisor `DATA_REFRESH` (и в load_all_data incremental — те же имена).

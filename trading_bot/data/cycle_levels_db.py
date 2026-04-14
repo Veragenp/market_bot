@@ -334,8 +334,6 @@ def rebuild_cycle_levels(*, force: bool = False) -> dict:
     if not CYCLE_LEVELS_REBUILD_ENABLED and not force:
         return {"skipped": True, "reason": "cycle_levels_rebuild_disabled"}
 
-    init_db()
-    run_migrations()
     now_ts = _now_ts()
     cycle_id = str(uuid.uuid4())
     conn = get_connection()
@@ -415,7 +413,8 @@ def rebuild_cycle_levels(*, force: bool = False) -> dict:
         UPDATE trading_state
         SET cycle_id = ?, position_state = 'none', cycle_phase = 'arming',
             levels_frozen = 1, cycle_version = cycle_version + 1,
-            close_reason = NULL, last_transition_at = ?, updated_at = ?
+            close_reason = NULL, last_package_exit_reason = NULL,
+            last_transition_at = ?, updated_at = ?
         WHERE id = 1
         """,
         (cycle_id, now_ts, now_ts),
@@ -611,8 +610,6 @@ def backfill_missing_cycle_side(
 def build_cycle_levels_diagnostics():
     import pandas as pd
 
-    init_db()
-    run_migrations()
     now_ts = _now_ts()
     conn = get_connection()
     cur = conn.cursor()
@@ -768,8 +765,6 @@ def build_cycle_levels_candidates_df():
 def fetch_cycle_levels_df():
     import pandas as pd
 
-    init_db()
-    run_migrations()
     conn = get_connection()
     df = pd.read_sql_query(
         """

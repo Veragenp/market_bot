@@ -19,7 +19,14 @@ from trading_bot.data.cycle_levels_db import (
     export_cycle_levels_sheets_snapshot,
 )
 from trading_bot.analytics.level_cross_monitor import load_cycle_level_pairs
-from trading_bot.tools.bybit_trading import to_bybit_symbol
+from trading_bot.tools.bybit_trading import (
+    cancel_linear_order,
+    get_linear_positions,
+    linear_position_sizes_by_symbol,
+    place_linear_market_order,
+    pool_symbols_flat_on_linear_exchange,
+    to_bybit_symbol,
+)
 from trading_bot.tools.telegram_notify import escape_html_telegram, get_telegram_notifier
 
 if TYPE_CHECKING:
@@ -149,6 +156,261 @@ def _ref_price_for_symbol(cur, *, symbol: str, prices: Dict[str, float]) -> Opti
         return None
     v = float(row["close"])
     return v if v > 0 else None
+
+
+def close_trading_epoch_v3_cancel(
+    cur,
+    *,
+    monitor: "LevelCrossMonitor",
+    signal_type: str,
+) -> Dict[str, Any]:
+    """
+    CANCEL_LONG/SHORT: полное закрытие freeze-эпохи — closed, разморозка, сброс cycle_id
+    до следующего полного S1 (новый UUID при следующем freeze).
+    """
+    now = int(time.time())
+    row = cur.execute(
+        "SELECT cycle_id, structural_cycle_id FROM trading_state WHERE id = 1"
+    ).fetchone()
+    if not row:
+        return {"ok": False, "error": "no_trading_state"}
+    cycle_id = str(row["cycle_id"]) if row["cycle_id"] else ""
+    scid = str(row["structural_cycle_id"]) if row["structural_cycle_id"] else None
+    reason = "v3_cancel_long" if signal_type == "CANCEL_LONG" else "v3_cancel_short"
+    if cycle_id:
+        _log_v3_event(
+            cur,
+            cycle_id=cycle_id,
+            structural_cycle_id=scid,
+            event_type=f"v3_{signal_type.lower()}",
+            symbol=None,
+            price=None,
+            meta={"action": "close_trading_epoch", "close_reason": reason},
+        )
+    cur.execute(
+        """
+        UPDATE trading_state SET
+            cycle_phase = 'closed',
+            levels_frozen = 0,
+            cycle_id = NULL,
+            structural_cycle_id = NULL,
+            position_state = 'none',
+            close_reason = ?,
+            channel_mode = 'two_sided',
+            known_side = 'both',
+            need_rebuild_opposite = 0,
+            opposite_rebuild_deadline_ts = NULL,
+            opposite_rebuild_attempts = 0,
+            allow_long_entry = 1,
+            allow_short_entry = 1,
+            last_rebuild_reason = NULL,
+            last_package_exit_reason = NULL,
+            last_transition_at = ?,
+            updated_at = ?
+        WHERE id = 1
+        """,
+        (reason, now, now),
+    )
+    monitor.reset()
+    return {"ok": True, "cancel": signal_type, "close_reason": reason}
+
+
+def _infer_last_package_exit_reason_from_db(reason_list: List[str]) -> str:
+    if not reason_list:
+        return "package_flat"
+    joined = [str(x).strip().lower() for x in reason_list if x]
+    if any(x in ("take", "tp") for x in joined):
+        return "take"
+    if any(x in ("stop", "sl", "adl", "liquidation", "reduce_close") for x in joined):
+        return "stop"
+    blob = " ".join(joined)
+    if any(x in blob for x in ("stop", "sl", "liquidat", "stop_loss", "adl")):
+        return "stop"
+    if any(x in blob for x in ("take", "tp", "profit", "target")):
+        return "take"
+    return "package_flat"
+
+
+def _apply_closed_after_package_flat(
+    cur,
+    *,
+    cycle_id: str,
+    structural_cycle_id: Optional[str],
+    now: int,
+    last_package_exit_reason: str,
+    meta: Dict[str, Any],
+) -> None:
+    cur.execute(
+        """
+        UPDATE trading_state SET
+            cycle_phase = 'closed',
+            levels_frozen = 0,
+            cycle_id = NULL,
+            structural_cycle_id = NULL,
+            position_state = 'none',
+            channel_mode = 'two_sided',
+            known_side = 'both',
+            need_rebuild_opposite = 0,
+            opposite_rebuild_deadline_ts = NULL,
+            opposite_rebuild_attempts = 0,
+            allow_long_entry = 1,
+            allow_short_entry = 1,
+            last_rebuild_reason = 'package_all_flat_close_epoch',
+            last_package_exit_reason = ?,
+            last_transition_at = ?,
+            updated_at = ?
+        WHERE id = 1
+        """,
+        (last_package_exit_reason, now, now),
+    )
+    _log_v3_event(
+        cur,
+        cycle_id=cycle_id,
+        structural_cycle_id=structural_cycle_id,
+        event_type="v3_package_all_flat_close_epoch",
+        symbol=None,
+        price=None,
+        meta={**meta, "last_package_exit_reason": last_package_exit_reason},
+    )
+
+
+def maybe_transition_arming_after_package_all_flat(cur) -> Dict[str, Any]:
+    """
+    Пакет плоский: нет open/pending в position_records ИЛИ (fallback) нет открытого size
+    по пулу на Bybit — закрываем текущую freeze-эпоху (cycle_phase=closed, unfreeze).
+
+    В фазе ``arming`` без записей в ``position_records`` пустой Bybit не считаем
+    «концом пакета»: это нормальное ожидание входа после freeze, иначе супервизор
+    сбрасывал бы торговый цикл и каждый час запускал новый structural.
+    """
+    if not st.ENTRY_PACKAGE_FLAT_TRANSITION:
+        return {"ok": True, "skipped": "disabled"}
+
+    now = int(time.time())
+    row = cur.execute(
+        """
+        SELECT cycle_id, structural_cycle_id, cycle_phase, levels_frozen
+        FROM trading_state WHERE id = 1
+        """
+    ).fetchone()
+    if not row:
+        return {"ok": False, "error": "no_trading_state"}
+    phase = str(row["cycle_phase"] or "")
+    if phase not in ("in_position", "arming"):
+        return {"ok": True, "skipped": "not_in_position_or_arming"}
+    if not int(row["levels_frozen"] or 0):
+        return {"ok": True, "skipped": "not_frozen"}
+    cid = row["cycle_id"]
+    if not cid:
+        return {"ok": True, "skipped": "no_cycle_id"}
+    cycle_id = str(cid)
+    scid = row["structural_cycle_id"]
+    scid = str(scid) if scid else None
+    pool_cycle = str(scid) if scid else cycle_id
+    pool = _load_cycle_member_symbols(cur, cycle_id=pool_cycle)
+    if not pool:
+        return {"ok": True, "skipped": "no_pool_symbols"}
+
+    open_row = cur.execute(
+        """
+        SELECT COUNT(*) AS c FROM position_records
+        WHERE cycle_id = ? AND status IN ('pending', 'open')
+        """,
+        (cycle_id,),
+    ).fetchone()
+    n_open = int(open_row["c"] if open_row else 0)
+    if n_open > 0:
+        return {"ok": True, "skipped": "positions_open_or_pending", "n_open": n_open}
+
+    any_row = cur.execute(
+        "SELECT COUNT(*) AS c FROM position_records WHERE cycle_id = ?",
+        (cycle_id,),
+    ).fetchone()
+    n_any = int(any_row["c"] if any_row else 0)
+
+    use_bybit = st.ENTRY_PACKAGE_FLAT_USE_BYBIT_POSITIONS or st.BYBIT_EXECUTION_ENABLED
+
+    if n_any > 0:
+        reasons_rows = cur.execute(
+            """
+            SELECT close_reason FROM position_records
+            WHERE cycle_id = ? AND status = 'closed' AND closed_at IS NOT NULL
+            ORDER BY closed_at DESC
+            LIMIT 8
+            """,
+            (cycle_id,),
+        ).fetchall()
+        reason_list = [str(r["close_reason"]) for r in reasons_rows if r["close_reason"]]
+        pkg_reason = _infer_last_package_exit_reason_from_db(reason_list)
+        _apply_closed_after_package_flat(
+            cur,
+            cycle_id=cycle_id,
+            structural_cycle_id=scid,
+            now=now,
+            last_package_exit_reason=pkg_reason,
+            meta={
+                "source": "position_records",
+                "position_records": n_any,
+                "recent_close_reasons": reason_list,
+            },
+        )
+        return {
+            "ok": True,
+            "transitioned": True,
+            "cycle_phase": "closed",
+            "position_records_seen": n_any,
+            "source": "position_records",
+            "last_package_exit_reason": pkg_reason,
+        }
+
+    if not use_bybit:
+        return {
+            "ok": True,
+            "skipped": "no_position_records_and_bybit_flat_disabled",
+            "hint": "set BYBIT_EXECUTION_ENABLED=1 or ENTRY_PACKAGE_FLAT_USE_BYBIT_POSITIONS=1",
+        }
+
+    resp = get_linear_positions()
+    if resp is None:
+        return {"ok": True, "skipped": "bybit_positions_unavailable"}
+    sizes = linear_position_sizes_by_symbol(resp)
+    if not pool_symbols_flat_on_linear_exchange(pool, sizes):
+        nonzero = {to_bybit_symbol(s): sizes.get(to_bybit_symbol(s), 0.0) for s in pool}
+        return {
+            "ok": True,
+            "skipped": "exchange_has_open_size",
+            "source": "bybit_positions",
+            "pool_sizes": nonzero,
+        }
+
+    if phase == "arming":
+        return {
+            "ok": True,
+            "skipped": "arming_bybit_flat_ignored",
+            "source": "bybit_positions",
+            "cycle_phase": phase,
+            "position_records_seen": 0,
+        }
+
+    _apply_closed_after_package_flat(
+        cur,
+        cycle_id=cycle_id,
+        structural_cycle_id=scid,
+        now=now,
+        last_package_exit_reason="bybit_flat",
+        meta={
+            "source": "bybit_positions",
+            "position_records": 0,
+        },
+    )
+    return {
+        "ok": True,
+        "transitioned": True,
+        "cycle_phase": "closed",
+        "position_records_seen": 0,
+        "source": "bybit_positions",
+        "last_package_exit_reason": "bybit_flat",
+    }
 
 
 def signal_structural_ready(
@@ -464,6 +726,191 @@ def run_opposite_rebuild_maintenance_tick(
     return {"ok": True, "inserted": int(rb.get("inserted", 0)), "missing": unresolved}
 
 
+def _flip_close_opposite_if_needed(
+    cur,
+    *,
+    cycle_id: str,
+    incoming_direction: str,
+    structural_cycle_id: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Групповой сигнал в противоположную сторону: закрыть пакет (reduce-only market),
+    отменить висящие лимиты pending, отменить привязанные стоп-ордера в БД, сбросить single_sided.
+    """
+    out: Dict[str, Any] = {
+        "ok": True,
+        "skipped": None,
+        "incoming": incoming_direction,
+        "actions": [],
+        "errors": [],
+    }
+    if not st.ENTRY_CLOSE_OPPOSITE_ON_FLIP_SIGNAL:
+        out["skipped"] = "disabled"
+        return out
+    if not st.BYBIT_EXECUTION_ENABLED:
+        out["skipped"] = "execution_disabled"
+        return out
+
+    opposite = "short" if incoming_direction == "long" else "long"
+    rows = cur.execute(
+        """
+        SELECT id, symbol, side, status, qty, filled_qty,
+               entry_exec_order_id, stop_exec_order_id
+        FROM position_records
+        WHERE cycle_id = ? AND LOWER(side) = ? AND status IN ('open', 'pending')
+        """,
+        (cycle_id, opposite),
+    ).fetchall()
+    if not rows:
+        out["skipped"] = "no_opposite_legs"
+        return out
+
+    now = int(time.time())
+    for r in rows:
+        rid = int(r["id"])
+        sym_trade = str(r["symbol"])
+        st_rec = str(r["status"])
+        qty_total = float(r["qty"] or 0.0)
+        fq = float(r["filled_qty"] or 0.0)
+
+        if r["stop_exec_order_id"]:
+            try:
+                sor = cur.execute(
+                    "SELECT bybit_order_id, symbol FROM exec_orders WHERE id = ?",
+                    (int(r["stop_exec_order_id"]),),
+                ).fetchone()
+                if sor and sor["bybit_order_id"]:
+                    sym_o = str(sor["symbol"] or sym_trade)
+                    cancel_linear_order(
+                        symbol_trade=sym_o,
+                        order_id=str(sor["bybit_order_id"]),
+                    )
+                    out["actions"].append(
+                        {
+                            "position_record_id": rid,
+                            "action": "cancel_stop",
+                            "order_id": str(sor["bybit_order_id"]),
+                        }
+                    )
+            except Exception:
+                logger.exception("flip: cancel stop failed position_record_id=%s", rid)
+                out["errors"].append({"position_record_id": rid, "step": "cancel_stop"})
+                out["ok"] = False
+
+        if st_rec == "pending" and r["entry_exec_order_id"]:
+            try:
+                eor = cur.execute(
+                    "SELECT bybit_order_id, symbol FROM exec_orders WHERE id = ?",
+                    (int(r["entry_exec_order_id"]),),
+                ).fetchone()
+                if eor and eor["bybit_order_id"]:
+                    sym_o = str(eor["symbol"] or sym_trade)
+                    cancel_linear_order(
+                        symbol_trade=sym_o,
+                        order_id=str(eor["bybit_order_id"]),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE position_records
+                        SET status = 'cancelled', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, rid),
+                    )
+                    out["actions"].append(
+                        {"position_record_id": rid, "action": "cancel_pending_entry"}
+                    )
+            except Exception:
+                logger.exception("flip: cancel pending entry position_record_id=%s", rid)
+                out["errors"].append({"position_record_id": rid, "step": "cancel_entry"})
+                out["ok"] = False
+            continue
+
+        if st_rec == "open":
+            qty_close = fq if fq > 0 else qty_total
+            if qty_close <= 0:
+                continue
+            side_buy_close = opposite == "short"
+            try:
+                resp = place_linear_market_order(
+                    symbol_trade=sym_trade,
+                    side_buy=side_buy_close,
+                    qty=qty_close,
+                    reduce_only=True,
+                )
+                rc = resp.get("retCode")
+                ok_rc = rc in (0, "0", None)
+                if not ok_rc:
+                    out["ok"] = False
+                    out["errors"].append(
+                        {
+                            "position_record_id": rid,
+                            "step": "reduce_market",
+                            "retCode": rc,
+                            "retMsg": resp.get("retMsg"),
+                        }
+                    )
+                out["actions"].append(
+                    {
+                        "position_record_id": rid,
+                        "action": "reduce_market",
+                        "qty": qty_close,
+                        "retCode": rc,
+                    }
+                )
+            except Exception as e:
+                logger.exception("flip: market close position_record_id=%s", rid)
+                out["errors"].append(
+                    {"position_record_id": rid, "step": "reduce_market", "error": str(e)}
+                )
+                out["ok"] = False
+
+    cur.execute(
+        """
+        UPDATE trading_state SET
+            position_state = 'none',
+            channel_mode = 'two_sided',
+            known_side = 'both',
+            need_rebuild_opposite = 0,
+            opposite_rebuild_deadline_ts = NULL,
+            allow_long_entry = 1,
+            allow_short_entry = 1,
+            updated_at = ?
+        WHERE id = 1
+        """,
+        (now,),
+    )
+
+    _log_v3_event(
+        cur,
+        cycle_id=cycle_id,
+        structural_cycle_id=structural_cycle_id,
+        event_type="v3_flip_close_opposite",
+        symbol=None,
+        price=None,
+        meta={
+            "incoming": incoming_direction,
+            "opposite": opposite,
+            "actions": out["actions"],
+            "errors": out["errors"],
+        },
+    )
+    if st.LEVEL_CROSS_TELEGRAM and out["actions"]:
+        try:
+            msg = (
+                f"Flip: закрыт пакет {opposite.upper()} перед {incoming_direction.upper()} "
+                f"({len(out['actions'])} действий)"
+            )
+            get_telegram_notifier().send_message(
+                f"<pre>{escape_html_telegram(msg)}</pre>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception("flip: telegram failed")
+
+    return out
+
+
 def process_v3_signal(
     cur,
     *,
@@ -483,41 +930,24 @@ def process_v3_signal(
     cycle_id = str(row["cycle_id"])
     scid = row["structural_cycle_id"]
     scid = str(scid) if scid else None
+    flip_out: Optional[Dict[str, Any]] = None
 
     if signal_type in ("CANCEL_LONG", "CANCEL_SHORT"):
-        _log_v3_event(
-            cur,
-            cycle_id=cycle_id,
-            structural_cycle_id=scid,
-            event_type=f"v3_{signal_type.lower()}",
-            symbol=None,
-            price=None,
-            meta={"action": "reset_monitor_flags"},
-        )
-        cur.execute(
-            """
-            UPDATE trading_state SET
-                allow_long_entry = 1, allow_short_entry = 1,
-                updated_at = ?
-            WHERE id = 1
-            """,
-            (int(time.time()),),
-        )
-        monitor.reset()
-        monitor.sync_cycle(
-            cur,
-            cycle_id=cycle_id,
-            structural_cycle_id=scid,
-            levels=load_cycle_level_pairs(cur, cycle_id),
-        )
+        out = close_trading_epoch_v3_cancel(cur, monitor=monitor, signal_type=signal_type)
         if st.LEVEL_CROSS_TELEGRAM:
             get_telegram_notifier().send_message(
-                f"<pre>{escape_html_telegram(signal_type + ' — сценарий сброшен, монитор переинициализирован')}</pre>",
+                f"<pre>{escape_html_telegram(signal_type + ' — эпоха freeze закрыта (S0), ждём полный structural')}</pre>",
                 parse_mode="HTML",
             )
-        return {"ok": True, "cancel": signal_type}
+        return out
 
     if signal_type in ("LONG", "SHORT"):
+        flip_out = _flip_close_opposite_if_needed(
+            cur,
+            cycle_id=cycle_id,
+            incoming_direction="long" if signal_type == "LONG" else "short",
+            structural_cycle_id=scid,
+        )
         guard = _guard_signal_for_single_sided(
             cur,
             cycle_id=cycle_id,
@@ -525,7 +955,7 @@ def process_v3_signal(
             signal_type=signal_type,
         )
         if guard is not None:
-            return guard
+            return {**guard, "flip_close": flip_out}
 
     long_pct = float(st.ENTRY_GATE_LONG_ATR_THRESHOLD_PCT)
     short_pct = float(st.ENTRY_GATE_SHORT_ATR_THRESHOLD_PCT)
@@ -536,7 +966,7 @@ def process_v3_signal(
         confirmation_ids: List[int] = []
         side_levels = _load_cycle_side_levels(cur, cycle_id=cycle_id, direction="long")
         if not side_levels:
-            return {"ok": False, "error": "no_long_levels"}
+            return {"ok": False, "error": "no_long_levels", "flip_close": flip_out}
         for symbol, level in side_levels.items():
             current_price = prices.get(symbol)
             if current_price is None:
@@ -604,13 +1034,9 @@ def process_v3_signal(
                     and bool(confirmation_ids)
                 )
                 if will_auto:
-                    mode = (
-                        "лимитные ордера (GTC)"
-                        if st.ENTRY_AUTO_OPEN_USE_LIMIT
-                        else "рыночный вход и стоп"
-                    )
                     gate_msg = (
-                        f"Вход LONG по {len(entered)} монетам — выставляем {mode}: "
+                        "Вход LONG по "
+                        f"{len(entered)} монетам — лимитные ордера (GTC) со стопом: "
                         + ",".join(entered)
                     )
                 else:
@@ -626,17 +1052,13 @@ def process_v3_signal(
             ):
                 from trading_bot.data.position_opening import auto_open_after_gate_confirmations
 
-                auto_open_results = auto_open_after_gate_confirmations(
-                    cur,
-                    confirmation_ids,
-                    use_limit=st.ENTRY_AUTO_OPEN_USE_LIMIT,
-                )
+                auto_open_results = auto_open_after_gate_confirmations(cur, confirmation_ids)
 
     elif signal_type == "SHORT":
         confirmation_ids_s: List[int] = []
         side_levels = _load_cycle_side_levels(cur, cycle_id=cycle_id, direction="short")
         if not side_levels:
-            return {"ok": False, "error": "no_short_levels"}
+            return {"ok": False, "error": "no_short_levels", "flip_close": flip_out}
         for symbol, level in side_levels.items():
             current_price = prices.get(symbol)
             if current_price is None:
@@ -707,13 +1129,9 @@ def process_v3_signal(
                     and bool(confirmation_ids_s)
                 )
                 if will_auto:
-                    mode = (
-                        "лимитные ордера (GTC)"
-                        if st.ENTRY_AUTO_OPEN_USE_LIMIT
-                        else "рыночный вход и стоп"
-                    )
                     gate_msg = (
-                        f"Вход SHORT по {len(entered)} монетам — выставляем {mode}: "
+                        "Вход SHORT по "
+                        f"{len(entered)} монетам — лимитные ордера (GTC) со стопом: "
                         + ",".join(entered)
                     )
                 else:
@@ -729,17 +1147,14 @@ def process_v3_signal(
             ):
                 from trading_bot.data.position_opening import auto_open_after_gate_confirmations
 
-                auto_open_results = auto_open_after_gate_confirmations(
-                    cur,
-                    confirmation_ids_s,
-                    use_limit=st.ENTRY_AUTO_OPEN_USE_LIMIT,
-                )
+                auto_open_results = auto_open_after_gate_confirmations(cur, confirmation_ids_s)
 
     out: Dict[str, Any] = {
         "ok": True,
         "signal": signal_type,
         "entered": entered,
         "rejected": rejected,
+        "flip_close": flip_out,
     }
     if auto_open_results is not None:
         out["auto_open"] = auto_open_results
@@ -795,4 +1210,10 @@ def _confirm(
     return rid
 
 
-__all__ = ["process_v3_signal", "run_opposite_rebuild_maintenance_tick", "signal_structural_ready"]
+__all__ = [
+    "process_v3_signal",
+    "run_opposite_rebuild_maintenance_tick",
+    "signal_structural_ready",
+    "close_trading_epoch_v3_cancel",
+    "maybe_transition_arming_after_package_all_flat",
+]

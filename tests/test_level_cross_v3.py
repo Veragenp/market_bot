@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import time
+import uuid
 
+from trading_bot.analytics.entry_gate import maybe_transition_arming_after_package_all_flat
 from trading_bot.analytics.entry_gate import process_v3_signal
 from trading_bot.analytics.entry_gate import run_opposite_rebuild_maintenance_tick
 from trading_bot.analytics.level_cross_monitor import (
@@ -416,6 +418,206 @@ def test_maintenance_uses_structural_membership_not_only_entered_symbols(clean_d
     conn.close()
     assert out.get("ok") is True
     assert int(row["c"]) == 1
+
+
+def test_cancel_closes_trading_epoch_and_clears_cycle_id(clean_db, monkeypatch):
+    monkeypatch.setattr("trading_bot.config.settings.LEVEL_CROSS_TELEGRAM", False)
+    init_db()
+    run_migrations()
+    ts = int(time.time())
+    conn = get_connection()
+    cur = conn.cursor()
+    _setup_frozen_cycle(cur, ts=ts, long_level=100.0, short_level=200.0)
+    conn.commit()
+    conn.close()
+
+    mon = LevelCrossMonitor()
+    conn = get_connection()
+    cur = conn.cursor()
+    r = process_v3_signal(cur, signal_type="CANCEL_LONG", monitor=mon, prices={})
+    row = cur.execute(
+        """
+        SELECT cycle_phase, levels_frozen, cycle_id, structural_cycle_id, close_reason,
+               allow_long_entry, allow_short_entry
+        FROM trading_state WHERE id = 1
+        """
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    assert r.get("ok") is True
+    assert r.get("close_reason") == "v3_cancel_long"
+    assert row["cycle_phase"] == "closed"
+    assert int(row["levels_frozen"] or 0) == 0
+    assert row["cycle_id"] is None
+    assert row["structural_cycle_id"] is None
+    assert row["close_reason"] == "v3_cancel_long"
+    assert int(row["allow_long_entry"] or 0) == 1
+    assert int(row["allow_short_entry"] or 0) == 1
+
+
+def test_package_all_flat_closes_epoch_and_unfreezes(clean_db, monkeypatch):
+    monkeypatch.setattr("trading_bot.config.settings.ENTRY_PACKAGE_FLAT_TRANSITION", True)
+    init_db()
+    run_migrations()
+    ts = int(time.time())
+    conn = get_connection()
+    cur = conn.cursor()
+    cid = _setup_frozen_cycle(cur, ts=ts, long_level=100.0, short_level=200.0)
+    cur.execute(
+        """
+        UPDATE trading_state
+        SET cycle_phase = 'in_position', position_state = 'long'
+        WHERE id = 1
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO position_records (
+            uuid, created_at, updated_at, cycle_id, structural_cycle_id,
+            symbol, side, status, qty, closed_at, close_reason
+        )
+        VALUES (?, ?, ?, ?, ?, 'BTC/USDT', 'long', 'closed', 1.0, ?, 'take')
+        """,
+        (str(uuid.uuid4()), ts, ts, cid, cid, ts),
+    )
+    conn.commit()
+    conn.close()
+
+    conn = get_connection()
+    cur = conn.cursor()
+    out = maybe_transition_arming_after_package_all_flat(cur)
+    row = cur.execute(
+        """
+        SELECT cycle_phase, levels_frozen, cycle_id, last_rebuild_reason, last_package_exit_reason
+        FROM trading_state WHERE id = 1
+        """
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    assert out.get("transitioned") is True
+    assert row["cycle_phase"] == "closed"
+    assert int(row["levels_frozen"] or 0) == 0
+    assert row["cycle_id"] is None
+    assert row["last_rebuild_reason"] == "package_all_flat_close_epoch"
+    assert row["last_package_exit_reason"] == "take"
+
+
+def test_package_flat_skips_when_no_records_and_bybit_disabled(clean_db, monkeypatch):
+    monkeypatch.setattr("trading_bot.config.settings.ENTRY_PACKAGE_FLAT_TRANSITION", True)
+    monkeypatch.setattr("trading_bot.config.settings.ENTRY_PACKAGE_FLAT_USE_BYBIT_POSITIONS", False)
+    monkeypatch.setattr("trading_bot.config.settings.BYBIT_EXECUTION_ENABLED", False)
+    init_db()
+    run_migrations()
+    ts = int(time.time())
+    conn = get_connection()
+    cur = conn.cursor()
+    _setup_frozen_cycle(cur, ts=ts, long_level=100.0, short_level=200.0)
+    cur.execute(
+        """
+        UPDATE trading_state
+        SET cycle_phase = 'in_position', position_state = 'long'
+        WHERE id = 1
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    conn = get_connection()
+    cur = conn.cursor()
+    out = maybe_transition_arming_after_package_all_flat(cur)
+    conn.close()
+    assert out.get("skipped") == "no_position_records_and_bybit_flat_disabled"
+
+
+def test_package_flat_bybit_pool_when_no_records(clean_db, monkeypatch):
+    monkeypatch.setattr("trading_bot.config.settings.ENTRY_PACKAGE_FLAT_TRANSITION", True)
+    monkeypatch.setattr("trading_bot.config.settings.ENTRY_PACKAGE_FLAT_USE_BYBIT_POSITIONS", True)
+    monkeypatch.setattr("trading_bot.config.settings.BYBIT_EXECUTION_ENABLED", False)
+
+    def fake_positions(symbol=None):
+        return {"result": {"list": []}}
+
+    monkeypatch.setattr("trading_bot.analytics.entry_gate.get_linear_positions", fake_positions)
+
+    init_db()
+    run_migrations()
+    ts = int(time.time())
+    conn = get_connection()
+    cur = conn.cursor()
+    _setup_frozen_cycle(cur, ts=ts, long_level=100.0, short_level=200.0)
+    cur.execute(
+        """
+        UPDATE trading_state
+        SET cycle_phase = 'in_position', position_state = 'long'
+        WHERE id = 1
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    conn = get_connection()
+    cur = conn.cursor()
+    out = maybe_transition_arming_after_package_all_flat(cur)
+    row = cur.execute(
+        "SELECT cycle_phase, last_package_exit_reason FROM trading_state WHERE id = 1"
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    assert out.get("transitioned") is True
+    assert out.get("last_package_exit_reason") == "bybit_flat"
+    assert row["cycle_phase"] == "closed"
+    assert row["last_package_exit_reason"] == "bybit_flat"
+
+
+def test_package_flat_bybit_ignored_in_arming_when_no_records(clean_db, monkeypatch):
+    """После freeze в arming биржа пустая — не сбрасываем эпоху (иначе structural по таймеру)."""
+    monkeypatch.setattr("trading_bot.config.settings.ENTRY_PACKAGE_FLAT_TRANSITION", True)
+    monkeypatch.setattr("trading_bot.config.settings.ENTRY_PACKAGE_FLAT_USE_BYBIT_POSITIONS", True)
+    monkeypatch.setattr("trading_bot.config.settings.BYBIT_EXECUTION_ENABLED", False)
+
+    def fake_positions(symbol=None):
+        return {"result": {"list": []}}
+
+    monkeypatch.setattr("trading_bot.analytics.entry_gate.get_linear_positions", fake_positions)
+
+    init_db()
+    run_migrations()
+    ts = int(time.time())
+    conn = get_connection()
+    cur = conn.cursor()
+    cid = _setup_frozen_cycle(cur, ts=ts, long_level=100.0, short_level=200.0)
+    cur.execute(
+        """
+        UPDATE trading_state
+        SET cycle_phase = 'arming', position_state = 'none'
+        WHERE id = 1
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    conn = get_connection()
+    cur = conn.cursor()
+    out = maybe_transition_arming_after_package_all_flat(cur)
+    row = cur.execute(
+        "SELECT cycle_phase, levels_frozen, cycle_id, last_package_exit_reason FROM trading_state WHERE id = 1"
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    assert out.get("skipped") == "arming_bybit_flat_ignored"
+    assert row["cycle_phase"] == "arming"
+    assert int(row["levels_frozen"] or 0) == 1
+    assert row["cycle_id"] == cid
+
+
+def test_pool_symbols_flat_on_linear_exchange_helper():
+    from trading_bot.tools.bybit_trading import pool_symbols_flat_on_linear_exchange
+
+    assert pool_symbols_flat_on_linear_exchange(
+        ["BTC/USDT", "ETH/USDT"],
+        {"BTCUSDT": 0.0, "ETHUSDT": 0.0},
+    )
+    assert not pool_symbols_flat_on_linear_exchange(["BTC/USDT"], {"BTCUSDT": 0.001})
 
 
 def test_load_cycle_level_pairs_requires_both_sides(clean_db):

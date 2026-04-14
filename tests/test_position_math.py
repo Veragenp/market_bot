@@ -68,7 +68,7 @@ def test_tp_as_stop_ranges_and_entry_offset_pct():
     p = compute_position_plan(
         side="long",
         base_price=100.0,
-        entry_price_raw=1.0,  # ignored because use_entry_offset=True
+        entry_price_raw=1.0,  # ignored: use_entry_offset=True → Y всегда от K
         atr=10.0,
         risk_usdt=5.0,
         stop_atr_mult=0.25,  # stop distance = 2.5
@@ -83,9 +83,33 @@ def test_tp_as_stop_ranges_and_entry_offset_pct():
         use_entry_offset=True,
         tp_in_stop_ranges=True,
     )
-    # Люфт 2% от ATR=10 => X=0.2; Y = K + X = 100.2
-    assert p.entry_price == pytest.approx(100.2)
-    # AB = Y - 2.5 = 97.7
-    assert p.stop_price == pytest.approx(97.7)
-    # TP = Y + 7.5 = 107.7
-    assert p.tp1_price == pytest.approx(107.7)
+    # Люфт 2% от K=100 => X=2; Y = K + X = 102
+    assert p.entry_price == pytest.approx(102.0)
+    # AB = Y - 2.5 = 99.5
+    assert p.stop_price == pytest.approx(99.5)
+    # TP = Y + 7.5 = 109.5
+    assert p.tp1_price == pytest.approx(109.5)
+
+
+def test_use_entry_offset_zero_entry_is_level_k_not_raw():
+    """Лимит на уровне K; сырая цена в entry_price_raw не влияет."""
+    p = compute_position_plan(
+        side="long",
+        base_price=0.926,
+        entry_price_raw=1.5,
+        atr=0.02,
+        risk_usdt=1.0,
+        stop_atr_mult=0.2,
+        tp1_atr_mult=3.0,
+        tp2_atr_mult=3.0,
+        tp3_atr_mult=3.0,
+        tp1_share_pct=100.0,
+        tp2_share_pct=0.0,
+        price_tick=0.0001,
+        qty_step=0.1,
+        entry_offset_pct=0.0,
+        use_entry_offset=True,
+        tp_in_stop_ranges=True,
+    )
+    assert p.base_price == pytest.approx(0.926)
+    assert p.entry_price == pytest.approx(0.926)
