@@ -620,7 +620,7 @@ def test_pool_symbols_flat_on_linear_exchange_helper():
     assert not pool_symbols_flat_on_linear_exchange(["BTC/USDT"], {"BTCUSDT": 0.001})
 
 
-def test_load_cycle_level_pairs_requires_both_sides(clean_db):
+def test_load_cycle_level_pairs_allows_single_side_symbol(clean_db):
     init_db()
     run_migrations()
     conn = get_connection()
@@ -639,4 +639,6 @@ def test_load_cycle_level_pairs_requires_both_sides(clean_db):
     conn.commit()
     pairs = load_cycle_level_pairs(cur, cid)
     conn.close()
-    assert pairs == {}
+    assert "ETH/USDT" in pairs
+    assert pairs["ETH/USDT"]["long"] == 1.0
+    assert "short" not in pairs["ETH/USDT"]

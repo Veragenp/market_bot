@@ -648,6 +648,11 @@ STRUCTURAL_OPPOSITE_REBUILD_ENABLED = os.getenv("STRUCTURAL_OPPOSITE_REBUILD_ENA
 STRUCTURAL_OPPOSITE_REBUILD_DEADLINE_SEC = int(
     os.getenv("STRUCTURAL_OPPOSITE_REBUILD_DEADLINE_SEC", "14400")
 )
+# Множитель диапазона ATR для rebuild противоположной стороны:
+# fit_band = [STRUCTURAL_W_MIN * mult, STRUCTURAL_W_MAX * mult].
+STRUCTURAL_OPPOSITE_REBUILD_BAND_MULT = float(
+    os.getenv("STRUCTURAL_OPPOSITE_REBUILD_BAND_MULT", "2.0")
+)
 
 # Отчёт structural-scan → Google Sheets (лист по умолчанию; переименование через env).
 STRUCTURAL_LEVELS_REPORT_WORKSHEET = (

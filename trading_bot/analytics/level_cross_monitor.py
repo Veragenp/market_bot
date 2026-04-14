@@ -39,7 +39,8 @@ def load_cycle_level_pairs(cur, cycle_id: str) -> Dict[str, Dict[str, float]]:
         sym = str(r["symbol"])
         d = str(r["direction"])
         out.setdefault(sym, {})[d] = float(r["level_price"])
-    return {k: v for k, v in out.items() if "long" in v and "short" in v}
+    # Монета может участвовать только в long или только в short наборе.
+    return out
 
 
 def _log_v3_event(
@@ -420,6 +421,54 @@ def run_level_cross_tick(
     signals.extend(mon.check_cancellation_conditions(cur))
     summary["signals"] = list(signals)
     summary["symbols"] = len(mon.levels)
+
+    if st.LEVEL_CROSS_TICK_SUMMARY_LOG:
+        n_lv = len(mon.levels)
+        priced = sum(
+            1 for s in mon.levels if prices.get(s) is not None and float(prices[s]) > 0
+        )
+        min_n = int(st.LEVEL_CROSS_MIN_ALERTS_COUNT)
+        timeout_min = float(st.LEVEL_CROSS_ALERT_TIMEOUT_MINUTES)
+        now_t = _utc_naive()
+        long_n = len(mon.long_alerts)
+        short_n = len(mon.short_alerts)
+        hist_n = len(mon.alerts_history)
+        long_age: Optional[float] = None
+        short_age: Optional[float] = None
+        if mon.long_window_start:
+            long_age = (now_t - mon.long_window_start).total_seconds() / 60.0
+        if mon.short_window_start:
+            short_age = (now_t - mon.short_window_start).total_seconds() / 60.0
+        long_pending = ""
+        if mon.long_window_start and long_n >= min_n and long_age is not None and long_age < timeout_min:
+            long_pending = f"LONG waiting timeout ({long_age:.1f}/{timeout_min} min, {long_n}>={min_n} syms)"
+        short_pending = ""
+        if mon.short_window_start and short_n >= min_n and short_age is not None and short_age < timeout_min:
+            short_pending = f"SHORT waiting timeout ({short_age:.1f}/{timeout_min} min, {short_n}>={min_n} syms)"
+        if mon.long_window_start and long_n < min_n:
+            long_pending = f"LONG need more symbols ({long_n}/{min_n})"
+        if mon.short_window_start and short_n < min_n:
+            short_pending = f"SHORT need more symbols ({short_n}/{min_n})"
+        extra = " ".join(x for x in (long_pending, short_pending) if x).strip()
+        logger.info(
+            "LevelCrossTick cycle_id=%s symbols=%s priced=%s/%s allow_long=%s allow_short=%s "
+            "crosses_hist=%s long_alerts_sym=%s short_alerts_sym=%s "
+            "min_n=%s timeout_min=%s signals=%s%s",
+            cycle_id,
+            n_lv,
+            priced,
+            n_lv,
+            int(allow_long),
+            int(allow_short),
+            hist_n,
+            long_n,
+            short_n,
+            min_n,
+            timeout_min,
+            signals,
+            f" | {extra}" if extra else "",
+        )
+
     return signals, summary
 
 

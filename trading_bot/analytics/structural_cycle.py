@@ -119,23 +119,43 @@ class StructuralCycle:
 
 
 # ---------------------------------------------------------------------------
-# SQL: топ-K уровней с одной стороны от ref
+# SQL: топ-K уровней в ATR-полосе от ref (v4-style)
 # ---------------------------------------------------------------------------
+
+
+def _level_rank_key(lvl: StrongLevel) -> Tuple[float, int, int]:
+    """Ранжирование как в v4: сила, при равенстве manual_global_hvn, затем id."""
+    manual_bonus = 1 if str(lvl.level_type or "") == "manual_global_hvn" else 0
+    return (float(lvl.volume_peak or 0.0), manual_bonus, int(lvl.id))
+
+
+def _band_bounds(ref_price: float, atr: float, direction: str) -> Tuple[float, float]:
+    """Цена в полосе [min_atr, max_atr] от ref (ниже/выше)."""
+    d_min = float(settings_pkg.STRUCTURAL_V4_BAND_MIN_ATR)
+    d_max = float(settings_pkg.STRUCTURAL_V4_BAND_MAX_ATR)
+    if direction == "long":
+        # Ниже ref: ref - dist, dist in [d_min*atr, d_max*atr]
+        return ref_price - d_max * atr, ref_price - d_min * atr
+    # Выше ref: ref + dist, dist in [d_min*atr, d_max*atr]
+    return ref_price + d_min * atr, ref_price + d_max * atr
 
 
 def _fetch_top_levels(
     cur,
     symbol: str,
     ref_price: float,
+    atr: float,
     direction: str,
     types: Sequence[str],
     k: int,
 ) -> List[StrongLevel]:
-    if not types or k <= 0:
+    if not types or k <= 0 or atr <= 0:
         return []
-    op = "<" if direction == "long" else ">"
+    lo, hi = _band_bounds(float(ref_price), float(atr), direction)
     ph = ",".join("?" * len(types))
-    rows = cur.execute(
+    op = "<" if direction == "long" else ">"
+    # Берем расширенную выборку по стороне и приоритизируем уровни внутри v4-полосы.
+    rows: Sequence[Any] = cur.execute(
         f"""
         SELECT id, price, volume_peak, strength, tier, level_type
         FROM price_levels
@@ -144,13 +164,12 @@ def _fetch_top_levels(
           AND status = 'active'
           AND level_type IN ({ph})
           AND price {op} ?
-        ORDER BY COALESCE(volume_peak, 0) DESC, COALESCE(strength, 0) DESC,
-                 COALESCE(updated_at, created_at) DESC
+        ORDER BY COALESCE(volume_peak, strength, 0) DESC, id DESC
         LIMIT ?
         """,
-        (symbol, *types, ref_price, k),
+        (symbol, *types, ref_price, int(max(k * 4, k))),
     ).fetchall()
-    return [
+    out = [
         StrongLevel(
             id=int(r[0]),
             price=float(r[1]),
@@ -161,6 +180,14 @@ def _fetch_top_levels(
         )
         for r in rows
     ]
+    def _score(lvl: StrongLevel) -> Tuple[float, int, int, int]:
+        in_band = 1 if (lo < hi and lo <= lvl.price <= hi) else 0
+        st, manual, lid = _level_rank_key(lvl)
+        # Совместимость: сила — первичный критерий; полоса v4 используется как доп. приоритет.
+        return (st, manual, in_band, lid)
+
+    out.sort(key=_score, reverse=True)
+    return out[: int(k)]
 
 
 def select_best_pair_from_sides(
@@ -201,8 +228,8 @@ def select_best_pair_for_symbol(
     w_lo: float,
     w_hi: float,
 ) -> Optional[SymbolPair]:
-    below = _fetch_top_levels(cur, symbol, ref_price, "long", types, top_k)
-    above = _fetch_top_levels(cur, symbol, ref_price, "short", types, top_k)
+    below = _fetch_top_levels(cur, symbol, ref_price, atr, "long", types, top_k)
+    above = _fetch_top_levels(cur, symbol, ref_price, atr, "short", types, top_k)
     return select_best_pair_from_sides(symbol, below, above, atr, ref_price, w_lo, w_hi)
 
 
@@ -241,8 +268,8 @@ def fit_pair_to_etalon(
     w_hi_global: float,
     slack: float,
 ) -> Optional[SymbolPair]:
-    below = _fetch_top_levels(cur, symbol, ref_price, "long", types, top_k)
-    above = _fetch_top_levels(cur, symbol, ref_price, "short", types, top_k)
+    below = _fetch_top_levels(cur, symbol, ref_price, atr, "long", types, top_k)
+    above = _fetch_top_levels(cur, symbol, ref_price, atr, "short", types, top_k)
     if not below or not above or atr <= 0:
         return None
     lo, hi = _w_fit_bounds(w_star, w_lo_global, w_hi_global, slack)
@@ -309,11 +336,16 @@ def _build_row(
     pair: Optional[SymbolPair],
     atr: Optional[float],
     mid_pct: float,
+    level_below: Optional[StrongLevel] = None,
+    level_above: Optional[StrongLevel] = None,
 ) -> StructuralSymbolResult:
-    if status != "ok" or pair is None or atr is None or atr <= 0:
+    if pair is not None:
+        level_below = pair.level_below
+        level_above = pair.level_above
+    if atr is None or atr <= 0:
         return StructuralSymbolResult(
             symbol=symbol,
-            status="incomplete_structure" if status == "ok" else status,
+            status="incomplete_structure" if status in ("ok", "partial") else status,
             level_below_id=None,
             level_above_id=None,
             L_price=None,
@@ -329,24 +361,38 @@ def _build_row(
             volume_peak_below=None,
             volume_peak_above=None,
         )
-    mid, mlo, mhi = symbol_pair_to_zone_bounds(pair, mid_pct)
+    lp = float(level_below.price) if level_below is not None else None
+    up = float(level_above.price) if level_above is not None else None
+    w_atr: Optional[float] = None
+    mid: Optional[float] = None
+    mlo: Optional[float] = None
+    mhi: Optional[float] = None
+    if lp is not None and up is not None:
+        if pair is not None:
+            w_atr = float(pair.W)
+        else:
+            w_atr = (up - lp) / float(atr)
+        mid = (lp + up) / 2.0
+        half = (mid_pct / 100.0) * (up - lp) / 2.0
+        mlo = mid - half
+        mhi = mid + half
     return StructuralSymbolResult(
         symbol=symbol,
-        status="ok",
-        level_below_id=pair.level_below.id,
-        level_above_id=pair.level_above.id,
-        L_price=pair.level_below.price,
-        U_price=pair.level_above.price,
+        status=status,
+        level_below_id=(level_below.id if level_below is not None else None),
+        level_above_id=(level_above.id if level_above is not None else None),
+        L_price=lp,
+        U_price=up,
         atr=float(atr),
-        W_atr=pair.W,
+        W_atr=w_atr,
         mid_price=mid,
         mid_band_low=mlo,
         mid_band_high=mhi,
         ref_price=ref_price,
-        tier_below=pair.level_below.tier or None,
-        tier_above=pair.level_above.tier or None,
-        volume_peak_below=float(pair.level_below.volume_peak),
-        volume_peak_above=float(pair.level_above.volume_peak),
+        tier_below=(level_below.tier or None) if level_below is not None else None,
+        tier_above=(level_above.tier or None) if level_above is not None else None,
+        volume_peak_below=(float(level_below.volume_peak) if level_below is not None else None),
+        volume_peak_above=(float(level_above.volume_peak) if level_above is not None else None),
     )
 
 
@@ -376,8 +422,12 @@ def compute_structural_symbol_results(
         ref = float(ref_by_symbol[symbol])
         atr = get_instruments_atr_bybit_futures_cur(cur, symbol)
         atr_cache[symbol] = atr
-        below_cache[symbol] = _fetch_top_levels(cur, symbol, ref, "long", types, k)
-        above_cache[symbol] = _fetch_top_levels(cur, symbol, ref, "short", types, k)
+        if atr is None or atr <= 0:
+            below_cache[symbol] = []
+            above_cache[symbol] = []
+        else:
+            below_cache[symbol] = _fetch_top_levels(cur, symbol, ref, float(atr), "long", types, k)
+            above_cache[symbol] = _fetch_top_levels(cur, symbol, ref, float(atr), "short", types, k)
         if atr is None or atr <= 0:
             no_atr_symbols.append(symbol)
             continue
@@ -413,72 +463,84 @@ def compute_structural_symbol_results(
     results: List[StructuralSymbolResult] = []
 
     w_star, etalon_pairs = build_etalon(initial_pairs, w_lo_band, w_hi_band, params.n_etalon)
-    if w_star is None:
-        for symbol in symbols:
-            ref = float(ref_by_symbol[symbol])
-            results.append(
-                _build_row(
-                    symbol,
-                    "incomplete_structure",
-                    ref,
-                    None,
-                    atr_cache.get(symbol),
-                    params.mid_band_pct,
-                )
-            )
-        return results, {
-            "pool_median_w": 0.0,
-            "pool_mad": 0.0,
-            "pool_median_r": 0.0,
-            "pool_mad_r": 0.0,
-            "w_star": 0.0,
-            "etalon_failed": 1,
-        }
-
-    logger.info(
-        "Эталон W* = %s на основе %s монет",
-        w_star,
-        len(etalon_pairs),
-    )
+    etalon_failed = w_star is None
+    if etalon_failed:
+        logger.warning(
+            "Эталон W* не сформирован: продолжаем с односторонними/сырьевыми уровнями по symbol."
+        )
+        w_star = 0.0
+        etalon_pairs = []
+    else:
+        logger.info(
+            "Эталон W* = %s на основе %s монет",
+            w_star,
+            len(etalon_pairs),
+        )
 
     w_slack_frac = float(params.w_slack)
     slack_abs_min = float(params.w_slack_abs_min)
-    effective_slack = max(slack_abs_min, float(w_star) * w_slack_frac)
+    effective_slack = max(slack_abs_min, float(w_star) * w_slack_frac if not etalon_failed else 0.0)
     etalon_by_symbol = {p.symbol: p for p in etalon_pairs}
     ok_ws: List[float] = []
 
     for symbol in symbols:
         ref = float(ref_by_symbol[symbol])
         atr = atr_cache.get(symbol)
-        if (
-            atr is None
-            or atr <= 0
-            or len(below_cache.get(symbol, ())) < min_side
-            or len(above_cache.get(symbol, ())) < min_side
-        ):
+        below = below_cache.get(symbol, ())
+        above = above_cache.get(symbol, ())
+        if atr is None or atr <= 0:
             results.append(
                 _build_row(symbol, "incomplete_structure", ref, None, atr, params.mid_band_pct)
             )
             continue
-        orig = etalon_by_symbol.get(symbol)
-        if orig is not None and orig.level_below.price < ref < orig.level_above.price:
-            pair: Optional[SymbolPair] = replace(orig, ref_price=ref)
-        else:
-            pair = fit_pair_to_etalon(
-                cur,
-                symbol,
-                ref,
-                float(atr),
-                w_star,
-                types,
-                k,
-                w_lo_band,
-                w_hi_band,
-                effective_slack,
-            )
-        if pair is None:
+        if not below and not above:
             results.append(
                 _build_row(symbol, "incomplete_structure", ref, None, atr, params.mid_band_pct)
+            )
+            continue
+        pair: Optional[SymbolPair] = None
+        if len(below) >= min_side and len(above) >= min_side:
+            orig = etalon_by_symbol.get(symbol)
+            if orig is not None and orig.level_below.price < ref < orig.level_above.price:
+                pair = replace(orig, ref_price=ref)
+            elif not etalon_failed:
+                pair = fit_pair_to_etalon(
+                    cur,
+                    symbol,
+                    ref,
+                    float(atr),
+                    w_star,
+                    types,
+                    k,
+                    w_lo_band,
+                    w_hi_band,
+                    effective_slack,
+                )
+            if pair is None and below and above:
+                # fallback: берем сильнейшие стороны без W*-fit, чтобы передать уровни в торговый контур
+                b0 = below[0]
+                a0 = above[0]
+                if b0.price < ref < a0.price:
+                    pair = SymbolPair(
+                        symbol=symbol,
+                        level_below=b0,
+                        level_above=a0,
+                        W=(a0.price - b0.price) / float(atr),
+                        atr=float(atr),
+                        ref_price=ref,
+                    )
+        if pair is None:
+            results.append(
+                _build_row(
+                    symbol,
+                    "partial",
+                    ref,
+                    None,
+                    atr,
+                    params.mid_band_pct,
+                    level_below=(below[0] if below else None),
+                    level_above=(above[0] if above else None),
+                )
             )
             continue
         row = _build_row(symbol, "ok", ref, pair, float(atr), params.mid_band_pct)
@@ -509,7 +571,7 @@ def compute_structural_symbol_results(
         "pool_median_r": 0.0,
         "pool_mad_r": 0.0,
         "w_star": float(w_star),
-        "etalon_failed": 0,
+        "etalon_failed": (1 if etalon_failed else 0),
     }
     return results, pool_stats
 
@@ -772,7 +834,7 @@ def rebuild_opposite_zone_on_cursor(cur, cycle_id: str, entered_direction: str) 
 
             if entered_direction == "long":
                 anchor = float(r["L_price"])
-                cands = _fetch_top_levels(cur, sym, anchor, "short", types, top_k)
+                cands = _fetch_top_levels(cur, sym, anchor, atr, "short", types, top_k)
                 best = _pick_best_opposite_level(
                     candidates=cands,
                     anchor_price=anchor,
@@ -804,7 +866,7 @@ def rebuild_opposite_zone_on_cursor(cur, cycle_id: str, entered_direction: str) 
                 updated += 1
             else:
                 anchor = float(r["U_price"])
-                cands = _fetch_top_levels(cur, sym, anchor, "long", types, top_k)
+                cands = _fetch_top_levels(cur, sym, anchor, atr, "long", types, top_k)
                 best = _pick_best_opposite_level(
                     candidates=cands,
                     anchor_price=anchor,

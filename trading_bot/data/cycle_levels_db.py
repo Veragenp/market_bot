@@ -19,10 +19,9 @@ from trading_bot.config.settings import (
     STRUCTURAL_MIN_POOL_SYMBOLS,
     STRUCTURAL_N_ETALON,
     STRUCTURAL_TOP_K,
+    STRUCTURAL_OPPOSITE_REBUILD_BAND_MULT,
     STRUCTURAL_W_MAX,
     STRUCTURAL_W_MIN,
-    STRUCTURAL_W_SLACK_ABS_MIN,
-    STRUCTURAL_W_SLACK_PCT,
 )
 from trading_bot.config.symbols import TRADING_SYMBOLS
 from trading_bot.data.db import get_connection
@@ -441,98 +440,74 @@ def backfill_missing_cycle_side(
         return {"inserted": 0, "missing": list(symbols), "error": "invalid_direction"}
     now_ts = _now_ts()
     fixed_direction = "long" if missing_direction == "short" else "short"
-    existing_w: Dict[str, float] = {}
     todo: Dict[str, Dict[str, object]] = {}
     for symbol in symbols:
         atr = _atr_daily(symbol, cur)
         if atr is None or atr <= 0:
             continue
-        fixed_price = _load_side_level(cur, cycle_id=cycle_id, symbol=symbol, direction=fixed_direction)
-        if fixed_price is None:
+        exists = cur.execute(
+            """
+            SELECT 1
+            FROM cycle_levels
+            WHERE cycle_id = ? AND symbol = ? AND direction = ? AND level_step = 1 AND is_active = 1
+            LIMIT 1
+            """,
+            (cycle_id, symbol, missing_direction),
+        ).fetchone()
+        if exists is not None:
             continue
-        existing_price = _load_side_level(cur, cycle_id=cycle_id, symbol=symbol, direction=missing_direction)
-        if existing_price is not None:
-            w = ((existing_price - fixed_price) / atr) if missing_direction == "short" else ((fixed_price - existing_price) / atr)
-            if w > 0:
-                existing_w[symbol] = float(w)
-            continue
+
         ref = ref_prices.get(symbol)
-        if ref is None or ref <= 0:
+        if ref is None or float(ref) <= 0:
+            ref = _latest_close_1m(symbol, cur)
+        if ref is None or float(ref) <= 0:
             continue
-        cands = _load_anchor_candidates_with_ref(
-            cur,
-            symbol=symbol,
-            missing_direction=missing_direction,
-            anchor_price=float(fixed_price),
-            ref_price=float(ref),
-            atr=float(atr),
-        )
+
+        fixed_price = _load_side_level(cur, cycle_id=cycle_id, symbol=symbol, direction=fixed_direction)
+        if fixed_price is not None:
+            cands = _load_anchor_candidates_with_ref(
+                cur,
+                symbol=symbol,
+                missing_direction=missing_direction,
+                anchor_price=float(fixed_price),
+                ref_price=float(ref),
+                atr=float(atr),
+            )
+        else:
+            # Без симметрии по символу: якорь только по текущей цене (ref).
+            cands = _load_candidates_with_ref_price(
+                symbol=symbol,
+                direction=missing_direction,
+                ref_price=float(ref),
+                atr=float(atr),
+                cur=cur,
+            )
         if not cands:
             continue
         todo[symbol] = {
-            "atr": float(atr),
-            "fixed": float(fixed_price),
             "ref": float(ref),
             "cands": cands[: int(STRUCTURAL_TOP_K)],
-            "idx": 0,
+            "idx": -1,
         }
 
     if not todo:
         return {"inserted": 0, "missing": list(symbols)}
 
-    w_min = float(STRUCTURAL_W_MIN)
-    w_max = float(STRUCTURAL_W_MAX)
-    w_slack_frac = float(STRUCTURAL_W_SLACK_PCT) / 100.0
-
-    def _w_cand(cand: Candidate, fixed: float, atr: float) -> float:
-        if missing_direction == "short":
-            return (cand.price - fixed) / atr
-        return (fixed - cand.price) / atr
-
-    w_votes: List[float] = []
-    for _sym, w in existing_w.items():
-        if w_min <= w <= w_max:
-            w_votes.append(float(w))
+    band_mult = max(0.1, float(STRUCTURAL_OPPOSITE_REBUILD_BAND_MULT))
+    fit_lo = max(float(CYCLE_LEVELS_MIN_DIST_ATR), float(STRUCTURAL_W_MIN) * band_mult)
+    fit_hi = max(fit_lo, float(STRUCTURAL_W_MAX) * band_mult)
 
     for _symbol, item in todo.items():
         cands = item["cands"]  # type: ignore[index]
-        fixed = float(item["fixed"])  # type: ignore[index]
-        atr = float(item["atr"])  # type: ignore[index]
-        for cand in cands:
-            w = _w_cand(cand, fixed, atr)
-            if w > 0 and w_min <= w <= w_max:
-                w_votes.append(w)
-                break
-
-    n_req = max(1, min(int(STRUCTURAL_N_ETALON), len(symbols)))
-    if len(w_votes) < n_req:
-        return {"inserted": 0, "missing": list(symbols), "reason": "insufficient_etalon_rebuild"}
-
-    w_star = _median(w_votes)
-    effective_slack = max(float(STRUCTURAL_W_SLACK_ABS_MIN), w_star * w_slack_frac)
-    fit_lo = max(w_min, w_star - effective_slack)
-    fit_hi = min(w_max, w_star + effective_slack)
-    if w_votes:
-        fit_lo = max(w_min, min(fit_lo, min(w_votes)))
-        fit_hi = min(w_max, max(fit_hi, max(w_votes)))
-
-    for _symbol, item in todo.items():
-        cands = item["cands"]  # type: ignore[index]
-        fixed = float(item["fixed"])  # type: ignore[index]
-        atr = float(item["atr"])  # type: ignore[index]
         idx_found = -1
         for i, cand in enumerate(cands):
-            w = _w_cand(cand, fixed, atr)
-            if fit_lo <= w <= fit_hi:
+            if fit_lo <= float(cand.distance_atr) <= fit_hi:
                 idx_found = i
                 break
+        if idx_found < 0 and cands:
+            # Fallback: берем просто сильнейший по стороне.
+            idx_found = 0
         item["idx"] = idx_found  # type: ignore[index]
-
-    need_todo = len(todo)
-    thresh = max(1, min(int(STRUCTURAL_MIN_POOL_SYMBOLS), need_todo))
-    fitted_n = sum(1 for it in todo.values() if int(it["idx"]) >= 0)  # type: ignore[index]
-    if fitted_n < thresh:
-        return {"inserted": 0, "missing": list(symbols), "reason": "insufficient_pool_after_fit_rebuild"}
 
     inserted = 0
     missing: List[str] = []
@@ -554,16 +529,10 @@ def backfill_missing_cycle_side(
             continue
         cands = item["cands"]  # type: ignore[index]
         idx = int(item["idx"])  # type: ignore[index]
-        atr = float(item["atr"])  # type: ignore[index]
-        fixed = float(item["fixed"])  # type: ignore[index]
         if idx < 0 or idx >= len(cands):
             missing.append(symbol)
             continue
         cand = cands[idx]
-        w = _w_cand(cand, fixed, atr)
-        if w <= 0 or not (fit_lo <= w <= fit_hi):
-            missing.append(symbol)
-            continue
         ref = float(item["ref"])  # type: ignore[index]
         cur.execute(
             """

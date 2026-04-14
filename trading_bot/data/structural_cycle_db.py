@@ -203,67 +203,68 @@ def _freeze_cycle_levels(
     for r in ok_rows:
         if r.atr is None or r.atr <= 0:
             continue
-        if r.L_price is None or r.U_price is None or r.level_below_id is None or r.level_above_id is None:
-            continue
-        dist_long = abs(r.L_price - r.ref_price) / r.atr
-        dist_short = abs(r.U_price - r.ref_price) / r.atr
-        cur.execute(
-            """
-            INSERT INTO cycle_levels (
-                cycle_id, symbol, direction, level_step, level_price, source_level_id,
-                tier, volume_peak, distance_atr, ref_price, ref_price_source, ref_price_ts,
-                is_primary, is_active, frozen_at, updated_at
+        if r.L_price is not None and r.level_below_id is not None:
+            dist_long = abs(r.L_price - r.ref_price) / r.atr
+            cur.execute(
+                """
+                INSERT INTO cycle_levels (
+                    cycle_id, symbol, direction, level_step, level_price, source_level_id,
+                    tier, volume_peak, distance_atr, ref_price, ref_price_source, ref_price_ts,
+                    is_primary, is_active, frozen_at, updated_at
+                )
+                VALUES (?, ?, 'long', 1, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
+                """,
+                (
+                    cycle_id,
+                    r.symbol,
+                    r.L_price,
+                    r.level_below_id,
+                    r.tier_below,
+                    r.volume_peak_below,
+                    dist_long,
+                    r.ref_price,
+                    ref_source,
+                    now_ts,
+                    now_ts,
+                    now_ts,
+                ),
             )
-            VALUES (?, ?, 'long', 1, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
-            """,
-            (
-                cycle_id,
-                r.symbol,
-                r.L_price,
-                r.level_below_id,
-                r.tier_below,
-                r.volume_peak_below,
-                dist_long,
-                r.ref_price,
-                ref_source,
-                now_ts,
-                now_ts,
-                now_ts,
-            ),
-        )
-        n += 1
-        cur.execute(
-            """
-            INSERT INTO cycle_levels (
-                cycle_id, symbol, direction, level_step, level_price, source_level_id,
-                tier, volume_peak, distance_atr, ref_price, ref_price_source, ref_price_ts,
-                is_primary, is_active, frozen_at, updated_at
+            n += 1
+        if r.U_price is not None and r.level_above_id is not None:
+            dist_short = abs(r.U_price - r.ref_price) / r.atr
+            cur.execute(
+                """
+                INSERT INTO cycle_levels (
+                    cycle_id, symbol, direction, level_step, level_price, source_level_id,
+                    tier, volume_peak, distance_atr, ref_price, ref_price_source, ref_price_ts,
+                    is_primary, is_active, frozen_at, updated_at
+                )
+                VALUES (?, ?, 'short', 1, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
+                """,
+                (
+                    cycle_id,
+                    r.symbol,
+                    r.U_price,
+                    r.level_above_id,
+                    r.tier_above,
+                    r.volume_peak_above,
+                    dist_short,
+                    r.ref_price,
+                    ref_source,
+                    now_ts,
+                    now_ts,
+                    now_ts,
+                ),
             )
-            VALUES (?, ?, 'short', 1, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
-            """,
-            (
-                cycle_id,
-                r.symbol,
-                r.U_price,
-                r.level_above_id,
-                r.tier_above,
-                r.volume_peak_above,
-                dist_short,
-                r.ref_price,
-                ref_source,
-                now_ts,
-                now_ts,
-                now_ts,
-            ),
-        )
-        n += 1
+            n += 1
 
     cur.execute(
         """
         UPDATE trading_state
         SET cycle_id = ?, structural_cycle_id = ?, position_state = 'none', cycle_phase = 'arming',
             levels_frozen = 1, cycle_version = cycle_version + 1,
-            close_reason = NULL, last_transition_at = ?, updated_at = ?
+            close_reason = NULL, last_package_exit_reason = NULL,
+            last_transition_at = ?, updated_at = ?
         WHERE id = 1
         """,
         (cycle_id, cycle_id, now_ts, now_ts),
@@ -297,6 +298,21 @@ def run_structural_pipeline(
     stage_started = now_ts
     conn = get_connection()
     cur = conn.cursor()
+    if st.SUPERVISOR_STRUCTURAL_SKIP_WHEN_CYCLE_ACTIVE:
+        tsrow = cur.execute(
+            "SELECT levels_frozen, cycle_phase FROM trading_state WHERE id = 1"
+        ).fetchone()
+        if tsrow and int(tsrow["levels_frozen"] or 0):
+            ph = str(tsrow["cycle_phase"] or "")
+            if ph in ("arming", "in_position"):
+                conn.close()
+                return {
+                    "ok": False,
+                    "error": "refuse_structural_while_frozen_active",
+                    "cycle_phase": ph,
+                    "levels_frozen": 1,
+                }
+
     record_stage_event(
         cur,
         stage="STRUCTURAL_SCAN",
@@ -408,8 +424,10 @@ def run_structural_pipeline(
     _insert_event(cur, cycle_id, "phase_change", now_ts, meta={"to": "scanning"})
 
     results, pool_stats = compute_structural_symbol_results(cur, syms, ref_by_symbol, p)
+    freeze_rows = [r for r in results if (r.level_below_id is not None or r.level_above_id is not None)]
     ok_rows = [r for r in results if r.status == "ok"]
     valid_n = len(ok_rows)
+    valid_n_freeze = len(freeze_rows)
 
     cur.execute(
         """
@@ -441,7 +459,7 @@ def run_structural_pipeline(
     }
 
     etalon_failed = bool(pool_stats.get("etalon_failed"))
-    if etalon_failed:
+    if etalon_failed and valid_n_freeze < p.min_pool_symbols:
         cur.execute(
             """
             UPDATE structural_cycles
@@ -481,7 +499,7 @@ def run_structural_pipeline(
                 logger.exception("structural_ops export_levels_snapshot failed")
         return out
 
-    if valid_n < p.min_pool_symbols:
+    if valid_n_freeze < p.min_pool_symbols:
         cur.execute(
             """
             UPDATE structural_cycles
@@ -505,7 +523,7 @@ def run_structural_pipeline(
             run_id=cycle_id,
             severity="error",
             message="Insufficient pool after W* fit",
-            details={"symbols_ok": valid_n, "min_pool": p.min_pool_symbols},
+            details={"symbols_ok": valid_n, "symbols_with_levels": valid_n_freeze, "min_pool": p.min_pool_symbols},
             started_at=stage_started,
             finished_at=now_ts,
         )
@@ -528,7 +546,7 @@ def run_structural_pipeline(
     _insert_event(cur, cycle_id, "phase_change", now_ts, meta={"to": "armed"})
 
     if do_freeze:
-        n_ins = _freeze_cycle_levels(cur, cycle_id, ok_rows, now_ts, ref_source)
+        n_ins = _freeze_cycle_levels(cur, cycle_id, freeze_rows, now_ts, ref_source)
         _insert_event(
             cur,
             cycle_id,
