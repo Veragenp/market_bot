@@ -1,21 +1,7 @@
-# Python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-
-# Virtual environments
-.venv/
-venv/
-env/
-
-# IDE
-.vscode/
-.idea/
-
-# Local secrets
-credentials.json
-**/credentials.json
-.env
+# Test reports
+report*.txt
+test_report*.txt
+report.txt
 .env.*
 *.key
 *.pem
