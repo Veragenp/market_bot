@@ -108,10 +108,44 @@ def generate_test_levels() -> Dict[str, Any]:
     
     logger.info("TEST_MODE: Starting test level generation")
     
-    # 1. Сбросить текущий цикл
+    # 1. Проверить есть ли активный тестовый цикл
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        active_cycle = cur.execute(
+            """
+            SELECT sc.id, sc.phase, sc.created_at
+            FROM structural_cycles sc
+            WHERE sc.ref_price_source = 'test' 
+              AND sc.phase IN ('armed', 'touch_window', 'entry_timer')
+            ORDER BY sc.created_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        
+        if active_cycle:
+            cycle_id = active_cycle["id"]
+            phase = active_cycle["phase"]
+            logger.info(
+                "TEST_MODE: Active test cycle exists (id=%s phase=%s), skipping regeneration",
+                cycle_id[:8], phase
+            )
+            conn.close()
+            return {
+                "ok": True,
+                "structural_cycle_id": cycle_id,
+                "symbols_count": 0,
+                "levels_created": 0,
+                "skipped": True,
+            }
+    finally:
+        conn.close()
+
+    # 2. Если активного цикла нет - продолжаем создание нового
+    # 3. Сбросить старый завершенный цикл
     _clear_test_cycle()
-    
-    # 2. Получить символы
+
+    # 4. Получить символы
     symbols = get_test_cycle_symbols()
     if not symbols:
         return {"ok": False, "error": "no_symbols"}
@@ -359,22 +393,48 @@ def rebuild_opposite_test_levels(cycle_id: str, known_side: str) -> Dict[str, An
 
 
 def _clear_test_cycle() -> None:
-    """Очистить старый тестовый цикл."""
+    """
+    Очистить старый тестовый цикл ТОЛЬКО если:
+    - фаза 'closed' (цикл завершён)
+    - или прошло >24 часа с создания
+    """
     conn = get_connection()
     try:
         cur = conn.cursor()
         
         # Найти старый тестовый цикл
         row = cur.execute(
-            "SELECT id FROM structural_cycles WHERE ref_price_source = 'test' ORDER BY created_at DESC LIMIT 1"
+            """
+            SELECT id, phase, created_at 
+            FROM structural_cycles 
+            WHERE ref_price_source = 'test' 
+            ORDER BY created_at DESC 
+            LIMIT 1
+            """
         ).fetchone()
         
         if row:
             old_id = row["id"]
-            cur.execute("DELETE FROM cycle_levels WHERE cycle_id = ?", (old_id,))
-            cur.execute("DELETE FROM structural_cycle_symbols WHERE cycle_id = ?", (old_id,))
-            cur.execute("DELETE FROM structural_cycles WHERE id = ?", (old_id,))
-            logger.info("TEST_MODE: Cleared old test cycle %s", old_id[:8])
+            phase = row["phase"]
+            created_at = row["created_at"]
+            now = int(time.time())
+            
+            # Удаляем только если цикл закрыт или старее 24 часов
+            should_delete = (phase == 'closed') or (now - created_at > 86400)
+            
+            if should_delete:
+                cur.execute("DELETE FROM cycle_levels WHERE cycle_id = ?", (old_id,))
+                cur.execute("DELETE FROM structural_cycle_symbols WHERE cycle_id = ?", (old_id,))
+                cur.execute("DELETE FROM structural_cycles WHERE id = ?", (old_id,))
+                logger.info(
+                    "TEST_MODE: Cleared old test cycle %s (phase=%s, age=%dh)",
+                    old_id[:8], phase, (now - created_at) // 3600
+                )
+            else:
+                logger.info(
+                    "TEST_MODE: Keeping active test cycle %s (phase=%s)",
+                    old_id[:8], phase
+                )
         
         conn.commit()
     finally:

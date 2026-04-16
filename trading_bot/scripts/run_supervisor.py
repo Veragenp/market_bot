@@ -548,6 +548,18 @@ def _run_levels_rebuild() -> Dict[str, int]:
     return out
 
 
+def _structural_main() -> Dict[str, object]:
+    """
+    Запуск structural pipeline (реальный или тестовый в зависимости от TEST_MODE).
+    """
+    if st.TEST_MODE:
+        logger.info("TEST_MODE: Generating test levels")
+        return generate_test_levels()
+    else:
+        logger.info("Running structural pipeline (production mode)")
+        return run_structural_pipeline()
+
+
 def _run_structural() -> Dict[str, object]:
     run_id = _cycle_id()
     start = int(time.time())
