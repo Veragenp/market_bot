@@ -136,10 +136,27 @@ TEST_MODE: Generated 20 levels for 10 symbols (cycle=a1b2c3d4)
 
 **Файл**: `trading_bot/scripts/analyze_test_run.py`
 
-Запуск:
+**Запуск:**
 ```powershell
+# Вывод в консоль
 python -m trading_bot.scripts.analyze_test_run
+
+# Сохранение в файл (UTF-8)
+python -m trading_bot.scripts.analyze_test_run --output report.txt
+
+# Автоматическое сохранение с датой
+python -m trading_bot.scripts.analyze_test_run --format file
+
+# Режим наблюдения (обновление каждые 10 секунд)
+python -m trading_bot.scripts.analyze_test_run --watch 10
 ```
+
+**Аргументы:**
+- `--db PATH` — путь к базе данных (по умолчанию: `data/market_data.db`)
+- `--logs DIR` — путь к директории с логами (по умолчанию: `logs/`)
+- `--output FILE` — сохранить отчёт в файл
+- `--format console|file` — формат вывода (console — в консоль, file — в файл)
+- `--watch N` — режим наблюдения с интервалом N секунд
 
 **Отчёт включает:**
 1. Общая информация (режим, время, символы)

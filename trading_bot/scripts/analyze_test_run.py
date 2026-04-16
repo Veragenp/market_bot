@@ -569,6 +569,9 @@ def main() -> None:
     parser.add_argument("--db", type=str, help="Путь к базе данных")
     parser.add_argument("--logs", type=str, help="Путь к директории с логами")
     parser.add_argument("--watch", type=int, help="Режим наблюдения (интервал в сек)")
+    parser.add_argument("--output", type=str, help="Путь для сохранения отчёта (например, report.txt)")
+    parser.add_argument("--format", choices=["console", "file"], default="console", 
+                        help="Формат вывода: console (в консоль) или file (в файл без emoji)")
     
     args = parser.parse_args()
     
@@ -582,7 +585,26 @@ def main() -> None:
     )
     
     try:
-        analyzer.run()
+        if args.output or args.format == "file":
+            # Сохранение в файл
+            output_path = args.output or f"test_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            print(f"Сохранение отчёта в: {output_path}")
+            
+            # Перенаправляем stdout в файл с UTF-8
+            import io
+            from contextlib import redirect_stdout
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                with redirect_stdout(f):
+                    analyzer.run()
+            
+            print(f"✅ Отчёт сохранён: {output_path}")
+            
+            # Также показать в консоли (без emoji для читаемости)
+            print("\nФайл сохранён. Откройте его в редакторе для просмотра.")
+        else:
+            # Вывод в консоль
+            analyzer.run()
     finally:
         analyzer.close()
 
