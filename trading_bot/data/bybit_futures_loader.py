@@ -320,6 +320,8 @@ class BybitFuturesDataLoader(BaseDataLoader):
             logging.getLogger(__name__).warning("pybit is required for liquidation websocket collection.")
             return []
 
+        from trading_bot.tools.bybit_ws import public_linear_websocket_kwargs
+
         bybit_symbol = self._to_bybit_symbol(symbol)
 
         events: List[Dict[str, Any]] = []
@@ -327,7 +329,7 @@ class BybitFuturesDataLoader(BaseDataLoader):
         deadline = time.time() + float(timeout_s)
 
         # `ws` is initialized and connects during __init__ (pybit), in a background thread.
-        ws = WebSocket(testnet=False, channel_type="linear")
+        ws = WebSocket(channel_type="linear", **public_linear_websocket_kwargs())
 
         def callback(message: Dict[str, Any]) -> None:
             nonlocal events

@@ -6,6 +6,11 @@ import time
 from typing import Any, Dict, List, Optional
 
 from trading_bot.config import settings as st
+from trading_bot.data.bybit_close_reason import (
+    classify_bybit_execution_close_reason,
+    parse_fill_raw_json,
+    resolve_close_reason,
+)
 from trading_bot.tools import bybit_trading as bt
 
 logger = logging.getLogger(__name__)
@@ -19,16 +24,35 @@ def _safe_num(v: Any) -> float:
 
 
 def _fetch_exec_orders_to_reconcile(cur, *, lookback_hours: int) -> List[Dict[str, Any]]:
+    """
+    Ордера с незавершённой сверкой по времени + все ордера, привязанные к open/pending позициям
+    (чтобы поймать fill стопа/выхода после перехода exec_orders в filled).
+    """
     cutoff = int(time.time()) - int(max(1, lookback_hours)) * 3600
     rows = cur.execute(
         """
-        SELECT id, bybit_order_id, symbol, side, status, cycle_id, structural_cycle_id, position_record_id
-        FROM exec_orders
-        WHERE bybit_order_id IS NOT NULL
-          AND bybit_order_id != ''
-          AND created_at >= ?
-          AND status IN ('submitted', 'partially_filled', 'open')
-        ORDER BY created_at DESC
+        SELECT DISTINCT e.id, e.bybit_order_id, e.symbol, e.side, e.status,
+               e.cycle_id, e.structural_cycle_id, e.position_record_id, e.order_role
+        FROM exec_orders e
+        WHERE e.bybit_order_id IS NOT NULL
+          AND e.bybit_order_id != ''
+          AND (
+            (
+              e.created_at >= ?
+              AND e.status IN ('submitted', 'partially_filled', 'open')
+            )
+            OR e.id IN (
+              SELECT entry_exec_order_id FROM position_records
+              WHERE status IN ('pending', 'open') AND entry_exec_order_id IS NOT NULL
+              UNION
+              SELECT stop_exec_order_id FROM position_records
+              WHERE status IN ('pending', 'open') AND stop_exec_order_id IS NOT NULL
+              UNION
+              SELECT exit_exec_order_id FROM position_records
+              WHERE status IN ('pending', 'open') AND exit_exec_order_id IS NOT NULL
+            )
+          )
+        ORDER BY e.created_at DESC
         """,
         (cutoff,),
     ).fetchall()
@@ -112,10 +136,56 @@ def _refresh_exec_order_from_fills(cur, *, exec_order_id: int) -> Dict[str, Any]
     return {"status": status, "filled_qty": filled_qty, "avg_fill_price": avg_fill_price}
 
 
+def _latest_fill_raw_as_execution(cur, *, exec_order_id: int) -> Optional[Dict[str, Any]]:
+    row = cur.execute(
+        """
+        SELECT raw_json FROM exec_fills
+        WHERE exec_order_id = ?
+        ORDER BY ts DESC, id DESC
+        LIMIT 1
+        """,
+        (exec_order_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return parse_fill_raw_json(row["raw_json"])
+
+
+def _close_reason_for_exec_order(cur, *, exec_order_id: int) -> str:
+    bybit_ex = _latest_fill_raw_as_execution(cur, exec_order_id=exec_order_id)
+    lor = cur.execute(
+        """
+        SELECT order_role, order_type, reduce_only
+        FROM exec_orders WHERE id = ?
+        """,
+        (exec_order_id,),
+    ).fetchone()
+    local = dict(lor) if lor else None
+    return resolve_close_reason(bybit_ex=bybit_ex, local_order_row=local)
+
+
+def _order_fill_snapshot(
+    cur, *, exec_order_id: int
+) -> tuple[str, float, Optional[float]]:
+    r = cur.execute(
+        """
+        SELECT status, filled_qty, avg_fill_price
+        FROM exec_orders WHERE id = ?
+        """,
+        (exec_order_id,),
+    ).fetchone()
+    if not r:
+        return "", 0.0, None
+    st_o = str(r["status"] or "")
+    fq = float(r["filled_qty"] or 0.0)
+    ap = float(r["avg_fill_price"]) if r["avg_fill_price"] is not None else None
+    return st_o, fq, ap
+
+
 def _refresh_position_from_orders(cur, *, position_record_id: int) -> None:
     pos = cur.execute(
         """
-        SELECT id, status, qty, entry_exec_order_id, exit_exec_order_id
+        SELECT id, status, qty, entry_exec_order_id, exit_exec_order_id, stop_exec_order_id
         FROM position_records
         WHERE id = ?
         """,
@@ -124,6 +194,8 @@ def _refresh_position_from_orders(cur, *, position_record_id: int) -> None:
     if not pos:
         return
     now = int(time.time())
+    pr_id = int(position_record_id)
+
     if pos["entry_exec_order_id"]:
         e = cur.execute(
             "SELECT status, filled_qty, avg_fill_price FROM exec_orders WHERE id = ?",
@@ -144,30 +216,60 @@ def _refresh_position_from_orders(cur, *, position_record_id: int) -> None:
                         updated_at = ?
                     WHERE id = ?
                     """,
-                    (e_filled, e_price, now, now, int(position_record_id)),
+                    (e_filled, e_price, now, now, pr_id),
                 )
-    if pos["exit_exec_order_id"]:
-        x = cur.execute(
-            "SELECT status, filled_qty, avg_fill_price FROM exec_orders WHERE id = ?",
-            (int(pos["exit_exec_order_id"]),),
-        ).fetchone()
-        if x and str(x["status"] or "") in ("filled", "partially_filled") and float(x["filled_qty"] or 0.0) > 0:
-            cur.execute(
-                """
-                UPDATE position_records
-                SET status = 'closed',
-                    exit_price_fact = COALESCE(exit_price_fact, ?),
-                    closed_at = COALESCE(closed_at, ?),
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    (float(x["avg_fill_price"]) if x["avg_fill_price"] is not None else None),
-                    now,
-                    now,
-                    int(position_record_id),
-                ),
-            )
+
+    pos2 = cur.execute(
+        """
+        SELECT status, qty, exit_exec_order_id, stop_exec_order_id
+        FROM position_records WHERE id = ?
+        """,
+        (pr_id,),
+    ).fetchone()
+    if not pos2 or str(pos2["status"] or "") == "closed":
+        return
+
+    qty = float(pos2["qty"] or 0.0)
+
+    def _meaningful_exit(st_o: str, fq: float) -> bool:
+        if st_o not in ("filled", "partially_filled") or fq <= 0:
+            return False
+        if qty <= 0:
+            return True
+        return fq >= qty * 0.999
+
+    closing_oid: Optional[int] = None
+    exit_px: Optional[float] = None
+
+    ex_id = pos2["exit_exec_order_id"]
+    if ex_id:
+        st_o, fq, ap = _order_fill_snapshot(cur, exec_order_id=int(ex_id))
+        if _meaningful_exit(st_o, fq):
+            closing_oid = int(ex_id)
+            exit_px = ap
+
+    if closing_oid is None and pos2["stop_exec_order_id"]:
+        st_o, fq, ap = _order_fill_snapshot(cur, exec_order_id=int(pos2["stop_exec_order_id"]))
+        if _meaningful_exit(st_o, fq):
+            closing_oid = int(pos2["stop_exec_order_id"])
+            exit_px = ap
+
+    if closing_oid is None:
+        return
+
+    reason = _close_reason_for_exec_order(cur, exec_order_id=closing_oid)
+    cur.execute(
+        """
+        UPDATE position_records
+        SET status = 'closed',
+            exit_price_fact = COALESCE(exit_price_fact, ?),
+            closed_at = COALESCE(closed_at, ?),
+            close_reason = ?,
+            updated_at = ?
+        WHERE id = ? AND status != 'closed'
+        """,
+        (exit_px, now, reason, now, pr_id),
+    )
 
 
 def reconcile_recent_exec_orders(cur, *, lookback_hours: int = 24) -> Dict[str, Any]:
@@ -178,7 +280,7 @@ def reconcile_recent_exec_orders(cur, *, lookback_hours: int = 24) -> Dict[str, 
     if not st.BYBIT_EXECUTION_ENABLED:
         return {"ok": True, "skipped": "execution_disabled"}
     try:
-        _ = bt._session()  # проверка ключей/доступа
+        _ = bt._session()
     except Exception:
         return {"ok": False, "error": "bybit_session_unavailable"}
 
@@ -218,8 +320,10 @@ def reconcile_recent_exec_orders(cur, *, lookback_hours: int = 24) -> Dict[str, 
         after_n = int(after["c"] or 0) if after else 0
         fills_upserted += max(0, after_n - before_n)
         _refresh_exec_order_from_fills(cur, exec_order_id=int(o["id"]))
-        if o.get("position_record_id"):
-            _refresh_position_from_orders(cur, position_record_id=int(o["position_record_id"]))
+        pid = o.get("position_record_id")
+        if pid:
+            _refresh_position_from_orders(cur, position_record_id=int(pid))
+
     return {
         "ok": True,
         "orders_checked": checked,
@@ -227,4 +331,7 @@ def reconcile_recent_exec_orders(cur, *, lookback_hours: int = 24) -> Dict[str, 
     }
 
 
-__all__ = ["reconcile_recent_exec_orders"]
+__all__ = [
+    "reconcile_recent_exec_orders",
+    "classify_bybit_execution_close_reason",
+]

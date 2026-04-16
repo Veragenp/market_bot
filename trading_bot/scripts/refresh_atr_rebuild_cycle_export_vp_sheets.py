@@ -32,7 +32,7 @@ from trading_bot.data.cycle_levels_db import (
     build_cycle_levels_diagnostics,
     fetch_cycle_levels_df,
 )
-from trading_bot.data.structural_cycle_db import run_structural_realtime_cycle
+from trading_bot.data.structural_cycle_db import run_structural_pipeline
 from trading_bot.data.repositories import get_ohlcv_tail, InstrumentsRepository
 from trading_bot.data.schema import init_db
 from trading_bot.tools.sheets_exporter import SheetsExporter
@@ -72,8 +72,8 @@ def main() -> None:
         )
         print("vp rebuild exit=", rc.returncode, flush=True)
 
-    print("=== 2) run_structural_realtime_cycle (touch_window -> entry_timer -> freeze) ===", flush=True)
-    r = run_structural_realtime_cycle()
+    print("=== 2) run_structural_pipeline (scan -> freeze) ===", flush=True)
+    r = run_structural_pipeline(auto_freeze=True)
     print(r, flush=True)
 
     import trading_bot.entrypoints.export_to_sheets as ets

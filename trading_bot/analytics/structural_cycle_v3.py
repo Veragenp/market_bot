@@ -33,9 +33,9 @@ class Channel:
 class MarketSyncDetector:
     def __init__(
         self,
-        min_width_atr: float = 0.8,
+        min_width_atr: float = 0.7,
         max_width_atr: float = 1.5,
-        zone_tolerance_atr: float = 0.3,
+        zone_tolerance_atr: float = 0.25,
         sync_threshold: float = 0.7,
         max_opposite_ratio: float = 0.3,
     ):
@@ -44,8 +44,6 @@ class MarketSyncDetector:
         self.zone_tolerance_atr = zone_tolerance_atr
         self.sync_threshold = sync_threshold
         self.max_opposite_ratio = max_opposite_ratio
-        # Hard band для адаптации: не отбрасываем потенциально рабочие каналы слишком рано.
-        self.hard_max_width_atr = 3.0
 
     def get_channels_for_symbol(self, levels: Sequence[Level], atr: float) -> List[Channel]:
         if len(levels) < 2 or atr <= 0:
@@ -69,24 +67,14 @@ class MarketSyncDetector:
                 )
         return channels
 
-    def get_zone_for_price(
-        self, price: float, channels: List[Channel], levels: Sequence[Level], atr: float
-    ) -> Optional[str]:
-        zone, _channel, _source = self.resolve_zone_and_channel(price, channels, levels, atr)
-        return zone
-
-    def resolve_zone_and_channel(
-        self, price: float, channels: List[Channel], levels: Sequence[Level], atr: float
-    ) -> Tuple[Optional[str], Optional[Channel], Optional[str]]:
+    def get_zone_for_price(self, price: float, channels: List[Channel], atr: float) -> Optional[str]:
         """
         Определяет зону для текущей цены.
         Сначала ищет канал, в который цена попадает с учётом tolerance.
-        Если таких нет – выполняет адаптацию: находит среди уровней пару, образующую канал
-        в сторону выхода цены, содержащую цену, и классифицирует относительно него.
-        При выборе пары приоритет отдаётся уровням с большей суммарной силой (strength).
+        Если таких нет – выбирает ближайший канал и возвращает 'low' (если цена ниже) или 'high' (если выше).
         """
-        if not channels or atr <= 0 or len(levels) < 2:
-            return None, None, None
+        if not channels or atr <= 0:
+            return None
 
         tolerance = self.zone_tolerance_atr * atr
 
@@ -97,13 +85,13 @@ class MarketSyncDetector:
             if low_ext <= price <= high_ext:
                 # Цена внутри расширенного канала – определяем зону
                 if price <= ch.low_level.price + tolerance:
-                    return "low", ch, "base_channel"
+                    return "low"
                 if price >= ch.high_level.price - tolerance:
-                    return "high", ch, "base_channel"
-                return "mid", ch, "base_channel"
+                    return "high"
+                return "mid"
 
-        # 2. Адаптация: найти ближайший канал (по расстоянию до его границ без tolerance)
-        best_ch: Optional[Channel] = None
+        # 2. Если ни один канал не содержит цену, находим ближайший по расстоянию до границ
+        best_ch = None
         best_dist = float("inf")
         for ch in channels:
             if price < ch.low_level.price:
@@ -111,78 +99,19 @@ class MarketSyncDetector:
             elif price > ch.high_level.price:
                 dist = price - ch.high_level.price
             else:
-                dist = 0.0
+                # Теоретически сюда не попадём, но на всякий случай
+                dist = 0
             if dist < best_dist:
                 best_dist = dist
                 best_ch = ch
 
-        if best_ch is None:
-            return None, None, None
+        if best_ch:
+            if price < best_ch.low_level.price:
+                return "low"
+            else:
+                return "high"
 
-        sorted_levels = sorted(levels, key=lambda l: l.price)
-        # low, high, shift, soft_width_penalty
-        candidates: List[Tuple[Level, Level, float, float]] = []
-
-        if price > best_ch.high_level.price:
-            # Цена выше – ищем канал выше
-            for i in range(len(sorted_levels) - 1):
-                for step in (1, 2):  # neighbors + one-skip
-                    j = i + step
-                    if j >= len(sorted_levels):
-                        continue
-                    low_lvl = sorted_levels[i]
-                    high_lvl = sorted_levels[j]
-                    # Канал должен быть в сторону цены (выше), но без требования полного непересечения.
-                    if high_lvl.price <= best_ch.high_level.price:
-                        continue
-                    width_atr = (high_lvl.price - low_lvl.price) / atr
-                    if not (self.min_width_atr <= width_atr <= self.hard_max_width_atr):
-                        continue
-                    if price > high_lvl.price + tolerance:
-                        continue
-                    shift = max(0.0, low_lvl.price - best_ch.low_level.price)
-                    soft_penalty = max(0.0, width_atr - self.max_width_atr)
-                    candidates.append((low_lvl, high_lvl, shift, soft_penalty))
-        elif price < best_ch.low_level.price:
-            # Цена ниже – ищем канал ниже
-            for i in range(len(sorted_levels) - 1):
-                for step in (1, 2):  # neighbors + one-skip
-                    j = i + step
-                    if j >= len(sorted_levels):
-                        continue
-                    low_lvl = sorted_levels[i]
-                    high_lvl = sorted_levels[j]
-                    # Канал должен быть в сторону цены (ниже), но без требования полного непересечения.
-                    if low_lvl.price >= best_ch.low_level.price:
-                        continue
-                    width_atr = (high_lvl.price - low_lvl.price) / atr
-                    if not (self.min_width_atr <= width_atr <= self.hard_max_width_atr):
-                        continue
-                    if price < low_lvl.price - tolerance:
-                        continue
-                    shift = max(0.0, best_ch.high_level.price - high_lvl.price)
-                    soft_penalty = max(0.0, width_atr - self.max_width_atr)
-                    candidates.append((low_lvl, high_lvl, shift, soft_penalty))
-
-        if not candidates:
-            return None, None, None
-
-        # Сортируем: сначала по убыванию суммарной силы, потом по мягкому штрафу ширины, затем по сдвигу.
-        candidates.sort(key=lambda x: (-(x[0].strength + x[1].strength), x[3], x[2]))
-        best_low, best_high, _, _ = candidates[0]
-        chosen_channel = Channel(
-            low_level=best_low,
-            high_level=best_high,
-            width_atr=(best_high.price - best_low.price) / atr,
-            low_zone_high=best_low.price + tolerance,
-            high_zone_low=best_high.price - tolerance,
-        )
-
-        if price <= best_low.price + tolerance:
-            return "low", chosen_channel, "adaptive_channel"
-        if price >= best_high.price - tolerance:
-            return "high", chosen_channel, "adaptive_channel"
-        return "mid", chosen_channel, "adaptive_channel"
+        return None
 
     def compute_distribution(self, symbols_data: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, int], int]:
         zones = {"low": 0, "mid": 0, "high": 0, "invalid": 0}
@@ -194,7 +123,7 @@ class MarketSyncDetector:
                 zones["invalid"] += 1
                 continue
             channels = self.get_channels_for_symbol(levels, atr)
-            zone, _ch, _src = self.resolve_zone_and_channel(float(price), channels, levels, float(atr))
+            zone = self.get_zone_for_price(float(price), channels, float(atr))
             if zone is None:
                 zones["invalid"] += 1
             else:
@@ -205,7 +134,7 @@ class MarketSyncDetector:
     def get_synced_direction(self, symbols_data: Dict[str, Dict[str, Any]]) -> Optional[str]:
         zones, total_valid = self.compute_distribution(symbols_data)
         if total_valid == 0:
-            logger.warning("V2: no valid symbols for synchronization")
+            logger.warning("V3: no valid symbols for synchronization")
             return None
         low_cnt = zones["low"]
         mid_cnt = zones["mid"]
@@ -273,14 +202,14 @@ def _pick_display_channel(price: float, channels: Sequence[Channel]) -> Optional
     return max(pool, key=lambda ch: ch.low_level.strength + ch.high_level.strength)
 
 
-def build_structural_v2_report_df(cur, symbols: Optional[Sequence[str]] = None) -> pd.DataFrame:
+def build_structural_v3_report_df(cur, symbols: Optional[Sequence[str]] = None) -> pd.DataFrame:
     syms = list(symbols) if symbols is not None else list(TRADING_SYMBOLS)
     allowed_types = tuple(settings_pkg.STRUCTURAL_ALLOWED_LEVEL_TYPES)
     top_k = int(settings_pkg.STRUCTURAL_TOP_K)
     detector = MarketSyncDetector(
-        min_width_atr=1.0,
+        min_width_atr=float(settings_pkg.STRUCTURAL_W_MIN),
         max_width_atr=float(settings_pkg.STRUCTURAL_W_MAX),
-        zone_tolerance_atr=0.3,
+        zone_tolerance_atr=0.25,
     )
 
     symbols_data: Dict[str, Dict[str, Any]] = {}
@@ -293,13 +222,12 @@ def build_structural_v2_report_df(cur, symbols: Optional[Sequence[str]] = None) 
         levels = _fetch_levels(cur, sym, allowed_types, max(2, top_k * 4))
         symbols_data[sym] = {"price": ref_price, "atr": atr, "levels": levels}
         channels = detector.get_channels_for_symbol(levels, float(atr or 0.0)) if atr else []
-        if ref_price is not None and atr is not None and channels:
-            zone, used_channel, zone_source = detector.resolve_zone_and_channel(
-                float(ref_price), channels, levels, float(atr)
-            )
-        else:
-            zone, used_channel, zone_source = None, None, None
-        display_channel = _pick_display_channel(float(ref_price), channels) if (ref_price is not None and channels) else None
+        zone = (
+            detector.get_zone_for_price(float(ref_price), channels, float(atr))
+            if (ref_price is not None and atr is not None and channels)
+            else None
+        )
+        chosen = _pick_display_channel(float(ref_price), channels) if (ref_price is not None and channels) else None
         rows_out.append(
             {
                 "exported_at_utc": exported_at,
@@ -308,29 +236,21 @@ def build_structural_v2_report_df(cur, symbols: Optional[Sequence[str]] = None) 
                 "atr_daily": float(atr) if atr is not None else None,
                 "levels_n": len(levels),
                 "channels_n": len(channels),
-                "zone_v2": zone or "invalid",
-                "zone_source": zone_source or "",
-                "channel_low_price": used_channel.low_level.price if used_channel else None,
-                "channel_high_price": used_channel.high_level.price if used_channel else None,
-                "channel_width_atr": used_channel.width_atr if used_channel else None,
-                "channel_low_strength": used_channel.low_level.strength if used_channel else None,
-                "channel_high_strength": used_channel.high_level.strength if used_channel else None,
-                "channel_low_level_id": used_channel.low_level.level_id if used_channel else None,
-                "channel_high_level_id": used_channel.high_level.level_id if used_channel else None,
-                "display_channel_low_price": display_channel.low_level.price if display_channel else None,
-                "display_channel_high_price": display_channel.high_level.price if display_channel else None,
-                "display_channel_width_atr": display_channel.width_atr if display_channel else None,
-                "display_channel_low_strength": display_channel.low_level.strength if display_channel else None,
-                "display_channel_high_strength": display_channel.high_level.strength if display_channel else None,
-                "display_channel_low_level_id": display_channel.low_level.level_id if display_channel else None,
-                "display_channel_high_level_id": display_channel.high_level.level_id if display_channel else None,
+                "zone_v3": zone or "invalid",
+                "channel_low_price": chosen.low_level.price if chosen else None,
+                "channel_high_price": chosen.high_level.price if chosen else None,
+                "channel_width_atr": chosen.width_atr if chosen else None,
+                "channel_low_strength": chosen.low_level.strength if chosen else None,
+                "channel_high_strength": chosen.high_level.strength if chosen else None,
+                "channel_low_level_id": chosen.low_level.level_id if chosen else None,
+                "channel_high_level_id": chosen.high_level.level_id if chosen else None,
             }
         )
 
     synced = detector.get_synced_direction(symbols_data)
     zones, total_valid = detector.compute_distribution(symbols_data)
     for r in rows_out:
-        r["sync_direction_v2"] = synced or ""
+        r["sync_direction_v3"] = synced or ""
         r["sync_threshold"] = detector.sync_threshold
         r["max_opposite_ratio"] = detector.max_opposite_ratio
         r["total_valid_symbols"] = total_valid
@@ -346,5 +266,5 @@ __all__ = [
     "Level",
     "Channel",
     "MarketSyncDetector",
-    "build_structural_v2_report_df",
+    "build_structural_v3_report_df",
 ]

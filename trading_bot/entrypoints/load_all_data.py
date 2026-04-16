@@ -15,8 +15,9 @@ Binance futures OI (история), Bybit OI/инструменты.
   python trading_bot/entrypoints/load_all_data.py --full
   python trading_bot/entrypoints/load_all_data.py --bybit-ws-liquidations
 
-  Шаг «Binance futures open interest (history)» можно отключить: LOAD_ALL_SKIP_BINANCE_FUTURES_OI=1 в .env
-  (остальной пайплайн, включая Bybit OI, без изменений).
+  Шаг «Binance futures open interest (history)» можно отключить: LOAD_ALL_SKIP_BINANCE_FUTURES_OI=1 в .env.
+
+  Те же переключатели, что у supervisor DATA_REFRESH (см. defaults в settings.py).
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from trading_bot.config import settings as st
 from trading_bot.config.symbols import (
     ANALYTIC_SYMBOLS,
     TRADING_SYMBOLS,
@@ -85,11 +87,14 @@ def main() -> None:
     )
 
     if args.full:
-        logger.info("=== Full historical: spot (4h,1d,1w,1M) — все TRADING_SYMBOLS ===")
-        mgr.load_historical_spot(symbols=symbols_spot, force_full=True)
-        logger.info("=== Spot 1m window — все TRADING_SYMBOLS ===")
-        mgr.load_intraday_1m_spot(symbols=symbols_spot, force_full=True)
-        if spot_ctx_extra:
+        if st.SUPERVISOR_DATA_REFRESH_SPOT_MAIN:
+            logger.info("=== Full historical: spot (4h,1d,1w,1M) — все TRADING_SYMBOLS ===")
+            mgr.load_historical_spot(symbols=symbols_spot, force_full=True)
+            logger.info("=== Spot 1m window — все TRADING_SYMBOLS ===")
+            mgr.load_intraday_1m_spot(symbols=symbols_spot, force_full=True)
+        else:
+            logger.info("Skipped full spot TRADING_SYMBOLS (SUPERVISOR_DATA_REFRESH_SPOT_MAIN=0)")
+        if spot_ctx_extra and st.SUPERVISOR_DATA_REFRESH_SPOT_CRYPTO_CONTEXT:
             logger.info(
                 "=== Full historical spot — ANALYTIC_SYMBOLS['crypto_context'] "
                 "(только пары вне TRADING_SYMBOLS) ==="
@@ -97,20 +102,39 @@ def main() -> None:
             mgr.load_historical_spot(symbols=spot_ctx_extra, force_full=True)
             logger.info("=== Spot 1m window — crypto_context extra ===")
             mgr.load_intraday_1m_spot(symbols=spot_ctx_extra, force_full=True)
-        logger.info("=== Macro — ANALYTIC_SYMBOLS['macro'] ===")
-        mgr.load_historical_macro(symbols=macro_syms, force_full=True)
-        logger.info("=== TradingView indices — ANALYTIC_SYMBOLS['indices'] ===")
-        mgr.load_historical_tradingview_indices(symbols=indices_syms, force_full=True)
+        elif spot_ctx_extra:
+            logger.info("Skipped full crypto_context spot (SUPERVISOR_DATA_REFRESH_SPOT_CRYPTO_CONTEXT=0)")
+        if st.SUPERVISOR_DATA_REFRESH_MACRO:
+            logger.info("=== Macro — ANALYTIC_SYMBOLS['macro'] ===")
+            mgr.load_historical_macro(symbols=macro_syms, force_full=True)
+        else:
+            logger.info("Skipped macro (SUPERVISOR_DATA_REFRESH_MACRO=0)")
+        if st.SUPERVISOR_DATA_REFRESH_INDICES_TV:
+            logger.info("=== TradingView indices — ANALYTIC_SYMBOLS['indices'] ===")
+            mgr.load_historical_tradingview_indices(symbols=indices_syms, force_full=True)
+        else:
+            logger.info("Skipped TradingView indices (SUPERVISOR_DATA_REFRESH_INDICES_TV=0)")
     else:
-        logger.info("=== Incremental spot — все TRADING_SYMBOLS ===")
-        mgr.update_incremental_spot(symbols=symbols_spot)
-        if spot_ctx_extra:
+        if st.SUPERVISOR_DATA_REFRESH_SPOT_MAIN:
+            logger.info("=== Incremental spot — все TRADING_SYMBOLS ===")
+            mgr.update_incremental_spot(symbols=symbols_spot)
+        else:
+            logger.info("Skipped incremental spot TRADING_SYMBOLS (SUPERVISOR_DATA_REFRESH_SPOT_MAIN=0)")
+        if spot_ctx_extra and st.SUPERVISOR_DATA_REFRESH_SPOT_CRYPTO_CONTEXT:
             logger.info("=== Incremental spot — ANALYTIC_SYMBOLS['crypto_context'] (extra) ===")
             mgr.update_incremental_spot(symbols=spot_ctx_extra)
-        logger.info("=== Incremental macro — ANALYTIC_SYMBOLS['macro'] ===")
-        mgr.update_incremental_macro(symbols=macro_syms)
-        logger.info("=== TradingView indices (collector) ===")
-        update_indices()
+        elif spot_ctx_extra:
+            logger.info("Skipped incremental crypto_context spot (SUPERVISOR_DATA_REFRESH_SPOT_CRYPTO_CONTEXT=0)")
+        if st.SUPERVISOR_DATA_REFRESH_MACRO:
+            logger.info("=== Incremental macro — ANALYTIC_SYMBOLS['macro'] ===")
+            mgr.update_incremental_macro(symbols=macro_syms)
+        else:
+            logger.info("Skipped incremental macro (SUPERVISOR_DATA_REFRESH_MACRO=0)")
+        if st.SUPERVISOR_DATA_REFRESH_INDICES_TV:
+            logger.info("=== TradingView indices (collector) ===")
+            update_indices()
+        else:
+            logger.info("Skipped TradingView indices (SUPERVISOR_DATA_REFRESH_INDICES_TV=0)")
 
     _skip_binance_futures_oi = (os.getenv("LOAD_ALL_SKIP_BINANCE_FUTURES_OI") or "").strip().lower() in (
         "1",
@@ -126,8 +150,11 @@ def main() -> None:
         logger.info("=== Binance futures open interest (history) ===")
         _safe("update_all_futures_data", lambda: update_all_futures_data(days_back=90))
 
-    logger.info("=== Open interest incremental (Bybit) — все TRADING_SYMBOLS ===")
-    _safe("update_incremental_oi", lambda: mgr.update_incremental_oi(symbols=symbols_spot))
+    if st.SUPERVISOR_DATA_REFRESH_OI_BYBIT:
+        logger.info("=== Open interest incremental (Bybit) — все TRADING_SYMBOLS ===")
+        _safe("update_incremental_oi", lambda: mgr.update_incremental_oi(symbols=symbols_spot))
+    else:
+        logger.info("Skipped Bybit OI incremental (SUPERVISOR_DATA_REFRESH_OI_BYBIT=0)")
 
     if args.bybit_ws_liquidations:
         logger.info("=== Liquidations (Bybit WS) — все TRADING_SYMBOLS ===")
@@ -137,17 +164,23 @@ def main() -> None:
             "Skipped Bybit liquidations WS (use --bybit-ws-liquidations to enable)"
         )
 
-    logger.info("=== Instruments (Bybit) — все TRADING_SYMBOLS ===")
-    _safe(
-        "update_instruments_for_symbols",
-        lambda: mgr.update_instruments_for_symbols(symbols_spot),
-    )
+    if st.SUPERVISOR_DATA_REFRESH_INSTRUMENTS:
+        logger.info("=== Instruments (Bybit) — все TRADING_SYMBOLS ===")
+        _safe(
+            "update_instruments_for_symbols",
+            lambda: mgr.update_instruments_for_symbols(symbols_spot),
+        )
+    else:
+        logger.info("Skipped Bybit instruments (SUPERVISOR_DATA_REFRESH_INSTRUMENTS=0)")
 
-    logger.info("=== ATR (instruments, Gerchik from spot 1d in DB) ===")
-    _safe(
-        "update_instruments_atr_for_trading_symbols",
-        lambda: mgr.update_instruments_atr_for_trading_symbols(),
-    )
+    if st.SUPERVISOR_DATA_REFRESH_INSTRUMENTS_ATR:
+        logger.info("=== ATR (instruments, Gerchik from spot 1d in DB) ===")
+        _safe(
+            "update_instruments_atr_for_trading_symbols",
+            lambda: mgr.update_instruments_atr_for_trading_symbols(),
+        )
+    else:
+        logger.info("Skipped instruments ATR (SUPERVISOR_DATA_REFRESH_INSTRUMENTS_ATR=0)")
 
     logger.info("=== DB integrity (non-strict) ===")
     try:

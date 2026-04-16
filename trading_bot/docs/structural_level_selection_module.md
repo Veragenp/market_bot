@@ -1,6 +1,11 @@
 # Модуль выбора уровней Structural (полное описание)
 
-Документ описывает **как в коде** устроен выбор канала (L/U), пул монет, mid-band, freeze в `cycle_levels` и realtime-ветку (touch / entry_timer / abort). Нужен для отладки ситуаций вида «уровни странные», «цикл отменился», «supervisor пишет failed».
+> Внимание: документ частично legacy.
+>
+> Актуальный источник правды по рабочему контуру: `cycle_modules_runtime_contract.md` и `structural_cycle_module.md`.
+> В активном supervisor-потоке используется `scan -> armed -> freeze` (без realtime touch/entry_timer/abort).
+
+Документ описывает детали отбора уровней и диагностические заметки. Разделы про realtime-фазы сохраняются только как историческая справка.
 
 ---
 

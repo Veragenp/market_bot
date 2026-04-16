@@ -286,6 +286,7 @@ def init_db() -> None:
             last_group_touch_source TEXT,
             last_group_touch_symbols_json TEXT,
             close_reason TEXT,
+            last_package_exit_reason TEXT,
             last_transition_at INTEGER,
             updated_at INTEGER NOT NULL
         )
@@ -1443,6 +1444,33 @@ def run_migrations() -> None:
         )
         cursor.execute(
             "INSERT INTO db_version (version, applied_at) VALUES (20, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 21:
+        _ts21 = _column_names(cursor, "trading_state")
+        if _ts21 and "last_package_exit_reason" not in _ts21:
+            cursor.execute(
+                "ALTER TABLE trading_state ADD COLUMN last_package_exit_reason TEXT"
+            )
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (21, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
+    if current_version < 22:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sheet_stats_exported_position (
+                position_record_id INTEGER PRIMARY KEY,
+                exported_at INTEGER NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (22, ?)",
             (int(time.time()),),
         )
         conn.commit()

@@ -4,11 +4,21 @@
 
 ---
 
+## Текущий runtime-контракт (фиксируем)
+
+- Перед стартом нового торгового цикла supervisor выполняет `levels_rebuild` (обновляет `vp_local_levels`).
+- Затем выполняется structural (`run_structural_pipeline(auto_freeze=True)`): выбираются уровни из актуального `price_levels` и фиксируются в `cycle_levels`.
+- Для торговли внутри цикла источником истины является `cycle_levels` (freeze-снимок), а не "текущий" `vp_local_levels` после последующих rebuild.
+- Монета может попасть только в одну сторону или в обе стороны; симметрия long/short по тикеру не обязательна.
+- При поиске противоположной стороны (flip/rebuild) используется актуальный пул уровней и текущая цена как fallback-якорь.
+
+---
+
 ## Зачем нужен модуль
 
-- Построить по каждой монете **пару уровней**: **L** (опора снизу, зона long) и **U** (сопротивление сверху, зона short) из `price_levels`.
-- Согласовать пул монет по **ширине коридора в ATR**: \(W_i = (U_i - L_i) / \mathrm{ATR}_i\), отфильтровать выбросы (**MAD**).
-- После правил **касаний / таймера / abort** (realtime-ветка) зафиксировать снимок в **`cycle_levels`** и обновить **`trading_state`** (единый writer freeze).
+- Построить по каждой монете торговые уровни из `price_levels`: **L** (опора снизу, зона long) и/или **U** (сопротивление сверху, зона short).
+- Согласовать пул монет по **ширине коридора в ATR**: \(W_i = (U_i - L_i) / \mathrm{ATR}_i\).
+- Зафиксировать снимок в **`cycle_levels`** и обновить **`trading_state`** (единый writer freeze).
 
 Исполнение сделок (**tutorial_v3**) этим модулем не занимается — он только готовит контракт `cycle_levels` + фазы в БД.
 
@@ -47,9 +57,9 @@
 
 6. Для каждого символа из **разрешённых `level_type`** выбираются кандидаты **ниже** и **выше** ref (сортировка: `volume_peak`, `strength`, `updated_at`), не более **`STRUCTURAL_TOP_K`** с каждой стороны.
 
-7. Если с какой-то стороны кандидатов **меньше** `STRUCTURAL_MIN_CANDIDATES_PER_SIDE` (по умолчанию **1**) или нет ATR — символ получает статус **`incomplete_structure`**, в пул пар не входит.
+7. Если с какой-то стороны кандидатов **меньше** `STRUCTURAL_MIN_CANDIDATES_PER_SIDE` (по умолчанию **1**) или нет ATR — символ получает статус **`incomplete_structure`**; при этом в freeze допускаются односторонние символы (только long или только short).
 
-8. Иначе стартует пара **режим A**: индексы (0,0) в сетке top-K×top-K; при необходимости **до `STRUCTURAL_REFINE_MAX_ROUNDS`** итераций подгоняется пара под **MAD** пула (выбросы по \(|W_i - m| > k \cdot \mathrm{MAD}\)\).
+8. Иначе выполняется v4-подобный выбор сильных уровней с ATR-band приоритетом (с fallback на более широкий side-фильтр), затем итерации подгонки под **MAD** пула (выбросы по \(|W_i - m| > k \cdot \mathrm{MAD}\)\).
 
 9. Финально по пулу считаются **медиана \(W\)** и **MAD** по строкам со статусом **`ok`**; выбросы помечаются **`outlier`**.
 
@@ -63,44 +73,10 @@
 
 ### Шаг A5. Freeze (опционально)
 
-13. Если **`auto_freeze=True`** (и не передан `--no-freeze` в экспорте):
-    - `DELETE FROM cycle_levels`, вставка по каждому **`ok`**: **long** на **L**, **short** на **U**;
+13. Если **`auto_freeze=True`**:
+    - `DELETE FROM cycle_levels`, вставка по каждому **`ok`** независимо по сторонам: если есть **L** — строка `long`, если есть **U** — строка `short`;
     - **`trading_state`**: `cycle_id` = `structural_cycle_id`, `levels_frozen=1`, `cycle_phase='arming'`, инкремент `cycle_version`;
     - события в **`structural_events`**.
-
----
-
-## Часть B — realtime: `run_structural_realtime_cycle`
-
-Полный контур с ожиданием цен (блокирующий цикл в процессе).
-
-### Шаг B1. Скан без freeze
-
-14. Вызывается **`run_structural_pipeline(auto_freeze=False)`**. Если фаза не **`armed`** (отмена на скане) — realtime **не** стартует, возврат.
-
-### Шаг B2. Touch window
-
-15. Фаза **`touch_window`**. Для каждого **`ok`** символа из БД читаются L, U, mid-полоса, ATR.
-
-16. В цикле (poll или синтетические **`price_ticks_override`** в тестах):
-    - если **last** попал в **[mid_band_low, mid_band_high]** — учёт **касания** с **дебаунсом** `STRUCTURAL_TOUCH_DEBOUNCE_SEC`, событие **`mid_touch`**;
-    - если цена **≤ L − D_abort·ATR** или **≥ U + D_abort·ATR** — символ в множество abort, события **`breakout_lower` / `breakout_upper`**.
-
-17. Пока не набрано **`STRUCTURAL_N_TOUCH`** уникальных (по времени окна **`STRUCTURAL_TOUCH_WINDOW_SEC`**) касаний — остаёмся в touch_window. Иначе переход к шагу B3.
-
-### Шаг B3. Entry timer
-
-18. Фаза **`entry_timer`**, выставляются `touch_started_at`, `entry_timer_until` (+ `STRUCTURAL_ENTRY_TIMER_SEC`).
-
-19. В этом окне: если **число символов с abort** ≥ **`STRUCTURAL_N_ABORT`** → **`cancelled`**, `collective_breakout`, выход.
-
-20. По истечении таймера — выход из цикла ожидания.
-
-### Шаг B4. Freeze
-
-21. Фаза снова **`armed`**, **`_freeze_cycle_levels`** из снимка **`structural_cycle_symbols`** (как в батче), ref в строках — из снимка скана.
-
-Таймаут всего ожидания: **`STRUCTURAL_MAX_RUNTIME_SEC`** → **`cancelled`**, `touch_window_timeout`.
 
 ---
 
@@ -109,7 +85,7 @@
 | Таблица | Роль |
 |---------|------|
 | `structural_cycles` | Фаза, время, `params_json`, агрегаты пула, таймеры, `cancel_reason`. |
-| `structural_cycle_symbols` | Снимок по символу: статус, L/U, id уровней, ATR, W, mid-полоса. |
+| `structural_cycle_symbols` | Снимок по символу: статус, L/U, id уровней, ATR, W. |
 | `structural_events` | Аудит: `phase_change`, `mid_touch`, `breakout_*`. |
 | `cycle_levels` | Результат freeze (контракт для исполнителя). |
 | `trading_state` | `structural_cycle_id`, `cycle_id`, `levels_frozen`, `cycle_phase`. |
@@ -120,11 +96,11 @@
 
 | Команда | Назначение |
 |---------|------------|
-| `python -m trading_bot.scripts.run_structural_cycle` | Полный realtime (долго, нужна сеть). |
-| `python -m trading_bot.scripts.run_structural_cycle --scan-only` | Только часть A (+ опциональный freeze по `STRUCTURAL_AUTO_FREEZE_ON_SCAN`). |
+| `python -m trading_bot.scripts.run_structural_cycle` | Scan + immediate freeze (рабочий режим). |
+| `python -m trading_bot.scripts.run_structural_cycle --no-freeze` | Только scan, без freeze. |
 | `python -m trading_bot.scripts.export_structural_scan_to_sheets` | Скан + лист **`structural_levels_report`**; по умолчанию **с freeze**. |
 | `python -m trading_bot.scripts.verify_structural` | Сухой скан + проверка инвариантов (L \< ref \< U, W_atr, mid) на текущей БД. |
-| `pytest tests/test_structural_cycle.py` | Автотесты (в т.ч. realtime на синтетических тиках). |
+| `pytest tests/test_structural_cycle.py` | Автотесты scan/freeze-контракта structural. |
 
 ---
 

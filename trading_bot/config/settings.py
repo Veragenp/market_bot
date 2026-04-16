@@ -210,7 +210,7 @@ LEVEL_CROSS_TELEGRAM_CROSSINGS = os.getenv("LEVEL_CROSS_TELEGRAM_CROSSINGS", "1"
     "on",
 )
 # Старт тика entry detector (monitor + gate): уведомление в Telegram (часто — раз в SUPERVISOR_ENTRY_TICK_SEC).
-ENTRY_DETECTOR_TELEGRAM_START = os.getenv("ENTRY_DETECTOR_TELEGRAM_START", "0").strip().lower() in (
+ENTRY_DETECTOR_TELEGRAM_START = os.getenv("ENTRY_DETECTOR_TELEGRAM_START", "1").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -673,7 +673,7 @@ STRUCTURAL_LEVELS_REPORT_V4_WORKSHEET = (
 )
 # v4: полоса от ref в ATR для выбора сильнейшего уровня ниже/выше (vp_local + manual_global_hvn).
 STRUCTURAL_V4_BAND_MIN_ATR = float(os.getenv("STRUCTURAL_V4_BAND_MIN_ATR", "1.5"))
-STRUCTURAL_V4_BAND_MAX_ATR = float(os.getenv("STRUCTURAL_V4_BAND_MAX_ATR", "3.5"))
+STRUCTURAL_V4_BAND_MAX_ATR = float(os.getenv("STRUCTURAL_V4_BAND_MAX_ATR", "4.5"))
 STRUCTURAL_V4_LEVELS_FETCH_LIMIT = int(os.getenv("STRUCTURAL_V4_LEVELS_FETCH_LIMIT", "2000"))
 # Операционный контур: лог + Telegram + Google Sheets (без смешивания с сигналами входа).
 STRUCTURAL_OPS_LOG = os.getenv("STRUCTURAL_OPS_LOG", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -712,7 +712,7 @@ STRUCTURAL_OPS_SHEETS_LOG_EACH_MID_TOUCH = os.getenv(
 # -----------------------------------------------------------------------------
 OPS_STAGE_LOG = os.getenv("OPS_STAGE_LOG", "1").strip().lower() in ("1", "true", "yes", "on")
 # Telegram по этапам supervisor — по умолчанию выкл. (минимум шума); логи этапов в БД при OPS_STAGE_LOG=1.
-OPS_STAGE_TELEGRAM = os.getenv("OPS_STAGE_TELEGRAM", "0").strip().lower() in ("1", "true", "yes", "on")
+OPS_STAGE_TELEGRAM = os.getenv("OPS_STAGE_TELEGRAM", "1").strip().lower() in ("1", "true", "yes", "on")
 # When enabled, Telegram only receives end-of-stage statuses and failures (no start spam).
 OPS_STAGE_TELEGRAM_ONLY_FINAL = os.getenv("OPS_STAGE_TELEGRAM_ONLY_FINAL", "1").strip().lower() in (
     "1",
@@ -749,6 +749,7 @@ SUPERVISOR_LOOP_ENABLED = os.getenv("SUPERVISOR_LOOP_ENABLED", "1").strip().lowe
     "yes",
     "on",
 )
+ALL_ACTIVE_LEVELS_WORKSHEET = "all_active_levels"
 SUPERVISOR_POLL_SEC = float(os.getenv("SUPERVISOR_POLL_SEC", "2"))
 # Как часто обновлять базовые данные (spot/macro/indices/oi/instruments), сек.
 SUPERVISOR_DATA_REFRESH_SEC = int(os.getenv("SUPERVISOR_DATA_REFRESH_SEC", "900"))
@@ -771,18 +772,6 @@ SUPERVISOR_ENTRY_TICK_SEC = int(os.getenv("SUPERVISOR_ENTRY_TICK_SEC", "10"))
 SUPERVISOR_EXPORT_VP_LOCAL_BEFORE_STRUCTURAL = os.getenv(
     "SUPERVISOR_EXPORT_VP_LOCAL_BEFORE_STRUCTURAL", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
-# Снимок structural (лист structural_levels_report): из trading_state.structural_cycle_id.
-# При пропуске scheduled structural (arming/in_position) пайплайн не дергается — supervisor
-# сам вызывает export_levels_snapshot. Уважает STRUCTURAL_OPS_SHEETS_LEVELS.
-SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT = os.getenv(
-    "SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT", "1"
-).strip().lower() not in ("0", "false", "no", "off")
-SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V2 = os.getenv(
-    "SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V2", "1"
-).strip().lower() not in ("0", "false", "no", "off")
-SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V4 = os.getenv(
-    "SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V4", "1"
-).strip().lower() not in ("0", "false", "no", "off")
 
 # Какие шаги делать в supervisor `DATA_REFRESH` (и в load_all_data incremental — те же имена).
 # 0 / false / no / off — пропустить; 1 / true / yes / on — выполнить.

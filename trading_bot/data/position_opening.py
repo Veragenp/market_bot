@@ -1,8 +1,8 @@
 """
 Черновик позиции из `entry_gate_confirmations` + расчёт `position_math`.
 
-Опционально — рыночный вход через `bybit_trading.place_linear_market_order` при
-`execute_market=True` и `BYBIT_EXECUTION_ENABLED`.
+Исполнение входа только лимитом (`place_linear_limit_order` + stopLoss в одном запросе).
+Рыночные ордера в продукте — только для выходов (reduce-only), не для открытия.
 """
 
 from __future__ import annotations
@@ -40,7 +40,6 @@ def create_draft_position_from_confirmation(
     cur,
     *,
     confirmation_id: int,
-    execute_market: bool = False,
     execute_limit: bool = False,
     risk_usdt: Optional[float] = None,
     stop_atr_mult: Optional[float] = None,
@@ -52,9 +51,9 @@ def create_draft_position_from_confirmation(
     qty_step: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Вставляет строку в `position_records` (pending; open после рыночного входа).
+    Вставляет строку в `position_records` (pending без ордера, если `execute_limit=False`).
 
-    Ровно один из флагов: `execute_market` (рынок + стоп) или `execute_limit` (лимит GTC, без стопа до исполнения).
+    При `execute_limit=True` — лимит GTC со встроенным stopLoss в одном place_order (как tutorial_v3).
     Нужен `BYBIT_EXECUTION_ENABLED=1`.
     """
     row = cur.execute(
@@ -141,132 +140,7 @@ def create_draft_position_from_confirmation(
     order_raw: Optional[Dict[str, Any]] = None
     stop_order_raw: Optional[Dict[str, Any]] = None
 
-    if execute_market and execute_limit:
-        return {"ok": False, "error": "ambiguous_execute_flags", "plan": plan_to_dict(plan)}
-
-    if execute_market:
-        if not st.BYBIT_EXECUTION_ENABLED:
-            return {
-                "ok": False,
-                "error": "execution_disabled",
-                "hint": "set BYBIT_EXECUTION_ENABLED=1",
-                "plan": plan_to_dict(plan),
-            }
-        client_oid = bt.build_client_order_id("pos")
-        side_buy = side == "long"
-        try:
-            order_raw = bt.place_linear_market_order(
-                symbol_trade=sym_trade,
-                side_buy=side_buy,
-                qty=float(plan.qty_total),
-                reduce_only=False,
-            )
-        except Exception:
-            logger.exception("place_linear_market_order failed %s", sym_bybit)
-            return {"ok": False, "error": "order_failed", "plan": plan_to_dict(plan)}
-
-        rc = order_raw.get("retCode")
-        if rc not in (0, "0", None):
-            return {
-                "ok": False,
-                "error": "order_rejected",
-                "ret_code": rc,
-                "ret_msg": order_raw.get("retMsg"),
-                "plan": plan_to_dict(plan),
-            }
-
-        bybit_oid = None
-        try:
-            bybit_oid = (order_raw.get("result") or {}).get("orderId")
-        except Exception:
-            pass
-
-        entry_exec_id = _insert_exec_order(
-            cur,
-            {
-                "created_at": now,
-                "updated_at": now,
-                "cycle_id": conf.get("cycle_id"),
-                "structural_cycle_id": conf.get("structural_cycle_id"),
-                "position_record_id": None,
-                "order_role": "entry",
-                "client_order_id": client_oid,
-                "bybit_order_id": str(bybit_oid) if bybit_oid else None,
-                "symbol": sym_bybit,
-                "side": "Buy" if side_buy else "Sell",
-                "order_type": "Market",
-                "qty": float(plan.qty_total),
-                "price": None,
-                "status": "submitted",
-                "exchange_status": "accepted",
-                "reduce_only": 0,
-                "error_message": None,
-                "raw_json": json.dumps(order_raw, ensure_ascii=False)[:8000],
-            },
-        )
-        # SL выставляется совместно с входом (одним execution-актом).
-        stop_side_buy = side == "short"
-        stop_client_oid = bt.build_client_order_id("sl")
-        try:
-            stop_order_raw = bt.place_linear_stop_market_order(
-                symbol_trade=sym_trade,
-                side_buy=stop_side_buy,
-                qty=float(plan.qty_total),
-                trigger_price=float(plan.stop_price),
-                reduce_only=True,
-                close_on_trigger=True,
-            )
-        except Exception:
-            logger.exception("place_linear_stop_market_order failed %s", sym_bybit)
-            return {
-                "ok": False,
-                "error": "stop_order_failed",
-                "plan": plan_to_dict(plan),
-                "entry_order_response": order_raw,
-            }
-        stop_rc = stop_order_raw.get("retCode")
-        if stop_rc not in (0, "0", None):
-            return {
-                "ok": False,
-                "error": "stop_order_rejected",
-                "ret_code": stop_rc,
-                "ret_msg": stop_order_raw.get("retMsg"),
-                "plan": plan_to_dict(plan),
-                "entry_order_response": order_raw,
-                "stop_order_response": stop_order_raw,
-            }
-        stop_bybit_oid = None
-        try:
-            stop_bybit_oid = (stop_order_raw.get("result") or {}).get("orderId")
-        except Exception:
-            pass
-        stop_exec_id = _insert_exec_order(
-            cur,
-            {
-                "created_at": now,
-                "updated_at": now,
-                "cycle_id": conf.get("cycle_id"),
-                "structural_cycle_id": conf.get("structural_cycle_id"),
-                "position_record_id": None,
-                "order_role": "stop",
-                "parent_exec_order_id": entry_exec_id,
-                "client_order_id": stop_client_oid,
-                "bybit_order_id": str(stop_bybit_oid) if stop_bybit_oid else None,
-                "symbol": sym_bybit,
-                "side": "Buy" if stop_side_buy else "Sell",
-                "order_type": "StopMarket",
-                "qty": float(plan.qty_total),
-                "price": float(plan.stop_price),
-                "status": "submitted",
-                "exchange_status": "accepted",
-                "reduce_only": 1,
-                "error_message": None,
-                "raw_json": json.dumps(stop_order_raw, ensure_ascii=False)[:8000],
-            },
-        )
-        status = "open"
-
-    elif execute_limit:
+    if execute_limit:
         if not st.BYBIT_EXECUTION_ENABLED:
             return {
                 "ok": False,
@@ -283,6 +157,7 @@ def create_draft_position_from_confirmation(
                 side_buy=side_buy,
                 qty=float(plan.qty_total),
                 price=limit_px,
+                stop_loss=float(plan.stop_price),
             )
         except Exception:
             logger.exception("place_linear_limit_order failed %s", sym_bybit)
@@ -402,17 +277,14 @@ def create_draft_position_from_confirmation(
 def auto_open_after_gate_confirmations(
     cur,
     confirmation_ids: Sequence[int],
-    *,
-    use_limit: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Для каждого id из гейта — черновик позиции и ордер (лимит или рынок+стоп)."""
+    """Для каждого id из гейта — черновик позиции и лимитный вход со встроенным SL."""
     out: List[Dict[str, Any]] = []
     for cid in confirmation_ids:
         r = create_draft_position_from_confirmation(
             cur,
             confirmation_id=int(cid),
-            execute_market=not use_limit,
-            execute_limit=use_limit,
+            execute_limit=True,
         )
         row: Dict[str, Any] = {"confirmation_id": int(cid), **r}
         out.append(row)

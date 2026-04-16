@@ -421,6 +421,8 @@ def run_level_cross_tick(
     signals.extend(mon.check_cancellation_conditions(cur))
     summary["signals"] = list(signals)
     summary["symbols"] = len(mon.levels)
+    summary["long_count"] = sum(1 for lv in mon.levels.values() if "long" in lv)
+    summary["short_count"] = sum(1 for lv in mon.levels.values() if "short" in lv)
 
     if st.LEVEL_CROSS_TICK_SUMMARY_LOG:
         n_lv = len(mon.levels)

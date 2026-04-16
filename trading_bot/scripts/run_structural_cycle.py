@@ -1,4 +1,4 @@
-"""Запуск structural-пайплайна: расчёт пула → при успехе freeze в cycle_levels + trading_state.
+"""Запуск structural-пайплайна: расчёт пула → immediate freeze в cycle_levels + trading_state.
 
   PYTHONPATH=. python -m trading_bot.scripts.run_structural_cycle
 
@@ -16,21 +16,18 @@ _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from trading_bot.data.structural_cycle_db import run_structural_pipeline, run_structural_realtime_cycle
+from trading_bot.data.structural_cycle_db import run_structural_pipeline
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--scan-only",
+        "--no-freeze",
         action="store_true",
-        help="Только structural scan/MAD без realtime touch-window и entry timer.",
+        help="Только structural scan, без записи freeze в cycle_levels/trading_state.",
     )
     args = parser.parse_args()
-    if args.scan_only:
-        r = run_structural_pipeline()
-    else:
-        r = run_structural_realtime_cycle()
+    r = run_structural_pipeline(auto_freeze=not args.no_freeze)
     print(json.dumps(r, ensure_ascii=False, indent=2))
 
 

@@ -3,7 +3,6 @@
 
 Примеры:
   python -m trading_bot.scripts.open_position_from_confirmation --id 1
-  python -m trading_bot.scripts.open_position_from_confirmation --id 1 --execute
   python -m trading_bot.scripts.open_position_from_confirmation --id 1 --limit
 """
 
@@ -21,16 +20,10 @@ from trading_bot.data.schema import run_migrations
 def main() -> int:
     p = argparse.ArgumentParser(description="Черновик position_records из entry_gate_confirmations")
     p.add_argument("--id", type=int, required=True, help="id строки entry_gate_confirmations")
-    ex = p.add_mutually_exclusive_group()
-    ex.add_argument(
-        "--execute",
-        action="store_true",
-        help="Рыночный вход + стоп (нужны BYBIT_EXECUTION_ENABLED=1 и ключи)",
-    )
-    ex.add_argument(
+    p.add_argument(
         "--limit",
         action="store_true",
-        help="Лимит GTC по плану (без стопа до исполнения)",
+        help="Лимит GTC по плану со встроенным stopLoss (нужны BYBIT_EXECUTION_ENABLED=1 и ключи)",
     )
     args = p.parse_args()
 
@@ -41,7 +34,6 @@ def main() -> int:
         out = create_draft_position_from_confirmation(
             cur,
             confirmation_id=args.id,
-            execute_market=args.execute,
             execute_limit=args.limit,
         )
         if out.get("ok"):

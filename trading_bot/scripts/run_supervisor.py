@@ -6,9 +6,8 @@
 Перед structural (если SUPERVISOR_EXPORT_VP_LOCAL_BEFORE_STRUCTURAL): выгрузка vp_local из БД
 в Google Sheet (те же листы, что export_volume_peaks_to_sheets_only), для сверки перед отбором.
 
-Если SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT: при пропуске scheduled structural (активный цикл /
-freeze) — выгрузка листа structural_levels_report из trading_state.structural_cycle_id
-(нужно STRUCTURAL_OPS_SHEETS_LEVELS=1).
+При пропуске scheduled structural (активный цикл / freeze) supervisor всё равно выгружает
+cycle_levels snapshot (главный freeze-результат для торгового контура).
 
 Запуск из корня репозитория (рядом с каталогом `trading_bot`):
   PYTHONPATH=. python -m trading_bot.scripts.run_supervisor --loop
@@ -32,24 +31,32 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Dict
+from typing import Any, Dict, Tuple
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from trading_bot.analytics.entry_detector import run_entry_detector_tick
+from trading_bot.analytics.entry_gate import maybe_transition_arming_after_package_all_flat
 from trading_bot.config import settings as st
 from trading_bot.config.symbols import ANALYTIC_SYMBOLS, TRADING_SYMBOLS, crypto_context_binance_spot_not_in_trading
 from trading_bot.data.collectors import update_indices
+from trading_bot.data.cycle_levels_db import export_cycle_levels_sheets_snapshot
 from trading_bot.data.data_loader import DataLoaderManager
 from trading_bot.data.db import get_connection
 from trading_bot.data.ops_stage import record_stage_event
 from trading_bot.data.schema import init_db, run_migrations
-from trading_bot.data.structural_cycle_db import run_structural_realtime_cycle
-from trading_bot.data.structural_ops_notify import export_levels_snapshot, export_levels_snapshot_v2
+from trading_bot.data.structural_cycle_db import run_structural_pipeline
 from trading_bot.entrypoints.export_volume_peaks_to_sheets_only import main as export_vp_to_sheets_main
 from trading_bot.scripts.rebuild_volume_profile_peaks_to_db import main as rebuild_vp_local_main
+from trading_bot.tools.bybit_trading import (
+    get_linear_open_orders,
+    get_linear_positions,
+    linear_position_sizes_by_symbol,
+    pool_symbols_flat_on_linear_exchange,
+    to_bybit_symbol,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +85,6 @@ def _log_supervisor_config_banner() -> None:
     logger.info(
         "Supervisor config: DATA_REFRESH=%ss LEVELS_REBUILD=%ss STRUCTURAL=%ss ENTRY_TICK=%ss "
         "poll=%ss | structural_skip_cycle_active=%s structural_retry_blocked=%ss | "
-        "export_structural_levels_when_skipped=%s | "
         "BYBIT_USE_DEMO=%s BYBIT_BASE_URL=%s | LEVEL_CROSS min=%s timeout_min=%s |%s",
         st.SUPERVISOR_DATA_REFRESH_SEC,
         st.SUPERVISOR_LEVELS_REBUILD_SEC,
@@ -87,7 +93,6 @@ def _log_supervisor_config_banner() -> None:
         st.SUPERVISOR_POLL_SEC,
         st.SUPERVISOR_STRUCTURAL_SKIP_WHEN_CYCLE_ACTIVE,
         st.SUPERVISOR_STRUCTURAL_RETRY_WHEN_BLOCKED_SEC,
-        int(st.SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT),
         st.BYBIT_USE_DEMO,
         st.BYBIT_BASE_URL,
         st.LEVEL_CROSS_MIN_ALERTS_COUNT,
@@ -107,53 +112,209 @@ def _log_supervisor_config_banner() -> None:
     )
 
 
-def _export_structural_levels_report_from_state() -> None:
+def _export_cycle_levels_snapshot_from_state() -> None:
     """
-    Выгрузка листа structural_levels_report по последнему structural_cycle_id из trading_state.
-
-    Данные строк (L/U, ref, z_w) читаются из БД; pipeline_out пустой — pool/ref_source подтянутся из structural_cycles.
+    Выгрузка freeze-снимка cycle_levels/diag/candidates из текущего состояния БД.
     """
     if os.getenv("PYTEST_CURRENT_TEST"):
         return
-    if not st.SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT:
+    if not st.OPS_STAGE_SHEETS:
         return
+    try:
+        snap = export_cycle_levels_sheets_snapshot()
+        logger.info(
+            "Supervisor: cycle_levels snapshot exported rows=%s diag=%s candidates=%s",
+            snap.get("cycle_levels_rows"),
+            snap.get("diag_rows"),
+            snap.get("candidates_rows"),
+        )
+    except Exception:
+        logger.exception(
+            "Supervisor: cycle_levels snapshot → Sheets failed (credentials / network?)"
+        )
+
+
+def _is_cycle_flat_on_exchange(symbols_trade: list[str]) -> Tuple[bool, str]:
+    """
+    Проверка flat на бирже по символам цикла:
+    - все позиции size==0
+    - нет открытых ордеров по символам цикла
+    """
+    if not symbols_trade:
+        return True, "no_symbols"
+
+    pos_resp = get_linear_positions()
+    if pos_resp is None:
+        return False, "exchange_positions_unavailable"
+    sizes = linear_position_sizes_by_symbol(pos_resp)
+    if not pool_symbols_flat_on_linear_exchange(symbols_trade, sizes):
+        return False, "exchange_has_open_positions"
+
+    oo_resp = get_linear_open_orders()
+    if oo_resp is None:
+        return False, "exchange_open_orders_unavailable"
+    bybit_pool = {to_bybit_symbol(s) for s in symbols_trade}
+    rows = ((oo_resp.get("result") or {}).get("list") or []) if isinstance(oo_resp, dict) else []
+    for row in rows:
+        sym = str(row.get("symbol") or "").upper()
+        if sym in bybit_pool:
+            return False, f"exchange_open_order:{sym}"
+    return True, "exchange_flat"
+
+
+def _safe_auto_reset_cycle() -> tuple[bool, str]:
+    """
+    Safe auto-reset залипшего цикла перед structural:
+    - активная freeze-фаза (arming/in_position + levels_frozen=1)
+    - нет open/pending позиций и pending/open ордеров в БД
+    - flat на бирже (Bybit) по символам цикла
+    """
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return False, "pytest_mode"
+
+    now = int(time.time())
     conn = get_connection()
     try:
         cur = conn.cursor()
         row = cur.execute(
-            "SELECT structural_cycle_id FROM trading_state WHERE id = 1"
+            """
+            SELECT cycle_id, structural_cycle_id, levels_frozen, cycle_phase, last_transition_at
+            FROM trading_state
+            WHERE id = 1
+            """
         ).fetchone()
-        scid = row["structural_cycle_id"] if row else None
+        if not row:
+            return False, "no_trading_state"
+
+        cycle_id = str(row["cycle_id"]) if row["cycle_id"] else ""
+        structural_cycle_id = str(row["structural_cycle_id"]) if row["structural_cycle_id"] else ""
+        frozen = int(row["levels_frozen"] or 0)
+        phase = str(row["cycle_phase"] or "")
+        if not (frozen == 1 and phase in ("arming", "in_position")):
+            return False, "not_active_frozen_cycle"
+        if not cycle_id:
+            return False, "no_cycle_id"
+
+        last_transition_at = int(row["last_transition_at"] or 0)
+        if last_transition_at and now - last_transition_at < 60:
+            return False, "recent_transition_guard"
+
+        open_pos_row = cur.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM position_records
+            WHERE cycle_id = ? AND status IN ('pending', 'open')
+            """,
+            (cycle_id,),
+        ).fetchone()
+        open_pos = int(open_pos_row["c"] if open_pos_row else 0)
+        if open_pos > 0:
+            return False, f"db_open_positions:{open_pos}"
+
+        pending_exec_row = cur.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM exec_orders
+            WHERE cycle_id = ?
+              AND lower(COALESCE(status, '')) NOT IN (
+                'filled', 'cancelled', 'canceled', 'rejected', 'closed', 'failed', 'expired'
+              )
+            """,
+            (cycle_id,),
+        ).fetchone()
+        pending_exec = int(pending_exec_row["c"] if pending_exec_row else 0)
+        if pending_exec > 0:
+            return False, f"db_pending_exec_orders:{pending_exec}"
+
+        sym_cycle = structural_cycle_id or cycle_id
+        sym_rows = cur.execute(
+            """
+            SELECT DISTINCT symbol
+            FROM structural_cycle_symbols
+            WHERE cycle_id = ?
+            """,
+            (sym_cycle,),
+        ).fetchall()
+        symbols_trade = [str(r["symbol"]) for r in sym_rows if r and r["symbol"]]
+        if not symbols_trade:
+            return False, "no_cycle_symbols"
+
+        exch_flat, exch_reason = _is_cycle_flat_on_exchange(symbols_trade)
+        if not exch_flat:
+            return False, exch_reason
+
+        cur.execute(
+            """
+            UPDATE trading_state
+            SET cycle_phase = 'closed',
+                levels_frozen = 0,
+                cycle_id = NULL,
+                structural_cycle_id = NULL,
+                position_state = 'none',
+                close_reason = 'safe_auto_reset_before_structural',
+                channel_mode = 'two_sided',
+                known_side = 'both',
+                need_rebuild_opposite = 0,
+                opposite_rebuild_deadline_ts = NULL,
+                opposite_rebuild_attempts = 0,
+                allow_long_entry = 1,
+                allow_short_entry = 1,
+                last_rebuild_reason = 'safe_auto_reset_before_structural',
+                last_transition_at = ?,
+                updated_at = ?
+            WHERE id = 1
+            """,
+            (now, now),
+        )
+        cur.execute(
+            """
+            UPDATE structural_cycles
+            SET phase = 'closed',
+                cancel_reason = COALESCE(cancel_reason, 'safe_auto_reset_before_structural'),
+                updated_at = ?
+            WHERE id = ? AND phase != 'closed'
+            """,
+            (now, sym_cycle),
+        )
+        record_stage_event(
+            cur,
+            stage="SAFE_AUTO_RESET",
+            status="ok",
+            cycle_id=cycle_id,
+            run_id=cycle_id,
+            message="Safe auto-reset before structural",
+            details={
+                "reason": "stale_active_cycle_without_positions_or_orders",
+                "phase": phase,
+                "levels_frozen": frozen,
+                "open_positions_db": open_pos,
+                "pending_exec_orders_db": pending_exec,
+                "symbols_checked": len(symbols_trade),
+                "exchange_check": exch_reason,
+            },
+            started_at=now,
+            finished_at=now,
+        )
+        conn.commit()
+        logger.info(
+            "Supervisor: safe auto-reset applied (cycle=%s symbols=%s reason=%s)",
+            cycle_id[:8],
+            len(symbols_trade),
+            exch_reason,
+        )
+        return True, "reset_applied"
+    except Exception:
+        conn.rollback()
+        logger.exception("Supervisor: safe auto-reset failed")
+        return False, "exception"
     finally:
         conn.close()
-    if not scid:
-        logger.debug(
-            "Supervisor: structural_levels_report export skipped (no structural_cycle_id in trading_state)"
-        )
-        return
-    try:
-        # В отчёт пишем консистентный structural snapshot:
-        # ref_price/L/U должны оставаться из одного и того же расчёта structural-cycle.
-        export_levels_snapshot(str(scid), {})
-        logger.info("Supervisor: structural_levels_report exported cycle_id=%s", str(scid))
-    except Exception:
-        logger.exception(
-            "Supervisor: structural_levels_report → Sheets failed (credentials / network?)"
-        )
-    if not st.SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V2:
-        return
-    try:
-        export_levels_snapshot_v2()
-        logger.info("Supervisor: structural_levels_report_v2 exported")
-    except Exception:
-        logger.exception(
-            "Supervisor: structural_levels_report_v2 → Sheets failed (credentials / network?)"
-        )
 
 
 def _should_skip_scheduled_structural() -> tuple[bool, str]:
     """
     Пока зафиксированы уровни и цикл не closed — полный structural не нужен (не сбрасывать V3-окно и freeze).
+    Проверяем "залипший" цикл: если positions flat но цикл активен более N часов — авто-сброс.
     """
     if os.getenv("PYTEST_CURRENT_TEST"):
         return False, ""
@@ -163,13 +324,47 @@ def _should_skip_scheduled_structural() -> tuple[bool, str]:
     try:
         cur = conn.cursor()
         row = cur.execute(
-            "SELECT levels_frozen, cycle_phase FROM trading_state WHERE id = 1"
+            "SELECT levels_frozen, cycle_phase, last_transition_at, cycle_id FROM trading_state WHERE id = 1"
         ).fetchone()
         if not row:
             return False, ""
         frozen = int(row["levels_frozen"] or 0)
-        phase = str(row["cycle_phase"] or "arming")
+        phase = str(row["cycle_phase"] or "")
         if frozen and phase in ("arming", "in_position"):
+            # Проверяем "залипший" цикл: нет позиций но цикл активен > 24ч
+            cycle_id = str(row["cycle_id"]) if row["cycle_id"] else ""
+            last_transition = int(row["last_transition_at"] or 0)
+            now = int(time.time())
+            
+            # Проверка на залипший цикл (без позиций более 24 часов)
+            if last_transition and now - last_transition > 86400:  # 24 часа
+                # Проверяем есть ли позиции
+                open_pos = cur.execute(
+                    "SELECT COUNT(*) AS c FROM position_records WHERE cycle_id = ? AND status IN ('pending', 'open')",
+                    (cycle_id,)
+                ).fetchone()
+                n_open = int(open_pos["c"] if open_pos else 0)
+                
+                if n_open == 0:
+                    # Цикл залипший — авто-сброс
+                    reset_done, reset_reason = _safe_auto_reset_cycle()
+                    if reset_done:
+                        logger.warning(
+                            "Supervisor: auto-reset STUCK cycle (no positions for >24h, cycle=%s)",
+                            cycle_id[:8]
+                        )
+                        return False, ""
+                    logger.warning(
+                        "Supervisor: stuck cycle detected but auto-reset failed (%s)",
+                        reset_reason
+                    )
+            
+            # После проверки залипания — выходим, structural будет пропущен
+            # Auto-reset применяется только если цикл залип >24h
+            logger.info(
+                "Supervisor: safe auto-reset blocked, keep structural skip (phase=%s frozen=%s)",
+                phase, frozen,
+            )
             return True, f"active_trading_cycle phase={phase} levels_frozen=1"
         return False, ""
     finally:
@@ -352,15 +547,8 @@ def _run_structural() -> Dict[str, object]:
             logger.exception(
                 "Supervisor: vp_local_levels → Sheets before structural failed (credentials / network?)"
             )
-    out = run_structural_realtime_cycle(force_freeze=True)
-    if st.SUPERVISOR_EXPORT_STRUCTURAL_LEVELS_REPORT_V2 and not os.getenv("PYTEST_CURRENT_TEST"):
-        try:
-            export_levels_snapshot_v2()
-            logger.info("Supervisor: structural_levels_report_v2 exported after structural run")
-        except Exception:
-            logger.exception(
-                "Supervisor: structural_levels_report_v2 export after structural run failed"
-            )
+    # Целевой режим: scan + immediate freeze (без realtime touch/entry_timer/abort).
+    out = run_structural_pipeline(auto_freeze=True)
     end = int(time.time())
     status = "ok" if out.get("phase") in ("armed", "completed") else "failed"
     sev = None if status == "ok" else "error"
@@ -420,7 +608,7 @@ def run_supervisor_once() -> Dict[str, object]:
     structural_out: Dict[str, object]
     if skip:
         logger.info("Supervisor once: structural skipped (%s)", reason)
-        _export_structural_levels_report_from_state()
+        _export_cycle_levels_snapshot_from_state()
         structural_out = {"skipped": True, "reason": reason}
     else:
         structural_out = _run_structural()
@@ -466,7 +654,7 @@ def run_supervisor_loop() -> None:
                         reason,
                         st.SUPERVISOR_STRUCTURAL_RETRY_WHEN_BLOCKED_SEC,
                     )
-                    _export_structural_levels_report_from_state()
+                    _export_cycle_levels_snapshot_from_state()
                     last_structural = now - int(st.SUPERVISOR_STRUCTURAL_SEC) + int(
                         st.SUPERVISOR_STRUCTURAL_RETRY_WHEN_BLOCKED_SEC
                     )

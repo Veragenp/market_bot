@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -7,7 +8,11 @@ from typing import Dict, Iterable, Optional
 
 import requests
 
+from trading_bot.config import settings as st
 from trading_bot.config.settings import BYBIT_BASE_URL, PRICE_FEED_MAX_STALE_SEC, PRICE_FEED_WS_WARMUP_SEC
+from trading_bot.tools.bybit_ws import public_linear_websocket_kwargs
+
+logger = logging.getLogger(__name__)
 
 
 def _to_bybit_symbol(symbol: str) -> str:
@@ -33,6 +38,14 @@ class PriceFeed:
     Unified current-price source for cycle selection and detector:
       1) Bybit WebSocket ticker (if pybit is available)
       2) REST fallback /v5/market/tickers
+
+    Публичные котировки не требуют API-ключей. При BYBIT_USE_DEMO=1 используются
+    demo WebSocket (stream-demo) и api-demo REST — как HTTP в bybit_trading, иначе
+    расхождение с ценами в демо-терминале.
+
+    Канал V5: channel_type linear (USDT perpetual). При проблемах с stream.bybit.com
+    задайте BYBIT_WS_DOMAIN=bytick при BYBIT_USE_DEMO=0 (см. trading_bot.tools.bybit_ws).
+    Если WS с сети недоступен, а REST работает: PRICE_FEED_WEBSOCKET_ENABLED=0.
     """
 
     def __init__(self) -> None:
@@ -44,6 +57,9 @@ class PriceFeed:
 
     def _on_ws_tick(self, message: dict) -> None:
         try:
+            if isinstance(message, dict) and message.get("success") is False:
+                logger.warning("PriceFeed: WebSocket op error %s", message)
+                return
             topic = str(message.get("topic") or "")
             data = message.get("data") or {}
             bybit_symbol = topic.split(".")[1] if "." in topic else str(data.get("symbol") or "")
@@ -59,26 +75,52 @@ class PriceFeed:
             return
 
     def start_ws(self, symbols: Iterable[str]) -> bool:
+        if not st.PRICE_FEED_WEBSOCKET_ENABLED:
+            return False
         if self._ws_started:
             return True
         try:
             from pybit.unified_trading import WebSocket  # type: ignore
-        except Exception:
+        except Exception as e:
+            logger.warning("PriceFeed: pybit WebSocket unavailable: %s", e)
             return False
         try:
-            ws = WebSocket(testnet=False, channel_type="linear")
-            for sym in symbols:
+            ws_kw = public_linear_websocket_kwargs()
+            sub = "stream-demo" if st.BYBIT_USE_DEMO else "stream"
+            dom = ws_kw.get("domain", "bybit")
+            logger.info(
+                "PriceFeed: WebSocket linear public ~ wss://%s.%s.com/v5/public/linear "
+                "demo=%s trace=%s",
+                sub,
+                dom,
+                st.BYBIT_USE_DEMO,
+                st.BYBIT_WS_TRACE_LOGGING,
+            )
+            ws = WebSocket(channel_type="linear", **ws_kw)
+            sym_list = list(symbols)
+            for sym in sym_list:
                 ws.ticker_stream(symbol=_to_bybit_symbol(sym), callback=self._on_ws_tick)
             self._ws = ws
             self._ws_started = True
+            logger.info(
+                "PriceFeed: WebSocket linear ticker started subs=%s BYBIT_USE_DEMO=%s (public, no API key)",
+                len(sym_list),
+                st.BYBIT_USE_DEMO,
+            )
             return True
-        except Exception:
+        except Exception as e:
+            logger.warning("PriceFeed: WebSocket start failed: %s", e)
             self._ws_started = False
             self._ws = None
             return False
 
     def _rest_snapshot(self, symbols: Iterable[str]) -> Dict[str, PricePoint]:
-        url = f"{BYBIT_BASE_URL.rstrip('/')}/v5/market/tickers"
+        base = (
+            "https://api-demo.bybit.com"
+            if st.BYBIT_USE_DEMO
+            else BYBIT_BASE_URL.rstrip("/")
+        )
+        url = f"{base}/v5/market/tickers"
         resp = self._session.get(url, params={"category": "linear"}, timeout=30)
         resp.raise_for_status()
         data = resp.json()
@@ -104,8 +146,7 @@ class PriceFeed:
 
     def get_prices(self, symbols: Iterable[str]) -> Dict[str, PricePoint]:
         syms = list(symbols)
-        # try ws first
-        ws_ok = self.start_ws(syms)
+        ws_ok = self.start_ws(syms) if st.PRICE_FEED_WEBSOCKET_ENABLED else False
         if ws_ok:
             deadline = time.time() + max(1, int(PRICE_FEED_WS_WARMUP_SEC))
             while time.time() < deadline:
@@ -126,12 +167,37 @@ class PriceFeed:
                     continue
                 out[s] = p
         missing = [s for s in syms if s not in out]
+        rest_n = 0
         if missing:
             try:
                 snap = self._rest_snapshot(missing)
-            except Exception:
+                rest_n = len(snap)
+                still = [s for s in missing if s not in snap]
+                if still:
+                    logger.warning(
+                        "PriceFeed: REST still missing %s symbols (of %s requested) demo=%s",
+                        len(still),
+                        len(syms),
+                        st.BYBIT_USE_DEMO,
+                    )
+            except Exception as e:
+                logger.warning("PriceFeed: REST tickers failed: %s", e)
                 snap = {}
             out.update(snap)
+        ws_pts = sum(1 for s in syms if s in out and out[s].source == "ws")
+        rest_pts = sum(1 for s in syms if s in out and out[s].source == "rest")
+        if syms:
+            logger.info(
+                "PriceFeed: want=%s got=%s (ws=%s rest=%s) ws_running=%s rest_batch=%s demo=%s stale_max=%ss",
+                len(syms),
+                len(out),
+                ws_pts,
+                rest_pts,
+                self._ws_started,
+                rest_n,
+                st.BYBIT_USE_DEMO,
+                PRICE_FEED_MAX_STALE_SEC,
+            )
         return out
 
 

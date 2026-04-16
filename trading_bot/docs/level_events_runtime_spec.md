@@ -1,5 +1,7 @@
 # Level Events Runtime Spec
 
+> Сейчас это отдельный аналитический контур; в active structural -> entry pipeline не является обязательным этапом.
+
 Цель: получать из `price_levels` практическую аналитику по касаниям уровней:
 
 - глубина проникновения (`penetration_atr`);

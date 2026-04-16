@@ -10,7 +10,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -49,13 +49,62 @@ def get_wallet_usdt_balance() -> Optional[Dict[str, Any]]:
 def get_linear_positions(symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
     try:
         sess = _session()
-        params: Dict[str, Any] = {"category": "linear", "limit": 50}
+        # Bybit V5 position/list требует symbol ИЛИ settleCoin.
+        params: Dict[str, Any] = {"category": "linear", "limit": 200}
         if symbol:
             params["symbol"] = to_bybit_symbol(symbol)
+        else:
+            params["settleCoin"] = "USDT"
         return sess.get_positions(**params)
     except Exception:
         logger.exception("get_positions failed")
         return None
+
+
+def get_linear_open_orders(symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Открытые ордера linear (USDT settleCoin при symbol=None)."""
+    try:
+        sess = _session()
+        params: Dict[str, Any] = {"category": "linear", "limit": 200}
+        if symbol:
+            params["symbol"] = to_bybit_symbol(symbol)
+        else:
+            params["settleCoin"] = "USDT"
+        return sess.get_open_orders(**params)
+    except Exception:
+        logger.exception("get_open_orders failed")
+        return None
+
+
+def linear_position_sizes_by_symbol(resp: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    По ответу get_positions: символ Bybit (BTCUSDT) -> размер позиции (|size| может быть 0).
+    Односторонний режим: одна строка на контракт.
+    """
+    out: Dict[str, float] = {}
+    if not resp or not resp.get("result"):
+        return out
+    for row in (resp.get("result") or {}).get("list") or []:
+        sym = str(row.get("symbol") or "").upper()
+        if not sym:
+            continue
+        try:
+            sz = float(row.get("size") or 0.0)
+        except (TypeError, ValueError):
+            sz = 0.0
+        out[sym] = sz
+    return out
+
+
+def pool_symbols_flat_on_linear_exchange(
+    symbols_trade: List[str], sizes_by_bybit_symbol: Dict[str, float], *, eps: float = 1e-12
+) -> bool:
+    """True, если по всем символам пула на бирже нет открытого size (включая отсутствие ключа = 0)."""
+    for s in symbols_trade:
+        key = to_bybit_symbol(s)
+        if abs(float(sizes_by_bybit_symbol.get(key, 0.0))) > eps:
+            return False
+    return True
 
 
 def place_linear_limit_order(
@@ -65,8 +114,13 @@ def place_linear_limit_order(
     qty: float,
     price: float,
     time_in_force: str = "GTC",
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Лимитный ордер USDT linear (вход)."""
+    """
+    Лимитный ордер USDT linear (вход).
+    Как tutorial_v3/bybit_api.place_limit_order: опционально stopLoss / takeProfit на той же заявке (GTC).
+    """
     from trading_bot.config import settings as st
 
     if not st.BYBIT_EXECUTION_ENABLED:
@@ -74,15 +128,31 @@ def place_linear_limit_order(
     sess = _session()
     sym = to_bybit_symbol(symbol_trade)
     side = "Buy" if side_buy else "Sell"
-    return sess.place_order(
-        category="linear",
-        symbol=sym,
-        side=side,
-        orderType="Limit",
-        qty=str(qty),
-        price=str(price),
-        timeInForce=time_in_force,
-    )
+    payload: Dict[str, Any] = {
+        "category": "linear",
+        "symbol": sym,
+        "side": side,
+        "orderType": "Limit",
+        "qty": str(qty),
+        "price": str(price),
+        "timeInForce": time_in_force,
+    }
+    if stop_loss is not None:
+        payload["stopLoss"] = str(stop_loss)
+    if take_profit is not None:
+        payload["takeProfit"] = str(take_profit)
+    return sess.place_order(**payload)
+
+
+def cancel_linear_order(*, symbol_trade: str, order_id: str) -> Dict[str, Any]:
+    """Отмена ордера по orderId (linear). symbol_trade: BTC/USDT или BTCUSDT."""
+    from trading_bot.config import settings as st
+
+    if not st.BYBIT_EXECUTION_ENABLED:
+        raise RuntimeError("BYBIT_EXECUTION_ENABLED is off — refusing to cancel order")
+    sess = _session()
+    sym = to_bybit_symbol(symbol_trade)
+    return sess.cancel_order(category="linear", symbol=sym, orderId=str(order_id))
 
 
 def place_linear_market_order(

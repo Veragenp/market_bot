@@ -7,12 +7,17 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+import pandas as pd
+
 from trading_bot.config.settings import (
     CYCLE_LEVELS_ALLOWED_LEVEL_TYPES,
     CYCLE_LEVELS_COOLDOWN_HOURS,
+    CYCLE_LEVELS_CANDIDATES_WORKSHEET,
+    CYCLE_LEVELS_DIAG_WORKSHEET,
     CYCLE_LEVELS_FALLBACK_MAX_ATR,
     CYCLE_LEVELS_MIN_DIST_ATR,
     CYCLE_LEVELS_REBUILD_ENABLED,
+    CYCLE_LEVELS_WORKSHEET,
     CYCLE_LEVELS_ZONE_EXPAND_MAX_STEPS,
     CYCLE_LEVELS_ZONE_EXPAND_STEP_ATR,
     CYCLE_LEVELS_ZONE_HALF_WIDTH_ATR,
@@ -22,6 +27,7 @@ from trading_bot.config.settings import (
     STRUCTURAL_OPPOSITE_REBUILD_BAND_MULT,
     STRUCTURAL_W_MAX,
     STRUCTURAL_W_MIN,
+    ALL_ACTIVE_LEVELS_WORKSHEET 
 )
 from trading_bot.config.symbols import TRADING_SYMBOLS
 from trading_bot.data.db import get_connection
@@ -29,7 +35,8 @@ from trading_bot.data.repositories import get_instruments_atr_bybit_futures_cur
 from trading_bot.data.schema import init_db, run_migrations
 from trading_bot.tools.price_feed import PricePoint, get_price_feed
 from trading_bot.tools.sheets_exporter import SheetsExporter
-
+# Определяем имя листа для всех активных уровней (если не задано в .env)
+ALL_ACTIVE_LEVELS_WORKSHEET = os.getenv("ALL_ACTIVE_LEVELS_WORKSHEET", "all_active_levels")
 
 @dataclass
 class Candidate:
@@ -67,7 +74,6 @@ def _latest_close_1m(symbol: str, cur) -> Optional[float]:
 
 
 def _atr_daily(symbol: str, cur) -> Optional[float]:
-    """ATR только из БД (`instruments.atr`, Gerchik). Пишется ежедневным job в `data_loader`."""
     return get_instruments_atr_bybit_futures_cur(cur, symbol)
 
 
@@ -432,10 +438,6 @@ def backfill_missing_cycle_side(
     ref_prices: Dict[str, float],
     ref_source: str = "entry_gate_rebuild",
 ) -> dict:
-    """
-    Дозаполняет недостающую сторону ('long' или 'short') для символов текущего cycle_id.
-    Возвращает счётчики inserted/missing.
-    """
     if missing_direction not in ("long", "short"):
         return {"inserted": 0, "missing": list(symbols), "error": "invalid_direction"}
     now_ts = _now_ts()
@@ -474,7 +476,6 @@ def backfill_missing_cycle_side(
                 atr=float(atr),
             )
         else:
-            # Без симметрии по символу: якорь только по текущей цене (ref).
             cands = _load_candidates_with_ref_price(
                 symbol=symbol,
                 direction=missing_direction,
@@ -505,7 +506,6 @@ def backfill_missing_cycle_side(
                 idx_found = i
                 break
         if idx_found < 0 and cands:
-            # Fallback: берем просто сильнейший по стороне.
             idx_found = 0
         item["idx"] = idx_found  # type: ignore[index]
 
@@ -577,8 +577,6 @@ def backfill_missing_cycle_side(
 
 
 def build_cycle_levels_diagnostics():
-    import pandas as pd
-
     now_ts = _now_ts()
     conn = get_connection()
     cur = conn.cursor()
@@ -651,10 +649,8 @@ def build_cycle_levels_diagnostics():
 
 
 def build_cycle_levels_candidates_df():
-    import pandas as pd
-
-    init_db()
-    run_migrations()
+    # init_db() и run_migrations() вызываются в supervisor при старте
+    # Не вызывать в каждом тике - создаёт database locked
     now_ts = _now_ts()
     conn = get_connection()
     cur = conn.cursor()
@@ -732,8 +728,6 @@ def build_cycle_levels_candidates_df():
 
 
 def fetch_cycle_levels_df():
-    import pandas as pd
-
     conn = get_connection()
     df = pd.read_sql_query(
         """
@@ -772,12 +766,9 @@ def fetch_cycle_levels_df():
 
 
 def export_cycle_levels_sheets_snapshot() -> Dict[str, int]:
-    """
-    Экспорт существующих листов cycle-levels (без создания новых форматов):
-      - CYCLE_LEVELS_WORKSHEET
-      - CYCLE_LEVELS_DIAG_WORKSHEET
-      - CYCLE_LEVELS_CANDIDATES_WORKSHEET
-    """
+    """Экспорт cycle_levels в Google Sheets с обработкой ошибок database locked."""
+    import sqlite3
+    
     credentials_path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
     spreadsheet_title = os.getenv("MARKET_AUDIT_SHEET_TITLE", "Market Data Audit")
     spreadsheet_url = os.getenv("MARKET_AUDIT_SHEET_URL")
@@ -789,16 +780,77 @@ def export_cycle_levels_sheets_snapshot() -> Dict[str, int]:
         spreadsheet_id=spreadsheet_id,
     )
     now_iso = datetime.now(timezone.utc).isoformat()
-    df = fetch_cycle_levels_df()
-    if df.empty:
-        df = df.assign(note="cycle_levels is empty")
-    df["exported_at_utc"] = now_iso
-    diag = build_cycle_levels_diagnostics()
-    diag["exported_at_utc"] = now_iso
-    cands = build_cycle_levels_candidates_df()
-    cands["exported_at_utc"] = now_iso
-    exporter.export_dataframe_to_sheet(df, spreadsheet_title, CYCLE_LEVELS_WORKSHEET)
-    exporter.export_dataframe_to_sheet(diag, spreadsheet_title, CYCLE_LEVELS_DIAG_WORKSHEET)
-    exporter.export_dataframe_to_sheet(cands, spreadsheet_title, CYCLE_LEVELS_CANDIDATES_WORKSHEET)
-    return {"cycle_levels_rows": len(df), "diag_rows": len(diag), "candidates_rows": len(cands)}
+    
+    try:
+        df = fetch_cycle_levels_df()
+        if df.empty:
+            df = df.assign(note="cycle_levels is empty")
+        df["exported_at_utc"] = now_iso
+        exporter.export_dataframe_to_sheet(df, spreadsheet_title, CYCLE_LEVELS_WORKSHEET)
+        cycle_levels_rows = len(df)
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e):
+            logger.warning("export_cycle_levels_sheets_snapshot: database locked, skipping cycle_levels export")
+            cycle_levels_rows = 0
+        else:
+            raise
+    
+    try:
+        diag = build_cycle_levels_diagnostics()
+        diag["exported_at_utc"] = now_iso
+        exporter.export_dataframe_to_sheet(diag, spreadsheet_title, CYCLE_LEVELS_DIAG_WORKSHEET)
+        diag_rows = len(diag)
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e):
+            logger.warning("export_cycle_levels_sheets_snapshot: database locked, skipping diag export")
+            diag_rows = 0
+        else:
+            raise
+    
+    try:
+        cands = build_cycle_levels_candidates_df()
+        cands["exported_at_utc"] = now_iso
+        exporter.export_dataframe_to_sheet(cands, spreadsheet_title, CYCLE_LEVELS_CANDIDATES_WORKSHEET)
+        candidates_rows = len(cands)
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e):
+            logger.warning("export_cycle_levels_sheets_snapshot: database locked, skipping candidates export")
+            candidates_rows = 0
+        else:
+            raise
+    
+    return {"cycle_levels_rows": cycle_levels_rows, "diag_rows": diag_rows, "candidates_rows": candidates_rows}
 
+
+# ========== НОВАЯ ФУНКЦИЯ: экспорт всех активных горизонтальных уровней ==========
+def export_all_active_levels_to_sheets() -> Dict[str, int]:
+    """Выгружает все активные уровни из price_levels (is_active=1, status='active')."""
+    credentials_path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
+    spreadsheet_title = os.getenv("MARKET_AUDIT_SHEET_TITLE", "Market Data Audit")
+    spreadsheet_url = os.getenv("MARKET_AUDIT_SHEET_URL")
+    spreadsheet_id = os.getenv("MARKET_AUDIT_SHEET_ID")
+    exporter = SheetsExporter(
+        credentials_path=credentials_path,
+        spreadsheet_title=spreadsheet_title,
+        spreadsheet_url=spreadsheet_url,
+        spreadsheet_id=spreadsheet_id,
+    )
+    conn = get_connection()
+    df = pd.read_sql_query(
+        """
+        SELECT
+            symbol, price, level_type, layer, strength, volume_peak,
+            duration_hours, tier, created_at, updated_at, is_active, status,
+            stable_level_id, origin, timeframe
+        FROM price_levels
+        WHERE is_active = 1 AND status = 'active'
+        ORDER BY symbol, price
+        """,
+        conn,
+    )
+    conn.close()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    df["exported_at_utc"] = now_iso
+    ws_name = os.getenv("ALL_ACTIVE_LEVELS_WORKSHEET", "all_active_levels")
+    exporter.export_dataframe_to_sheet(df, spreadsheet_title, ws_name)
+    return {"rows": len(df), "worksheet": ws_name}

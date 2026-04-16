@@ -84,12 +84,13 @@ def _build_levels_dataframe(cycle_id: str, pipeline_out: Optional[Dict[str, Any]
     ).fetchall()
     conn.close()
 
+    logger.debug("Building levels dataframe for cycle_id=%s, rows=%d", cycle_id, len(rows))
+
     ref_src = pipeline_out.get("ref_price_source")
     pool_m_w = float(pipeline_out.get("pool_median_w") or 0.0)
     pool_mad_w = float(pipeline_out.get("pool_mad") or 0.0)
     pool_m_r = float(pipeline_out.get("pool_median_r") or 0.0)
     pool_mad_r = float(pipeline_out.get("pool_mad_r") or 0.0)
-    # pool_k = z_w_ok_threshold; pool_mad = люфт W*; z_w = |W - W*| / slack
     mad_k = float(
         (sc["pool_k"] if sc and sc["pool_k"] is not None else pj.get("z_w_ok_threshold", 1.0)) or 1.0
     )
@@ -171,7 +172,96 @@ def _build_levels_dataframe(cycle_id: str, pipeline_out: Optional[Dict[str, Any]
                 "dist_ref_to_U_atr": dist_u,
             }
         )
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+    logger.info("Built levels dataframe with %d records for cycle_id=%s", len(df), cycle_id)
+    return df
+
+
+def build_structural_trading_levels_df(cycle_id: str) -> Any:
+    """
+    Новая функция: формирует упрощённый DataFrame только с ТОРГОВЫМИ уровнями
+    для выгрузки в Google Sheets. Включает: символ, направление, цену уровня,
+    текущую цену, расстояние в ATR, объём пика.
+    """
+    import pandas as pd
+
+    from trading_bot.data.db import get_connection
+    from trading_bot.tools.price_feed import PricePoint, get_price_feed
+
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # Загружаем structural_cycle_symbols
+    sc_rows = cur.execute(
+        """
+        SELECT symbol, L_price, U_price, atr, ref_price_ws,
+               tier_below, tier_above, volume_peak_below, volume_peak_above
+        FROM structural_cycle_symbols
+        WHERE cycle_id = ? AND status = 'ok'
+        """,
+        (cycle_id,),
+    ).fetchall()
+    
+    # Получаем текущие цены
+    symbols = [str(r["symbol"]) for r in sc_rows]
+    feed = get_price_feed()
+    live_prices = feed.get_prices(symbols)
+    
+    records = []
+    for r in sc_rows:
+        sym = str(r["symbol"])
+        ref_price = float(r["ref_price_ws"]) if r["ref_price_ws"] else None
+        atr = float(r["atr"]) if r["atr"] else None
+        
+        # Текущая цена
+        live_price = live_prices.get(sym)
+        current_price = float(live_price.price) if live_price else (ref_price or 0.0)
+        
+        # LONG уровень
+        if r["L_price"] is not None:
+            lp = float(r["L_price"])
+            dist_atr = abs(lp - current_price) / atr if atr and atr > 0 else None
+            records.append({
+                "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+                "structural_cycle_id": cycle_id,
+                "symbol": sym,
+                "direction": "LONG",
+                "level_price": lp,
+                "tier": r["tier_below"],
+                "volume_peak": r["volume_peak_below"],
+                "current_price": current_price,
+                "dist_from_current_atr": dist_atr,
+                "atr": atr,
+                "ref_price": ref_price,
+            })
+        
+        # SHORT уровень
+        if r["U_price"] is not None:
+            up = float(r["U_price"])
+            dist_atr = abs(up - current_price) / atr if atr and atr > 0 else None
+            records.append({
+                "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+                "structural_cycle_id": cycle_id,
+                "symbol": sym,
+                "direction": "SHORT",
+                "level_price": up,
+                "tier": r["tier_above"],
+                "volume_peak": r["volume_peak_above"],
+                "current_price": current_price,
+                "dist_from_current_atr": dist_atr,
+                "atr": atr,
+                "ref_price": ref_price,
+            })
+    
+    conn.close()
+    
+    df = pd.DataFrame(records)
+    if not df.empty:
+        # Сортировка: сначала направление, потом символ
+        df = df.sort_values(["direction", "symbol"]).reset_index(drop=True)
+    
+    logger.info("Built trading levels dataframe with %d records for cycle_id=%s", len(df), cycle_id)
+    return df
 
 
 def export_levels_snapshot(cycle_id: str, pipeline_out: Optional[Dict[str, Any]] = None) -> None:
@@ -179,9 +269,13 @@ def export_levels_snapshot(cycle_id: str, pipeline_out: Optional[Dict[str, Any]]
     from trading_bot.tools.sheets_exporter import SheetsExporter
 
     if not st.STRUCTURAL_OPS_SHEETS_LEVELS:
+        logger.debug("STRUCTURAL_OPS_SHEETS_LEVELS disabled, skipping export")
         return
     es = _load_export_to_sheets()
     df = _build_levels_dataframe(cycle_id, pipeline_out)
+    if df.empty:
+        logger.warning("Empty dataframe for levels snapshot, skipping export")
+        return
     exporter = SheetsExporter(
         credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH", es.CREDENTIALS_PATH),
         spreadsheet_title=es.SHEET_TITLE,
@@ -189,8 +283,48 @@ def export_levels_snapshot(cycle_id: str, pipeline_out: Optional[Dict[str, Any]]
         spreadsheet_id=os.getenv("MARKET_AUDIT_SHEET_ID") or es.SHEET_ID,
     )
     ws = os.getenv("STRUCTURAL_LEVELS_REPORT_WORKSHEET", st.STRUCTURAL_LEVELS_REPORT_WORKSHEET)
-    exporter.export_dataframe_to_sheet(df, es.SHEET_TITLE, ws)
-    logger.info("Structural ops: levels sheet %s rows=%s cycle_id=%s", ws, len(df), cycle_id)
+    logger.info("Exporting levels snapshot to sheet '%s', rows=%d, cycle_id=%s", ws, len(df), cycle_id)
+    try:
+        exporter.export_dataframe_to_sheet(df, es.SHEET_TITLE, ws)
+        logger.info("Successfully exported levels snapshot to %s", ws)
+    except Exception as e:
+        logger.exception("Failed to export levels snapshot to sheet %s", ws)
+        raise
+
+
+def export_structural_trading_levels(cycle_id: str) -> None:
+    """
+    Экспорт упрощённой таблицы ТОРГОВЫХ уровней в Google Sheets.
+    Лист: structural_trading_levels (или из env STRUCTURAL_TRADING_LEVELS_WORKSHEET)
+    """
+    from trading_bot.config import settings as st
+    from trading_bot.tools.sheets_exporter import SheetsExporter
+
+    if not st.STRUCTURAL_OPS_SHEETS_LEVELS:
+        logger.debug("STRUCTURAL_OPS_SHEETS_LEVELS disabled, skipping export")
+        return
+    
+    es = _load_export_to_sheets()
+    df = build_structural_trading_levels_df(cycle_id)
+    if df.empty:
+        logger.warning("Empty trading levels dataframe for cycle_id=%s, skipping export", cycle_id)
+        return
+    
+    exporter = SheetsExporter(
+        credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH", es.CREDENTIALS_PATH),
+        spreadsheet_title=es.SHEET_TITLE,
+        spreadsheet_url=os.getenv("MARKET_AUDIT_SHEET_URL") or es.SHEET_URL,
+        spreadsheet_id=os.getenv("MARKET_AUDIT_SHEET_ID") or es.SHEET_ID,
+    )
+    
+    ws_name = os.getenv("STRUCTURAL_TRADING_LEVELS_WORKSHEET", "structural_trading_levels")
+    logger.info("Exporting trading levels to sheet '%s', rows=%d, cycle_id=%s", ws_name, len(df), cycle_id)
+    
+    try:
+        exporter.export_dataframe_to_sheet(df, es.SHEET_TITLE, ws_name)
+        logger.info("Successfully exported trading levels to %s", ws_name)
+    except Exception:
+        logger.exception("Failed to export trading levels to sheet %s", ws_name)
 
 
 def export_levels_snapshot_v2() -> None:
@@ -208,6 +342,9 @@ def export_levels_snapshot_v2() -> None:
         df = build_structural_v2_report_df(cur)
     finally:
         conn.close()
+    if df.empty:
+        logger.warning("Empty dataframe for levels v2 snapshot, skipping")
+        return
     exporter = SheetsExporter(
         credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH", es.CREDENTIALS_PATH),
         spreadsheet_title=es.SHEET_TITLE,
@@ -215,8 +352,78 @@ def export_levels_snapshot_v2() -> None:
         spreadsheet_id=os.getenv("MARKET_AUDIT_SHEET_ID") or es.SHEET_ID,
     )
     ws = os.getenv("STRUCTURAL_LEVELS_REPORT_V2_WORKSHEET", st.STRUCTURAL_LEVELS_REPORT_V2_WORKSHEET)
-    exporter.export_dataframe_to_sheet(df, es.SHEET_TITLE, ws)
-    logger.info("Structural ops: levels v2 sheet %s rows=%s", ws, len(df))
+    logger.info("Exporting levels v2 snapshot to sheet '%s', rows=%d", ws, len(df))
+    try:
+        exporter.export_dataframe_to_sheet(df, es.SHEET_TITLE, ws)
+        logger.info("Successfully exported levels v2 snapshot")
+    except Exception as e:
+        logger.exception("Failed to export levels v2 snapshot")
+
+
+def export_levels_snapshot_v3() -> None:
+    from trading_bot.analytics.structural_cycle_v3 import build_structural_v3_report_df
+    from trading_bot.config import settings as st
+    from trading_bot.data.db import get_connection
+    from trading_bot.tools.sheets_exporter import SheetsExporter
+
+    if not st.STRUCTURAL_OPS_SHEETS_LEVELS:
+        return
+    es = _load_export_to_sheets()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        df = build_structural_v3_report_df(cur)
+    finally:
+        conn.close()
+    if df.empty:
+        logger.warning("Empty dataframe for levels v3 snapshot, skipping")
+        return
+    exporter = SheetsExporter(
+        credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH", es.CREDENTIALS_PATH),
+        spreadsheet_title=es.SHEET_TITLE,
+        spreadsheet_url=os.getenv("MARKET_AUDIT_SHEET_URL") or es.SHEET_URL,
+        spreadsheet_id=os.getenv("MARKET_AUDIT_SHEET_ID") or es.SHEET_ID,
+    )
+    ws = os.getenv("STRUCTURAL_LEVELS_REPORT_V3_WORKSHEET", st.STRUCTURAL_LEVELS_REPORT_V3_WORKSHEET)
+    logger.info("Exporting levels v3 snapshot to sheet '%s', rows=%d", ws, len(df))
+    try:
+        exporter.export_dataframe_to_sheet(df, es.SHEET_TITLE, ws)
+        logger.info("Successfully exported levels v3 snapshot")
+    except Exception as e:
+        logger.exception("Failed to export levels v3 snapshot")
+
+
+def export_levels_snapshot_v4() -> None:
+    from trading_bot.analytics.structural_cycle_v4 import build_structural_v4_report_df
+    from trading_bot.config import settings as st
+    from trading_bot.data.db import get_connection
+    from trading_bot.tools.sheets_exporter import SheetsExporter
+
+    if not st.STRUCTURAL_OPS_SHEETS_LEVELS:
+        return
+    es = _load_export_to_sheets()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        df = build_structural_v4_report_df(cur)
+    finally:
+        conn.close()
+    if df.empty:
+        logger.warning("Empty dataframe for levels v4 snapshot, skipping")
+        return
+    exporter = SheetsExporter(
+        credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH", es.CREDENTIALS_PATH),
+        spreadsheet_title=es.SHEET_TITLE,
+        spreadsheet_url=os.getenv("MARKET_AUDIT_SHEET_URL") or es.SHEET_URL,
+        spreadsheet_id=os.getenv("MARKET_AUDIT_SHEET_ID") or es.SHEET_ID,
+    )
+    ws = os.getenv("STRUCTURAL_LEVELS_REPORT_V4_WORKSHEET", st.STRUCTURAL_LEVELS_REPORT_V4_WORKSHEET)
+    logger.info("Exporting levels v4 snapshot to sheet '%s', rows=%d", ws, len(df))
+    try:
+        exporter.export_dataframe_to_sheet(df, es.SHEET_TITLE, ws)
+        logger.info("Successfully exported levels v4 snapshot")
+    except Exception as e:
+        logger.exception("Failed to export levels v4 snapshot")
 
 
 def _human_message(
@@ -383,7 +590,9 @@ def notify_no_valid_ref_prices(
 
 __all__ = [
     "export_levels_snapshot",
+    "export_structural_trading_levels",
     "export_levels_snapshot_v2",
+    "export_levels_snapshot_v3",
     "notify_no_valid_ref_prices",
     "on_structural_event",
 ]
