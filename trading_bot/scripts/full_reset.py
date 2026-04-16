@@ -26,7 +26,14 @@
 from __future__ import annotations
 
 import argparse
+import codecs
+import sys
 import time
+
+# Устанавливаем UTF-8 кодировку для Windows
+if sys.platform == 'win32':
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
 
 from trading_bot.data.db import get_connection
 from trading_bot.data.schema import init_db, run_migrations

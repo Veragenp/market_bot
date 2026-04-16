@@ -284,6 +284,30 @@ def export_levels_snapshot(cycle_id: str, pipeline_out: Optional[Dict[str, Any]]
     )
     ws = os.getenv("STRUCTURAL_LEVELS_REPORT_WORKSHEET", st.STRUCTURAL_LEVELS_REPORT_WORKSHEET)
     logger.info("Exporting levels snapshot to sheet '%s', rows=%d, cycle_id=%s", ws, len(df), cycle_id)
+    
+    # Логирование текущих цен и уровней для каждого символа
+    try:
+        logger.info("Levels snapshot by symbol:")
+        for sym in sorted(df["symbol"].unique()):
+            sym_df = df[df["symbol"] == sym].iloc[0]
+            ref_price = sym_df.get("ref_price")
+            l_price = sym_df.get("long_L_strongest_below")
+            u_price = sym_df.get("short_U_strongest_above")
+            status = sym_df.get("row_status")
+            
+            level_info = []
+            if l_price is not None:
+                level_info.append(f"L:{l_price:.2f}")
+            if u_price is not None:
+                level_info.append(f"U:{u_price:.2f}")
+            
+            if ref_price:
+                logger.info("  %s: ref=%.2f | levels=[%s] status=%s", sym, ref_price, ", ".join(level_info), status)
+            else:
+                logger.info("  %s: levels=[%s] status=%s", sym, ", ".join(level_info), status)
+    except Exception:
+        logger.exception("Failed to log levels snapshot")
+    
     try:
         exporter.export_dataframe_to_sheet(df, es.SHEET_TITLE, ws)
         logger.info("Successfully exported levels snapshot to %s", ws)
@@ -319,6 +343,25 @@ def export_structural_trading_levels(cycle_id: str) -> None:
     
     ws_name = os.getenv("STRUCTURAL_TRADING_LEVELS_WORKSHEET", "structural_trading_levels")
     logger.info("Exporting trading levels to sheet '%s', rows=%d, cycle_id=%s", ws_name, len(df), cycle_id)
+    
+    # Логирование текущих цен для каждого символа
+    try:
+        logger.info("Current prices by symbol:")
+        price_summary = df.groupby("symbol").agg({
+            "current_price": "first",
+            "level_price": list,
+            "direction": list
+        }).reset_index()
+        
+        for _, row in price_summary.iterrows():
+            sym = row["symbol"]
+            current = row["current_price"]
+            levels = row["level_price"]
+            directions = row["direction"]
+            level_str = ", ".join([f"{d}:{p:.2f}" for d, p in zip(directions, levels)])
+            logger.info("  %s: current=%.2f | levels=[%s]", sym, current, level_str)
+    except Exception:
+        logger.exception("Failed to log price summary")
     
     try:
         exporter.export_dataframe_to_sheet(df, es.SHEET_TITLE, ws_name)
