@@ -60,7 +60,7 @@ from trading_bot.data.structural_cycle_db import run_structural_pipeline
 # Test mode import
 if st.TEST_MODE:
     from trading_bot.analytics.test_level_generator import generate_test_levels, rebuild_opposite_test_levels
-    logger.info("TEST_MODE: Test level generator enabled")
+
 from trading_bot.entrypoints.export_volume_peaks_to_sheets_only import main as export_vp_to_sheets_main
 from trading_bot.scripts.rebuild_volume_profile_peaks_to_db import main as rebuild_vp_local_main
 from trading_bot.tools.bybit_trading import (
@@ -403,6 +403,12 @@ def _setup_supervisor_logging() -> str:
     sh.setFormatter(formatter)
     root.addHandler(fh)
     root.addHandler(sh)
+    
+    # Логирование TEST_MODE
+    if st.TEST_MODE:
+        logger = logging.getLogger(__name__)
+        logger.info("TEST_MODE: Test level generator enabled")
+    
     return log_path
 
 

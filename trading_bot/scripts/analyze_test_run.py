@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import glob
 import logging
 import os
@@ -23,6 +24,11 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+# UTF-8 кодировка для Windows
+if sys.platform == 'win32':
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO not in sys.path:
@@ -114,15 +120,14 @@ class TestAnalyzer:
         """Вывести информацию о циклах."""
         print("\n" + "-" * 80)
         print("🔄 СТРУКТУРНЫЕ ЦИКЛЫ")
-        print("- * 80)
+        print("-" * 80)
         
         cur = self.conn.cursor()
         
         # Группировка по фазам
         rows = cur.execute(
             """
-            SELECT phase, COUNT(*) as cnt, 
-                   GROUP_CONCAT(DISTINCT ref_price_source) as sources
+            SELECT phase, COUNT(*) as cnt
             FROM structural_cycles
             GROUP BY phase
             ORDER BY created_at DESC
@@ -136,19 +141,16 @@ class TestAnalyzer:
         for row in rows:
             phase = row["phase"]
             cnt = row["cnt"]
-            source = (row["sources"] or "").split(",")[0] or "unknown"
             
             icon = "✅" if phase == "closed" else "🟡" if phase == "armed" else "🔵"
-            print(f"  {icon} {phase.upper()}: {cnt} циклов (source={source})")
+            print(f"  {icon} {phase.upper()}: {cnt} циклов")
         
         # Детали последнего цикла
         row = cur.execute(
             """
-            SELECT sc.id, sc.phase, sc.created_at, sc.symbols_valid_count,
-                   sc.ref_price_source,
-                   (SELECT COUNT(*) FROM structural_cycle_symbols s WHERE s.cycle_id = sc.id) as symbols_count
-            FROM structural_cycles sc
-            ORDER BY sc.created_at DESC
+            SELECT id, phase, created_at, symbols_valid_count
+            FROM structural_cycles
+            ORDER BY created_at DESC
             LIMIT 1
             """
         ).fetchone()
@@ -157,11 +159,17 @@ class TestAnalyzer:
             print(f"\n  Последний цикл:")
             print(f"    ID: {str(row['id'])[:8] if row['id'] else 'N/A'}")
             print(f"    Фаза: {row['phase']}")
-            print(f"    Символы: {row['symbols_count']}")
-            print(f"    Источник: {row['ref_price_source']}")
+            
+            # Символы
+            cycle_id = row["id"]
+            if cycle_id:
+                sym_count = cur.execute(
+                    "SELECT COUNT(*) as cnt FROM structural_cycle_symbols WHERE cycle_id = ?",
+                    (cycle_id,)
+                ).fetchone()["cnt"]
+                print(f"    Символы: {sym_count}")
             
             # Уровни
-            cycle_id = row["id"]
             if cycle_id:
                 levels_row = cur.execute(
                     """
@@ -250,38 +258,44 @@ class TestAnalyzer:
                 print(f"    • {reason}: {cnt}")
         
         # PnL (если есть)
-        row = cur.execute(
-            """
-            SELECT 
-                SUM(CASE WHEN close_pnl IS NOT NULL THEN close_pnl ELSE 0 END) as total_pnl,
-                COUNT(close_pnl) as pnl_count
-            FROM position_records
-            WHERE status = 'closed'
-            """
-        ).fetchone()
-        
-        if row and row["pnl_count"] and row["pnl_count"] > 0:
-            total_pnl = row["total_pnl"] or 0
-            avg_pnl = total_pnl / row["pnl_count"]
+        try:
+            row = cur.execute(
+                """
+                SELECT 
+                    SUM(CASE WHEN close_pnl IS NOT NULL THEN close_pnl ELSE 0 END) as total_pnl,
+                    COUNT(close_pnl) as pnl_count
+                FROM position_records
+                WHERE status = 'closed'
+                """
+            ).fetchone()
             
-            print(f"\n  PnL:")
-            print(f"    Общий: {total_pnl:.2f} USDT")
-            print(f"    Средний: {avg_pnl:.2f} USDT")
-            print(f"    Сделок с PnL: {row['pnl_count']}")
+            if row and row["pnl_count"] and row["pnl_count"] > 0:
+                total_pnl = row["total_pnl"] or 0
+                avg_pnl = total_pnl / row["pnl_count"]
+                
+                print(f"\n  PnL:")
+                print(f"    Общий: {total_pnl:.2f} USDT")
+                print(f"    Средний: {avg_pnl:.2f} USDT")
+                print(f"    Сделок с PnL: {row['pnl_count']}")
+        except Exception:
+            pass  # Колонка close_pnl может отсутствовать
         
         # Время удержания
-        row = cur.execute(
-            """
-            SELECT 
-                AVG((closed_at - created_at) / 60.0) as avg_hold_minutes
-            FROM position_records
-            WHERE status = 'closed' AND closed_at IS NOT NULL
-            """
-        ).fetchone()
-        
-        if row and row["avg_hold_minutes"]:
-            print(f"\n  Время удержания:")
-            print(f"    Среднее: {self._format_duration(row['avg_hold_minutes'] * 60)}")
+        try:
+            row = cur.execute(
+                """
+                SELECT 
+                    AVG((closed_at - created_at) / 60.0) as avg_hold_minutes
+                FROM position_records
+                WHERE status = 'closed' AND closed_at IS NOT NULL
+                """
+            ).fetchone()
+            
+            if row and row["avg_hold_minutes"]:
+                print(f"\n  Время удержания:")
+                print(f"    Среднее: {self._format_duration(row['avg_hold_minutes'] * 60)}")
+        except Exception:
+            pass  # Колонки могут отсутствовать
     
     def _print_orders(self) -> None:
         """Вывести информацию об ордерах."""
@@ -313,23 +327,26 @@ class TestAnalyzer:
             print(f"    {icon} {status.upper()}: {cnt}")
         
         # По типу
-        rows = cur.execute(
-            """
-            SELECT side, type, COUNT(*) as cnt
-            FROM exec_orders
-            WHERE status = 'filled'
-            GROUP BY side, type
-            ORDER BY cnt DESC
-            """
-        ).fetchall()
-        
-        if rows:
-            print(f"\n  Исполнённые ордера:")
-            for row in rows:
-                side = row["side"]
-                order_type = row["type"]
-                cnt = row["cnt"]
-                print(f"    • {side} {order_type}: {cnt}")
+        try:
+            rows = cur.execute(
+                """
+                SELECT side, type, COUNT(*) as cnt
+                FROM exec_orders
+                WHERE status = 'filled'
+                GROUP BY side, type
+                ORDER BY cnt DESC
+                """
+            ).fetchall()
+            
+            if rows:
+                print(f"\n  Исполнённые ордера:")
+                for row in rows:
+                    side = row["side"]
+                    order_type = row["type"]
+                    cnt = row["cnt"]
+                    print(f"    • {side} {order_type}: {cnt}")
+        except Exception:
+            pass  # Колонка type может отсутствовать
     
     def _print_errors(self) -> None:
         """Вывести информацию об ошибках."""
@@ -340,26 +357,29 @@ class TestAnalyzer:
         cur = self.conn.cursor()
         
         # Ошибки из ops_stage_runs
-        rows = cur.execute(
-            """
-            SELECT stage, status, severity, message, details
-            FROM ops_stage_runs
-            WHERE status = 'error' OR severity IN ('error', 'critical')
-            ORDER BY started_at DESC
-            LIMIT 10
-            """
-        ).fetchall()
-        
-        if rows:
-            print(f"\n  Ошибки из ops_stage_runs ({len(rows)}):")
-            for row in rows:
-                stage = row["stage"]
-                severity = row["severity"] or "error"
-                message = (row["message"] or "")[:100]
-                icon = "🔴" if severity == "critical" else "🟡"
-                print(f"    {icon} [{stage}] {severity}: {message}")
-        else:
-            print("  Нет ошибок в ops_stage_runs")
+        try:
+            rows = cur.execute(
+                """
+                SELECT stage, status, severity, message, details
+                FROM ops_stage_runs
+                WHERE status = 'error' OR severity IN ('error', 'critical')
+                ORDER BY started_at DESC
+                LIMIT 10
+                """
+            ).fetchall()
+            
+            if rows:
+                print(f"\n  Ошибки из ops_stage_runs ({len(rows)}):")
+                for row in rows:
+                    stage = row["stage"]
+                    severity = row["severity"] or "error"
+                    message = (row["message"] or "")[:100]
+                    icon = "🔴" if severity == "critical" else "🟡"
+                    print(f"    {icon} [{stage}] {severity}: {message}")
+            else:
+                print("  Нет ошибок в ops_stage_runs")
+        except Exception:
+            print("  Нет данных об ошибках в ops_stage_runs")
         
         # Анализ логов
         self._analyze_log_files()
@@ -474,24 +494,27 @@ class TestAnalyzer:
             recommendations.append(f"🟡 Много ошибок ({row['cnt']}) — проверьте логи")
         
         # Проверка на успешные сделки
-        row = cur.execute(
-            """
-            SELECT COUNT(*) as cnt
-            FROM position_records
-            WHERE status = 'closed' AND close_pnl > 0
-            """
-        ).fetchone()
-        
-        total_closed = cur.execute(
-            "SELECT COUNT(*) FROM position_records WHERE status = 'closed'"
-        ).fetchone()["cnt"]
-        
-        if total_closed and total_closed > 0 and row["cnt"]:
-            win_rate = (row["cnt"] / total_closed) * 100
-            if win_rate < 40:
-                recommendations.append(f"🟡 Низкая winning rate ({win_rate:.1f}%) — проверьте уровни")
-            elif win_rate > 70:
-                recommendations.append(f"🟢 Хорошая winning rate ({win_rate:.1f}%)")
+        try:
+            row = cur.execute(
+                """
+                SELECT COUNT(*) as cnt
+                FROM position_records
+                WHERE status = 'closed' AND close_pnl > 0
+                """
+            ).fetchone()
+            
+            total_closed = cur.execute(
+                "SELECT COUNT(*) FROM position_records WHERE status = 'closed'"
+            ).fetchone()["cnt"]
+            
+            if total_closed and total_closed > 0 and row["cnt"]:
+                win_rate = (row["cnt"] / total_closed) * 100
+                if win_rate < 40:
+                    recommendations.append(f"🟡 Низкая winning rate ({win_rate:.1f}%) — проверьте уровни")
+                elif win_rate > 70:
+                    recommendations.append(f"🟢 Хорошая winning rate ({win_rate:.1f}%)")
+        except Exception:
+            pass  # Колонка close_pnl может отсутствовать
         
         # Проверка на тестовый режим
         row = cur.execute(
