@@ -822,3 +822,25 @@ TELEGRAM_BOT_TOKEN = _env_strip_quotes(os.getenv("TELEGRAM_BOT_TOKEN", "")) or _
 TELEGRAM_CHAT_ID = _env_strip_quotes(os.getenv("TELEGRAM_CHAT_ID", "")) or _env_strip_quotes(
     os.getenv("CHAT_ID", "")
 )
+
+# ============================================================================
+# TEST MODE - Тестовый контур для быстрой проверки (без ожидания реальных движений)
+# ============================================================================
+
+# Включить тестовый режим (генерация искусственных уровней)
+TEST_MODE = os.getenv("TEST_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Смещение тестовых уровней от текущей цены в ATR
+# LONG уровень: current_price - TEST_LEVEL_OFFSET_ATR * atr
+# SHORT уровень: current_price + TEST_LEVEL_OFFSET_ATR * atr
+TEST_LEVEL_OFFSET_ATR = float(os.getenv("TEST_LEVEL_OFFSET_ATR", "0.2"))
+
+# Смещение для rebuild противоположной стороны в ATR
+# После входа в LONG: SHORT уровень = current_price + TEST_OPPOSITE_OFFSET_ATR * atr
+TEST_OPPOSITE_OFFSET_ATR = float(os.getenv("TEST_OPPOSITE_OFFSET_ATR", "0.4"))
+
+# Количество символов для тестового цикла
+TEST_CYCLE_SYMBOLS_COUNT = int(os.getenv("TEST_CYCLE_SYMBOLS_COUNT", "10"))
+
+# Интервал тестового цикла (сек) - как часто пересоздавать уровни
+TEST_CYCLE_INTERVAL_SEC = int(os.getenv("TEST_CYCLE_INTERVAL_SEC", "60"))

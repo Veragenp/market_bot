@@ -56,6 +56,11 @@ from trading_bot.data.state_manager import (
     handle_recovery_sync_mismatch,
 )
 from trading_bot.data.structural_cycle_db import run_structural_pipeline
+
+# Test mode import
+if st.TEST_MODE:
+    from trading_bot.analytics.test_level_generator import generate_test_levels, rebuild_opposite_test_levels
+    logger.info("TEST_MODE: Test level generator enabled")
 from trading_bot.entrypoints.export_volume_peaks_to_sheets_only import main as export_vp_to_sheets_main
 from trading_bot.scripts.rebuild_volume_profile_peaks_to_db import main as rebuild_vp_local_main
 from trading_bot.tools.bybit_trading import (
@@ -548,17 +553,40 @@ def _run_structural() -> Dict[str, object]:
         message="Supervisor structural cycle started",
         started_at=start,
     )
-    if st.SUPERVISOR_EXPORT_VP_LOCAL_BEFORE_STRUCTURAL and not os.getenv("PYTEST_CURRENT_TEST"):
+    
+    # TEST MODE: Использовать упрощённый генератор уровней
+    if st.TEST_MODE:
+        logger.info("TEST_MODE: Running test level generator")
         try:
-            export_vp_to_sheets_main()
-        except Exception:
-            logger.exception(
-                "Supervisor: vp_local_levels → Sheets before structural failed (credentials / network?)"
-            )
-    # Целевой режим: scan + immediate freeze (без realtime touch/entry_timer/abort).
-    out = run_structural_pipeline(auto_freeze=True)
-    end = int(time.time())
-    status = "ok" if out.get("phase") in ("armed", "completed") else "failed"
+            result = generate_test_levels()
+            if result.get("ok"):
+                out = {
+                    "phase": "armed",
+                    "structural_cycle_id": result.get("structural_cycle_id"),
+                    "symbols_count": result.get("symbols_count", 0),
+                    "levels_created": result.get("levels_created", 0),
+                    "test_mode": True,
+                }
+                status = "ok"
+            else:
+                out = {"phase": "failed", "error": result.get("error"), "test_mode": True}
+                status = "failed"
+        except Exception as e:
+            logger.exception("TEST_MODE: Test level generator failed")
+            out = {"phase": "failed", "error": str(e), "test_mode": True}
+            status = "failed"
+    else:
+        # Стандартный structural pipeline
+        if st.SUPERVISOR_EXPORT_VP_LOCAL_BEFORE_STRUCTURAL and not os.getenv("PYTEST_CURRENT_TEST"):
+            try:
+                export_vp_to_sheets_main()
+            except Exception:
+                logger.exception(
+                    "Supervisor: vp_local_levels → Sheets before structural failed (credentials / network?)"
+                )
+        out = run_structural_pipeline(auto_freeze=True)
+        status = "ok" if out.get("phase") in ("armed", "completed") else "failed"
+    
     sev = None if status == "ok" else "error"
     _stage_event(
         stage="STRUCTURAL_RUN",

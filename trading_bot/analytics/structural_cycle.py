@@ -429,6 +429,120 @@ def compute_structural_symbol_results(
 # ---------------------------------------------------------------------------
 # Rebuild противоположной стороны (используется только при флипе)
 # ---------------------------------------------------------------------------
+def _rebuild_side_test_mode(
+    cur,
+    cycle_id: str,
+    target_direction: str,
+    prices: Optional[Dict[str, float]] = None,
+) -> bool:
+    """
+    TEST MODE: упрощённый rebuild противоположной стороны.
+    Использует смещение от текущей цены: offset * ATR.
+    """
+    from trading_bot.analytics.test_level_generator import _get_tick_size, _round_to_tick
+    
+    if target_direction not in ("long", "short"):
+        return False
+
+    try:
+        # Получить offset из настроек
+        offset = st.TEST_OPPOSITE_OFFSET_ATR
+        
+        # Получить символы цикла
+        srows = cur.execute(
+            """
+            SELECT symbol, atr
+            FROM structural_cycle_symbols
+            WHERE cycle_id = ? AND status = 'ok'
+            """,
+            (cycle_id,),
+        ).fetchall()
+        
+        if not srows:
+            logger.warning("TEST rebuild: no symbols for cycle %s", cycle_id)
+            return False
+
+        now_ts = int(time.time())
+        updated = 0
+
+        for r in srows:
+            sym = str(r["symbol"])
+            atr = float(r["atr"])
+            if atr <= 0:
+                continue
+
+            # Получить текущую цену
+            current_price = (prices or {}).get(sym)
+            if current_price is None:
+                # Fallback: последняя цена из БД
+                px_row = cur.execute(
+                    "SELECT close FROM ohlcv WHERE symbol = ? AND timeframe = '1m' ORDER BY timestamp DESC LIMIT 1",
+                    (sym,),
+                ).fetchone()
+                if px_row and px_row["close"]:
+                    current_price = float(px_row["close"])
+                else:
+                    continue
+            
+            # Расчёт уровня
+            if target_direction == "long":
+                level_price = current_price - offset * atr
+            else:
+                level_price = current_price + offset * atr
+            
+            # ROUND to tick size
+            tick = _get_tick_size(sym)
+            if tick:
+                level_price = _round_to_tick(level_price, tick)
+            
+            # Обновить structural_cycle_symbols
+            if target_direction == "long":
+                cur.execute(
+                    """
+                    UPDATE structural_cycle_symbols
+                    SET L_price = ?, W_atr = ?, evaluated_at = ?
+                    WHERE cycle_id = ? AND symbol = ?
+                    """,
+                    (level_price, offset, now_ts, cycle_id, sym),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE structural_cycle_symbols
+                    SET U_price = ?, W_atr = ?, evaluated_at = ?
+                    WHERE cycle_id = ? AND symbol = ?
+                    """,
+                    (level_price, offset, now_ts, cycle_id, sym),
+                )
+            
+            # Обновить cycle_levels
+            cur.execute(
+                """
+                UPDATE cycle_levels
+                SET level_price = ?, updated_at = ?, is_active = 1, status = 'active'
+                WHERE cycle_id = ? AND symbol = ? AND direction = ?
+                """,
+                (level_price, now_ts, cycle_id, sym, target_direction),
+            )
+            
+            updated += 1
+            logger.info(
+                "TEST rebuild: %s side for %s: %.2f (offset=%.2f*ATR=%.2f)",
+                target_direction.upper(), sym, level_price, offset, atr
+            )
+        
+        if updated == 0:
+            logger.warning("TEST rebuild: no symbols updated")
+            return False
+
+        logger.info("TEST rebuild: successfully updated %d symbols for %s", updated, target_direction)
+        return True
+        
+    except Exception as e:
+        logger.exception("TEST rebuild failed: %s", e)
+        return False
+
+
 def rebuild_side_on_cursor(
     cur,
     cycle_id: str,
@@ -441,6 +555,10 @@ def rebuild_side_on_cursor(
     if target_direction not in ("long", "short"):
         logger.warning("rebuild_side_on_cursor: invalid direction %s", target_direction)
         return False
+
+    # TEST MODE: использовать упрощённый алгоритм
+    if st.TEST_MODE:
+        return _rebuild_side_test_mode(cur, cycle_id, target_direction, prices)
 
     cur.execute("SAVEPOINT sp_rebuild_side")
     try:
