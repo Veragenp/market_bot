@@ -1475,5 +1475,50 @@ def run_migrations() -> None:
         )
         conn.commit()
 
+    # Migration v23: Session tracking + Position sync fields
+    if current_version < 23:
+        # position_records: sync fields
+        _pr23 = _column_names(cursor, "position_records")
+        if _pr23 and "exchange_position_id" not in _pr23:
+            cursor.execute("ALTER TABLE position_records ADD COLUMN exchange_position_id TEXT")
+        _pr23 = _column_names(cursor, "position_records")
+        if _pr23 and "last_sync_ts" not in _pr23:
+            cursor.execute("ALTER TABLE position_records ADD COLUMN last_sync_ts INTEGER")
+        _pr23 = _column_names(cursor, "position_records")
+        if _pr23 and "sync_status" not in _pr23:
+            cursor.execute("ALTER TABLE position_records ADD COLUMN sync_status TEXT DEFAULT 'pending'")
+        _pr23 = _column_names(cursor, "position_records")
+        if _pr23 and "last_sync_error" not in _pr23:
+            cursor.execute("ALTER TABLE position_records ADD COLUMN last_sync_error TEXT")
+        
+        # trading_state: session tracking
+        _ts23 = _column_names(cursor, "trading_state")
+        if _ts23 and "last_session_id" not in _ts23:
+            cursor.execute("ALTER TABLE trading_state ADD COLUMN last_session_id TEXT")
+        _ts23 = _column_names(cursor, "trading_state")
+        if _ts23 and "last_start_ts" not in _ts23:
+            cursor.execute("ALTER TABLE trading_state ADD COLUMN last_start_ts INTEGER")
+        _ts23 = _column_names(cursor, "trading_state")
+        if _ts23 and "last_start_mode" not in _ts23:
+            cursor.execute("ALTER TABLE trading_state ADD COLUMN last_start_mode TEXT")
+        _ts23 = _column_names(cursor, "trading_state")
+        if _ts23 and "opposite_rebuild_in_progress" not in _ts23:
+            cursor.execute("ALTER TABLE trading_state ADD COLUMN opposite_rebuild_in_progress INTEGER DEFAULT 0")
+        
+        # runtime_state table for temporary flags
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS runtime_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at INTEGER
+            )
+        """)
+        
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (23, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
     conn.close()
 

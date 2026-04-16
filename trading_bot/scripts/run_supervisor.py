@@ -47,6 +47,14 @@ from trading_bot.data.data_loader import DataLoaderManager
 from trading_bot.data.db import get_connection
 from trading_bot.data.ops_stage import record_stage_event
 from trading_bot.data.schema import init_db, run_migrations
+from trading_bot.data.state_manager import (
+    determine_start_mode,
+    handle_fresh_start,
+    handle_recovery_add_missing,
+    handle_clean_stale_positions,
+    handle_recovery_continue,
+    handle_recovery_sync_mismatch,
+)
 from trading_bot.data.structural_cycle_db import run_structural_pipeline
 from trading_bot.entrypoints.export_volume_peaks_to_sheets_only import main as export_vp_to_sheets_main
 from trading_bot.scripts.rebuild_volume_profile_peaks_to_db import main as rebuild_vp_local_main
@@ -602,6 +610,35 @@ def run_supervisor_once() -> Dict[str, object]:
     """
     init_db()
     run_migrations()
+    
+    # НОВЫЙ ШАГ: определить режим старта
+    logger.info("Supervisor: determining start mode...")
+    mode, session_id, details = determine_start_mode()
+    logger.info("Supervisor: start mode=%s session=%s", mode, session_id[:8])
+    
+    # Выполняем обработчик режима
+    if mode == "FRESH_START":
+        result = handle_fresh_start()
+        logger.info("Supervisor: fresh_start applied session=%s", session_id[:8])
+    elif mode == "RECOVERY_ADD_MISSING":
+        result = handle_recovery_add_missing(details)
+        logger.info("Supervisor: recovery_add_missing applied positions=%s", 
+                    len(details.get("exchange_positions", {})) if details else 0)
+    elif mode == "CLEAN_STALE_POSITIONS":
+        result = handle_clean_stale_positions(details)
+        logger.info("Supervisor: clean_stale_positions applied positions_closed=%s",
+                    len(details.get("db_positions", [])) if details else 0)
+    elif mode == "RECOVERY_CONTINUE":
+        result = handle_recovery_continue(details)
+        logger.info("Supervisor: recovery_continue applied")
+    elif mode == "RECOVERY_SYNC_MISMATCH":
+        result = handle_recovery_sync_mismatch(details)
+        logger.error("Supervisor: RECOVERY_SYNC_MISMATCH - manual reset required!")
+        # Отправляем алерт
+        logger.error("Supervisor: sync mismatch details=%s", details)
+    else:
+        logger.warning("Supervisor: unknown start mode=%s", mode)
+    
     data_out = _run_data_refresh()
     levels_out = _run_levels_rebuild()
     skip, reason = _should_skip_scheduled_structural()
@@ -618,6 +655,8 @@ def run_supervisor_once() -> Dict[str, object]:
         "levels": levels_out,
         "structural": structural_out,
         "entry": entry_out,
+        "start_mode": mode,
+        "session_id": session_id,
     }
 
 

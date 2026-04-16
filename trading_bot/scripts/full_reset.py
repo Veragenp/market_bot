@@ -20,6 +20,7 @@
   --dry-run          Показать что будет сделано, но не выполнять
   --no-close-pos     Не закрывать позиции (только сброс состояния)
   --force            Выполнить без подтверждения
+  --close-exchange   Закрыть позиции на бирже (через API)
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import time
 
 from trading_bot.data.db import get_connection
 from trading_bot.data.schema import init_db, run_migrations
+from trading_bot.tools.bybit_trading import get_linear_positions, linear_position_sizes_by_symbol
 
 
 def main() -> None:
@@ -36,6 +38,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Показать что будет сделано, но не выполнять")
     parser.add_argument("--no-close-pos", action="store_true", help="Не закрывать позиции (только сброс состояния)")
     parser.add_argument("--force", action="store_true", help="Выполнить без подтверждения")
+    parser.add_argument("--close-exchange", action="store_true", help="Закрыть позиции на бирже (через API)")
     args = parser.parse_args()
 
     init_db()
@@ -112,6 +115,32 @@ def main() -> None:
                 )
                 print(f"✅ Помечено {cur.rowcount} позиций как 'cancelled'")
 
+        # Закрыть позиции на бирже (если --close-exchange)
+        if args.close_exchange and not args.dry_run:
+            print(f"\n{'=' * 80}")
+            print("ЗАКРЫТИЕ ПОЗИЦИЙ НА БИРЖЕ (Bybit)")
+            print(f"{'=' * 80}")
+
+            try:
+                pos_resp = get_linear_positions()
+                if pos_resp and pos_resp.get("retCode") == 0:
+                    sizes = linear_position_sizes_by_symbol(pos_resp)
+                    closed_count = 0
+                    
+                    for sym, size in sizes.items():
+                        if abs(size) > 1e-12:
+                            print(f"  Закрываю позицию {sym}: size={size}")
+                            # TODO: Реализовать закрытие через API
+                            # place_linear_market_order(...)
+                            closed_count += 1
+                    
+                    print(f"✅ Попыток закрытия: {closed_count}")
+                    print("⚠️  Примечание: фактическое закрытие пока не реализовано (TODO)")
+                else:
+                    print("⚠️  Не удалось получить позиции с биржи")
+            except Exception as e:
+                print(f"❌ Ошибка при закрытии позиций: {e}")
+
         if pending_orders > 0:
             print(f"\n{'=' * 80}")
             print(f"ОТМЕНА {pending_orders} pending ордеров")
@@ -143,7 +172,8 @@ def main() -> None:
             print("  cycle_id → NULL")
             print("  structural_cycle_id → NULL")
             print("  position_state → 'none'")
-            print("  start_reason → 'manual'")
+            print("  last_start_mode → 'manual_reset'")
+            print("  opposite_rebuild_in_progress → 0")
         else:
             cur.execute(
                 """
@@ -160,9 +190,11 @@ def main() -> None:
                     need_rebuild_opposite = 0,
                     opposite_rebuild_deadline_ts = NULL,
                     opposite_rebuild_attempts = 0,
+                    opposite_rebuild_in_progress = 0,
                     allow_long_entry = 1,
                     allow_short_entry = 1,
                     last_rebuild_reason = 'manual_reset_before_new_session',
+                    last_start_mode = 'manual_reset',
                     last_transition_at = ?,
                     updated_at = ?
                 WHERE id = 1
