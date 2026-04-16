@@ -2,6 +2,7 @@
 report*.txt
 test_report*.txt
 report.txt
+trading_bot_report.txt
 .env.*
 *.key
 *.pem
