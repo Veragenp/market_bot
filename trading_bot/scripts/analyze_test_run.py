@@ -546,37 +546,158 @@ class TestAnalyzer:
         self.conn.close()
 
 
-def watch_mode(interval_sec: int = 10) -> None:
-    """Режим наблюдения — обновлять отчёт каждые N секунд."""
-    print(f"👁️  Режим наблюдения (обновление каждые {interval_sec} сек)")
-    print("Нажмите Ctrl+C для выхода\n")
+def watch_mode(interval_sec: int = 60, output_file: Optional[str] = None) -> None:
+    """Режим наблюдения — анализ и перезапись отчёта каждые N секунд."""
+    print(f"👁️  Режим автоматического мониторинга")
+    print(f"Интервал: {interval_sec} сек")
+    if output_file:
+        print(f"Файл отчёта: {output_file}")
+    print("Нажмите Ctrl+C для остановки\n")
     
     analyzer = TestAnalyzer()
+    iteration = 0
     
     try:
         while True:
-            os.system('cls' if os.name == 'nt' else 'clear')
-            analyzer.run()
+            iteration += 1
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n[{now}] Анализ #{iteration}...")
+            
+            # Создаём буфер для вывода
+            import io
+            from contextlib import redirect_stdout
+            
+            buffer = io.StringIO()
+            
+            # Выполняем анализ в буфер
+            with redirect_stdout(buffer):
+                analyzer.run()
+            
+            content = buffer.getvalue()
+            
+            # Если указан файл — сохраняем
+            if output_file:
+                try:
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        f.write(f"# Отчёт от {now}\n")
+                        f.write(content)
+                    print(f"  ✅ Сохранён: {output_file}")
+                except Exception as e:
+                    print(f"  ❌ Ошибка сохранения: {e}")
+            
+            # Показываем краткую сводку в консоль
+            lines = content.split('\n')
+            for line in lines[:20]:  # Первые 20 строк
+                print(f"  {line}")
+            if len(lines) > 20:
+                print(f"  ... ({len(lines) - 20} строк ещё)")
+            
             time.sleep(interval_sec)
+            
     except KeyboardInterrupt:
-        print("\n\n⏹️  Наблюдение остановлено")
+        print(f"\n\n⏹️  Мониторинг остановлен (всего {iteration} анализов)")
+    finally:
+        analyzer.close()
+
+
+def auto_monitor_mode(interval_sec: int = 300, output_file: str = "test_report.txt") -> None:
+    """
+    Автоматический мониторинг — фоновый процесс с периодической перезаписью.
+    Запускается один раз и работает постоянно.
+    """
+    print("=" * 80)
+    print("🔄 АВТОМАТИЧЕСКИЙ МОНИТОРИНГ ТОРГОВОГО КОНТУРА")
+    print("=" * 80)
+    print(f"Интервал анализа: {interval_sec} сек ({interval_sec // 60} мин)")
+    print(f"Файл отчёта: {output_file}")
+    print(f"Старт: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("\nНажмите Ctrl+C для остановки\n")
+    
+    analyzer = TestAnalyzer()
+    iteration = 0
+    start_time = time.time()
+    
+    try:
+        while True:
+            iteration += 1
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            elapsed = int(time.time() - start_time)
+            
+            print(f"\n{'=' * 80}")
+            print(f"[{now}] Анализ #{iteration} (uptime: {elapsed // 3600}ч {elapsed % 3600 // 60}м)")
+            print('=' * 80)
+            
+            # Выполняем анализ
+            try:
+                # Сохраняем в файл
+                import io
+                from contextlib import redirect_stdout
+                
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    analyzer.run()
+                
+                content = buffer.getvalue()
+                
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(f"# Автоматический отчёт торгового бота\n")
+                    f.write(f"# Генерация: {now}\n")
+                    f.write(f"# Итерация: {iteration}\n")
+                    f.write(f"# Uptime: {elapsed // 3600}ч {elapsed % 3600 // 60}м\n")
+                    f.write("#" + "=" * 79 + "\n\n")
+                    f.write(content)
+                
+                print(f"✅ Отчёт обновлён: {output_file}")
+                
+                # Краткая сводка в консоль
+                if "winning rate" in content.lower():
+                    for line in content.split('\n'):
+                        if "winning" in line.lower() or "pnl" in line.lower():
+                            print(f"  {line.strip()}")
+                
+            except Exception as e:
+                print(f"❌ Ошибка анализа: {e}")
+                logger.exception("Auto-monitor analysis failed")
+            
+            # Ждём до следующего анализа
+            print(f"Ожидание {interval_sec} сек до следующего анализа...")
+            time.sleep(interval_sec)
+            
+    except KeyboardInterrupt:
+        total_time = int(time.time() - start_time)
+        print(f"\n\n{'=' * 80}")
+        print(f"⏹️  МОНИТОРИНГ ОСТАНОВЛЕН")
+        print(f"{'=' * 80}")
+        print(f"Всего анализов: {iteration}")
+        print(f"Общее время: {total_time // 3600}ч {total_time % 3600 // 60}м")
+        print(f"Последний отчёт: {output_file}")
     finally:
         analyzer.close()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Анализатор тестовых прогонов")
+    parser = argparse.ArgumentParser(description="Анализатор тестовых прогонов и мониторинг торгового контура")
     parser.add_argument("--db", type=str, help="Путь к базе данных")
     parser.add_argument("--logs", type=str, help="Путь к директории с логами")
-    parser.add_argument("--watch", type=int, help="Режим наблюдения (интервал в сек)")
     parser.add_argument("--output", type=str, help="Путь для сохранения отчёта (например, report.txt)")
+    parser.add_argument("--watch", type=int, help="Режим наблюдения (интервал в сек, по умолчанию 60)")
+    parser.add_argument("--monitor", type=int, nargs="?", const=300, default=None,
+                        help="Автоматический мониторинг (фоновый процесс, интервал в сек, по умолчанию 300)")
     parser.add_argument("--format", choices=["console", "file"], default="console", 
                         help="Формат вывода: console (в консоль) или file (в файл без emoji)")
     
     args = parser.parse_args()
     
-    if args.watch:
-        watch_mode(args.watch)
+    # Автоматический мониторинг (фоновый процесс)
+    if args.monitor is not None:
+        output = args.output or "trading_bot_report.txt"
+        auto_monitor_mode(interval_sec=args.monitor, output_file=output)
+        return
+    
+    # Режим наблюдения
+    if args.watch is not None:
+        output = args.output or None
+        watch_mode(interval_sec=args.watch, output_file=output)
         return
     
     analyzer = TestAnalyzer(
@@ -590,7 +711,6 @@ def main() -> None:
             output_path = args.output or f"test_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             print(f"Сохранение отчёта в: {output_path}")
             
-            # Перенаправляем stdout в файл с UTF-8
             import io
             from contextlib import redirect_stdout
             
@@ -599,8 +719,6 @@ def main() -> None:
                     analyzer.run()
             
             print(f"✅ Отчёт сохранён: {output_path}")
-            
-            # Также показать в консоли (без emoji для читаемости)
             print("\nФайл сохранён. Откройте его в редакторе для просмотра.")
         else:
             # Вывод в консоль
