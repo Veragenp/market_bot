@@ -86,7 +86,9 @@ def _build_levels_dataframe(cycle_id: str, pipeline_out: Optional[Dict[str, Any]
 
     logger.debug("Building levels dataframe for cycle_id=%s, rows=%d", cycle_id, len(rows))
 
-    ref_src = pipeline_out.get("ref_price_source")
+    # pipeline_out может быть None или не содержать все поля
+    pipeline_out = pipeline_out or {}
+    ref_src = pipeline_out.get("ref_price_source") or "unknown"
     pool_m_w = float(pipeline_out.get("pool_median_w") or 0.0)
     pool_mad_w = float(pipeline_out.get("pool_mad") or 0.0)
     pool_m_r = float(pipeline_out.get("pool_median_r") or 0.0)

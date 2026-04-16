@@ -559,41 +559,11 @@ def _run_structural() -> Dict[str, object]:
         message="Supervisor structural cycle started",
         started_at=start,
     )
+    out = _structural_main()
+    end = int(time.time())
     
-    # TEST MODE: Использовать упрощённый генератор уровней
-    if st.TEST_MODE:
-        logger.info("TEST_MODE: Running test level generator")
-        try:
-            result = generate_test_levels()
-            if result.get("ok"):
-                out = {
-                    "phase": "armed",
-                    "structural_cycle_id": result.get("structural_cycle_id"),
-                    "symbols_count": result.get("symbols_count", 0),
-                    "levels_created": result.get("levels_created", 0),
-                    "test_mode": True,
-                }
-                status = "ok"
-            else:
-                out = {"phase": "failed", "error": result.get("error"), "test_mode": True}
-                status = "failed"
-        except Exception as e:
-            logger.exception("TEST_MODE: Test level generator failed")
-            out = {"phase": "failed", "error": str(e), "test_mode": True}
-            status = "failed"
-    else:
-        # Стандартный structural pipeline
-        if st.SUPERVISOR_EXPORT_VP_LOCAL_BEFORE_STRUCTURAL and not os.getenv("PYTEST_CURRENT_TEST"):
-            try:
-                export_vp_to_sheets_main()
-            except Exception:
-                logger.exception(
-                    "Supervisor: vp_local_levels → Sheets before structural failed (credentials / network?)"
-                )
-        out = run_structural_pipeline(auto_freeze=True)
-        status = "ok" if out.get("phase") in ("armed", "completed") else "failed"
-    
-    sev = None if status == "ok" else "error"
+    sev = "error" if not out.get("ok", True) else None
+    status = "failed" if sev else "ok"
     _stage_event(
         stage="STRUCTURAL_RUN",
         status=status,
