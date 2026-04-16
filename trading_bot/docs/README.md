@@ -14,7 +14,6 @@
 ### State Manager
 - **MODULE_STATE_MANAGER.md** — Краткое описание (API, режимы)
 - **STATE_MANAGER_DESIGN.md** — Полное описание (500+ строк)
-- **scripts/README_STATE_MANAGER_WORKFLOW.md** — Workflow и примеры
 
 ### Structural Cycle
 - **MODULE_STRUCTURAL_CYCLE.md** — Краткое описание
