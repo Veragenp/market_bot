@@ -68,12 +68,22 @@ class TelegramNotifier:
     """
     Ленивый синглтон: кэш токена/чата из env и один requests.Session на процесс.
     Для ops-уведомлений (structural и др.) без интерактивного бота.
+    
+    Важно: токены считываются при первом вызове send_message(), а не при инициализации,
+    чтобы дать время settings.py загрузить .env файл.
     """
 
     def __init__(self) -> None:
-        self._token = _resolve_token()
-        self._chat_id = _resolve_chat_id()
         self._session = requests.Session()
+        self._token_cached: Optional[str] = None
+        self._chat_id_cached: Optional[str] = None
+
+    def _ensure_tokens(self) -> None:
+        """Считать токены из env (лениво, при первом использовании)."""
+        if self._token_cached is None:
+            self._token_cached = _resolve_token()
+        if self._chat_id_cached is None:
+            self._chat_id_cached = _resolve_chat_id()
 
     def send_message(
         self,
@@ -82,14 +92,17 @@ class TelegramNotifier:
         parse_mode: Optional[str] = "HTML",
         timeout: float = 30.0,
     ) -> bool:
-        if not self._token or not self._chat_id:
+        # Считываем токены лениво - при первом вызове send_message
+        self._ensure_tokens()
+        
+        if not self._token_cached or not self._chat_id_cached:
             logger.warning("Telegram: skip send (singleton: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID)")
             return False
         if not text or not str(text).strip():
             logger.warning("Telegram: skip send (empty text)")
             return False
-        url = f"{DEFAULT_API}/bot{self._token}/sendMessage"
-        payload: dict = {"chat_id": self._chat_id, "text": str(text)}
+        url = f"{DEFAULT_API}/bot{self._token_cached}/sendMessage"
+        payload: dict = {"chat_id": self._chat_id_cached, "text": str(text)}
         if parse_mode:
             payload["parse_mode"] = parse_mode
         try:

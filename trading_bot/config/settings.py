@@ -844,3 +844,17 @@ TEST_CYCLE_SYMBOLS_COUNT = int(os.getenv("TEST_CYCLE_SYMBOLS_COUNT", "10"))
 
 # Интервал тестового цикла (сек) - как часто пересоздавать уровни
 TEST_CYCLE_INTERVAL_SEC = int(os.getenv("TEST_CYCLE_INTERVAL_SEC", "60"))
+
+# ============================================================================
+# TEST MODE DATA OPTIMIZATION - Ускоренный режим без загрузки данных
+# ============================================================================
+
+# Автоматически отключаем загрузку данных в тестовом режиме (override вручную заданных значений)
+if TEST_MODE:
+    TEST_MODE_SKIP_DATA_REFRESH = True
+    TEST_MODE_SKIP_LEVELS_REBUILD = True
+    TEST_MODE_SKIP_VP_EXPORT = True
+else:
+    TEST_MODE_SKIP_DATA_REFRESH = False
+    TEST_MODE_SKIP_LEVELS_REBUILD = False
+    TEST_MODE_SKIP_VP_EXPORT = False

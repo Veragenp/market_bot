@@ -76,6 +76,14 @@ def _append_sheet_row(
 def _send_telegram(stage: str, status: str, cycle_id: Optional[str], message: str, severity: Optional[str]) -> None:
     if not st.OPS_STAGE_TELEGRAM or os.getenv("PYTEST_CURRENT_TEST"):
         return
+    
+    # Отключаем спам от рутинных тиков supervisor
+    # Эти этапы вызываются каждый тик и не несут полезной информации для Telegram
+    if stage in ("ENTRY_TICK", "ENTRY_SIGNAL", "ORDER_RECONCILE", "DATA_REFRESH", "LEVELS_REBUILD"):
+        # Отправляем только если есть ошибка
+        if (severity or "").lower() not in ("error", "critical"):
+            return
+    
     if st.OPS_STAGE_TELEGRAM_ONLY_FINAL and status == "started":
         return
     if st.OPS_STAGE_TELEGRAM_ONLY_FINAL and (severity or "").lower() not in ("error", "critical") and status not in (

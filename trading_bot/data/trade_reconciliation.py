@@ -206,18 +206,56 @@ def _refresh_position_from_orders(cur, *, position_record_id: int) -> None:
             e_filled = float(e["filled_qty"] or 0.0)
             e_price = float(e["avg_fill_price"]) if e["avg_fill_price"] is not None else None
             if e_status in ("filled", "partially_filled") and e_filled > 0:
-                cur.execute(
-                    """
-                    UPDATE position_records
-                    SET status = CASE WHEN status = 'pending' THEN 'open' ELSE status END,
-                        filled_qty = ?,
-                        entry_price_fact = COALESCE(entry_price_fact, ?),
-                        opened_at = COALESCE(opened_at, ?),
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (e_filled, e_price, now, now, pr_id),
-                )
+                    # Проверяем была ли позиция ранее 'pending' (новый вход)
+                    was_pending_row = cur.execute("""
+                        SELECT status FROM position_records WHERE id = ?
+                    """, (pr_id,)).fetchone()
+                    was_pending = was_pending_row and str(was_pending_row["status"]) == "pending"
+                    
+                    cur.execute(
+                        """
+                        UPDATE position_records
+                        SET status = CASE WHEN status = 'pending' THEN 'open' ELSE status END,
+                            filled_qty = ?,
+                            entry_price_fact = COALESCE(entry_price_fact, ?),
+                            opened_at = COALESCE(opened_at, ?),
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (e_filled, e_price, now, now, pr_id),
+                    )
+
+                    # Telegram уведомление об открытии позиции (только если была 'pending')
+                    if was_pending:
+                        logger.info("Position %s changed from pending to open - sending Telegram notification", pr_id)
+                        if st.LEVEL_CROSS_TELEGRAM:
+                            try:
+                                from trading_bot.tools.telegram_notify import escape_html_telegram, get_telegram_notifier
+                                
+                                pos_info = cur.execute("""
+                                    SELECT symbol, side, qty, entry_price_fact
+                                    FROM position_records WHERE id = ?
+                                """, (pr_id,)).fetchone()
+                                
+                                if pos_info:
+                                    symbol = str(pos_info['symbol'])
+                                    side = str(pos_info['side']).upper()
+                                    qty = float(pos_info['qty'] or 0)
+                                    entry_price = pos_info['entry_price_fact']
+                                    
+                                    msg = (
+                                        f"🟢 ОТКРЫТИЕ позиции: {symbol} {side}\n"
+                                        f"Цена: {entry_price:.4f}, Кол-во: {qty}"
+                                    )
+                                    logger.info("Sending Telegram message: %s", msg)
+                                    get_telegram_notifier().send_message(f"<pre>{escape_html_telegram(msg)}</pre>", parse_mode="HTML")
+                                    logger.info("Telegram: Position open notification sent for %s %s", symbol, side)
+                                else:
+                                    logger.error("Could not fetch position info for %s", pr_id)
+                            except Exception:
+                                logger.exception("position open telegram failed")
+                        else:
+                            logger.info("LEVEL_CROSS_TELEGRAM is disabled, skipping notification")
 
     pos2 = cur.execute(
         """
@@ -270,6 +308,84 @@ def _refresh_position_from_orders(cur, *, position_record_id: int) -> None:
         """,
         (exit_px, now, reason, now, pr_id),
     )
+
+    # Telegram уведомление о закрытии позиции
+    logger.info("Position %s closed - checking Telegram notification", pr_id)
+    if st.LEVEL_CROSS_TELEGRAM:
+        try:
+            from trading_bot.tools.telegram_notify import escape_html_telegram, get_telegram_notifier
+            
+            pos_info = cur.execute("""
+                SELECT symbol, side, qty, entry_price_fact, exit_price_fact, close_reason
+                FROM position_records WHERE id = ?
+            """, (pr_id,)).fetchone()
+            
+            if pos_info:
+                symbol = str(pos_info['symbol'])
+                side = str(pos_info['side']).upper()
+                qty = float(pos_info['qty'] or 0)
+                entry_price = pos_info['entry_price_fact']
+                exit_price = pos_info['exit_price_fact']
+                raw_reason = str(pos_info['close_reason'] or 'unknown')
+                
+                logger.info("Closing position: %s %s, reason: %s", symbol, side, raw_reason)
+                
+                # Маппинг причин закрытия на читаемые сообщения
+                reason_map = {
+                    'take_profit': '✅ TAKE PROFIT',
+                    'tp1': '✅ TAKE PROFIT 1',
+                    'tp2': '✅ TAKE PROFIT 2',
+                    'tp3': '✅ TAKE PROFIT 3',
+                    'stop_loss': '❌ STOP LOSS',
+                    'flip_long': '🔄 FLIP (LONG → SHORT)',
+                    'flip_short': '🔄 FLIP (SHORT → LONG)',
+                    'flip': '🔄 FLIP (переворот рынка)',
+                    'timeout': '⏰ TIMEOUT (истекло время)',
+                    'manual_close': '👤 РУЧНОЕ ЗАКРЫТИЕ',
+                    'exchange_close': '🏢 БИРЖА (техническое)',
+                    'reduce_only': '📉 REDUCE_ONLY',
+                }
+                
+                # Поиск подходящей причины (частичное совпадение)
+                display_reason = raw_reason.upper()
+                for key, display in reason_map.items():
+                    if key.lower() in raw_reason.lower():
+                        display_reason = display
+                        break
+                
+                # Расчёт PnL
+                pnl_pct = None
+                pnl_usdt = None
+                if entry_price and exit_price:
+                    if side == 'SELL':  # SHORT
+                        pnl_pct = (entry_price - exit_price) / entry_price * 100
+                    else:  # LONG
+                        pnl_pct = (exit_price - entry_price) / entry_price * 100
+                
+                    # PnL в USDT (примерно)
+                    pnl_usdt = pnl_pct * qty * entry_price / 100
+                
+                pnl_str = f"{pnl_pct:+.2f}%" if pnl_pct is not None else "?"
+                pnl_usdt_str = f" (~{pnl_usdt:+.2f} USDT)" if pnl_usdt is not None else ""
+                
+                # Иконка результата
+                result_icon = "✅" if pnl_pct and pnl_pct > 0 else "❌" if pnl_pct and pnl_pct < 0 else "⚪"
+                
+                msg = (
+                    f"{result_icon} 🔴 ЗАКРЫТИЕ позиции: {symbol} {side}\n"
+                    f"Цена: {entry_price:.4f} → {exit_price:.4f}\n"
+                    f"PnL: {pnl_str}{pnl_usdt_str}\n"
+                    f"Причина: {display_reason}"
+                )
+                logger.info("Sending Telegram close message: %s", msg)
+                get_telegram_notifier().send_message(f"<pre>{escape_html_telegram(msg)}</pre>", parse_mode="HTML")
+                logger.info("Telegram: Position close notification sent for %s %s", symbol, side)
+            else:
+                logger.error("Could not fetch position info for %s", pr_id)
+        except Exception:
+            logger.exception("position close telegram failed")
+    else:
+        logger.info("LEVEL_CROSS_TELEGRAM is disabled, skipping close notification")
 
 
 def reconcile_recent_exec_orders(cur, *, lookback_hours: int = 24) -> Dict[str, Any]:

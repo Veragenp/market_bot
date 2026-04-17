@@ -35,6 +35,15 @@ def init_db() -> None:
         """
     )
     cursor.execute("DROP INDEX IF EXISTS idx_ohlcv_unique")
+    # --- Удаление дубликатов перед созданием уникального индекса ---
+    cursor.execute("""
+        DELETE FROM ohlcv
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid)
+            FROM ohlcv
+            GROUP BY symbol, timeframe, timestamp, ifnull(source, '')
+        )
+    """)
     cursor.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_ohlcv_unique

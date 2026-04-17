@@ -49,6 +49,7 @@ class PriceFeed:
     """
 
     def __init__(self) -> None:
+        
         self._lock = threading.Lock()
         self._prices: Dict[str, PricePoint] = {}
         self._ws = None
@@ -75,6 +76,10 @@ class PriceFeed:
             return
 
     def start_ws(self, symbols: Iterable[str]) -> bool:
+        # Disable WebSocket in TEST_MODE - REST fallback is sufficient and avoids 404 errors
+        if st.TEST_MODE:
+            logger.debug("PriceFeed: WebSocket disabled in TEST_MODE (using REST only)")
+            return False
         if not st.PRICE_FEED_WEBSOCKET_ENABLED:
             return False
         if self._ws_started:
@@ -86,11 +91,14 @@ class PriceFeed:
             return False
         try:
             ws_kw = public_linear_websocket_kwargs()
-            sub = "stream-demo" if st.BYBIT_USE_DEMO else "stream"
+            # Bybit Demo WebSocket endpoint issue: stream-demo.bybit.com returns 404
+            # Workaround: use main stream endpoint even in demo mode for public data
+            # Demo mode still affects REST calls (api-demo.bybit.com)
+            sub = "stream"  # Always use "stream" - public WS works the same for demo/real
             dom = ws_kw.get("domain", "bybit")
             logger.info(
                 "PriceFeed: WebSocket linear public ~ wss://%s.%s.com/v5/public/linear "
-                "demo=%s trace=%s",
+                "demo=%s trace=%s (note: public WS uses main endpoint, REST uses demo)",
                 sub,
                 dom,
                 st.BYBIT_USE_DEMO,

@@ -71,9 +71,11 @@ def _load_open_entry_orders_by_symbol_and_side() -> Dict[tuple[str, str], List[s
 
 def _get_atr(cur, symbol_trade: str) -> Optional[float]:
     """Получить ATR для символа из таблицы instruments."""
+    # Преобразовать BTC/USDT → BTCUSDT (формат instruments)
+    symbol_bybit = symbol_trade.replace("/", "").upper()
     row = cur.execute(
         "SELECT atr FROM instruments WHERE symbol = ? AND exchange = 'bybit_futures'",
-        (symbol_trade,),
+        (symbol_bybit,),
     ).fetchone()
     if not row or row["atr"] is None:
         return None
@@ -677,6 +679,10 @@ def place_entry_order_for_symbol(
 
     rc = order_resp.get("retCode")
     if rc not in (0, "0", None):
+        logger.error(
+            "❌ ORDER REJECTED: %s %s | retCode: %s | retMsg: %s",
+            sym_bybit, side.upper(), rc, order_resp.get("retMsg")
+        )
         return {
             "ok": False,
             "error": "limit_order_rejected",
@@ -760,6 +766,12 @@ def place_entry_order_for_symbol(
     cur.execute(
         "UPDATE exec_orders SET position_record_id = ?, updated_at = ? WHERE id = ?",
         (pos_id, now, exec_id),
+    )
+
+    # Логирование успешного размещения ордера
+    logger.info(
+        "✅ ORDER PLACED: %s %s | OrderID: %s | Qty: %.4f | Price: %.4f | Stop: %.4f",
+        sym_bybit, side.upper(), bybit_oid, float(plan.qty_total), level_price, float(plan.stop_price)
     )
 
     return {
@@ -864,16 +876,10 @@ def process_v4_signal(
             logger.debug("EntryGate LONG %s price=%s level=%s atr=%s thr=%s ok=%s",
                          symbol, current_price, level_price, atr, threshold, condition_met)
         else:  # SHORT
-            # Для SHORT также проверяем, не был ли уже алерт (опционально)
-            alerted = monitor.get_alerted_status(symbol, "short") if monitor else False
-            if alerted:
-                logger.debug("EntryGate SHORT %s already alerted, skip", symbol)
-                rejected.append(symbol)
-                continue
             threshold = short_pct / 100.0 * atr
             condition_met = float(current_price) < level_price - threshold
-            logger.debug("EntryGate SHORT %s price=%s level=%s atr=%s alerted=%s thr=%s ok=%s",
-                         symbol, current_price, level_price, atr, alerted, threshold, condition_met)
+            logger.debug("EntryGate SHORT %s price=%s level=%s atr=%s thr=%s ok=%s",
+                         symbol, current_price, level_price, atr, threshold, condition_met)
 
         if condition_met:
             # Выставляем лимитный ордер
@@ -930,16 +936,34 @@ def process_v4_signal(
             meta={"entered": entered, "rejected": rejected, "flip_done": rebuild_done},
         )
 
-    # 6. Telegram уведомление
-    if st.LEVEL_CROSS_TELEGRAM and entered:
-        msg = f"Сигнал {signal_type}: выставлены лимитные ордера на {len(entered)} монет: {', '.join(entered[:10])}"
-        if len(entered) > 10:
-            msg += f" и ещё {len(entered)-10}"
+    # 6. Telegram уведомление о входе в позицию
+    if st.LEVEL_CROSS_TELEGRAM and (entered or rejected):
+        msg = f"🟢 СИГНАЛ {signal_type} ОБРАБОТАН:\n"
+        
+        if entered:
+            entered_list = ', '.join(entered[:5])
+            if len(entered) > 5:
+                entered_list += f" и ещё {len(entered)-5}"
+            msg += f"✅ Прошли проверку ({len(entered)}): {entered_list}\n"
+        
         if rejected:
-            msg += f"\nОтклонено (не прошли условие): {len(rejected)} монет"
+            rejected_list = ', '.join(rejected[:5])
+            if len(rejected) > 5:
+                rejected_list += f" и ещё {len(rejected)-5}"
+            msg += f"❌ Не прошли ATR-фильтр ({len(rejected)}): {rejected_list}"
+        
         get_telegram_notifier().send_message(f"<pre>{escape_html_telegram(msg)}</pre>", parse_mode="HTML")
 
-    # 7. Выгрузка в Google Sheets (сразу после входа)
+    # 7. Telegram уведомление об исполнении ордеров (открытие позиций)
+    if st.LEVEL_CROSS_TELEGRAM and entered:
+        try:
+            # Через 1-2 минуты проверить исполнены ли ордера и отправить уведомление
+            # Это делается в reconcile, но можно добавить отдельный тик
+            pass  # Уведомление будет при закрытии позиции с причиной
+        except Exception:
+            logger.exception("position open telegram failed")
+
+    # 8. Выгрузка в Google Sheets (сразу после входа)
     try:
         from trading_bot.data.trading_cycle_sheets import export_open_orders_to_sheets, sync_trading_positions_and_stats_to_sheets
         export_open_orders_to_sheets(cur)

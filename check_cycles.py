@@ -13,8 +13,10 @@ for c in cycles:
 
 print("\n=== TRADING STATE ===")
 ts = cur.execute("SELECT * FROM trading_state LIMIT 1").fetchone()
-for k, v in ts.items():
-    print(f"{k}: {v}")
+if ts:
+    # sqlite3.Row supports dictionary-style access
+    for key in ts.keys():
+        print(f"{key}: {ts[key]}")
 
 print("\n=== POSITIONS ===")
 pos = cur.execute("SELECT symbol, side, status, qty FROM position_records WHERE status IN ('open','pending')").fetchall()

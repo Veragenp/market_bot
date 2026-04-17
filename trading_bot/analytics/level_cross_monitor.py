@@ -145,11 +145,20 @@ class LevelCrossMonitor:
         long_level = levels.get("long")
         short_level = levels.get("short")
 
-        if self.prev_prices.get(symbol) is None:
+        prev = self.prev_prices.get(symbol)
+        if prev is None:
+            # Первый тик: проверяем, является ли текущая цена уже пересечением
+            # (например, если cycle начался, когда цена уже была рядом с уровнем)
             self.prev_prices[symbol] = current_price
+            logger.info(
+                "LevelCross: %s init price=%.4f long_level=%s short_level=%s",
+                symbol, current_price,
+                f"{long_level:.4f}" if long_level else "N/A",
+                f"{short_level:.4f}" if short_level else "N/A"
+            )
             return
 
-        prev = float(self.prev_prices[symbol])
+        prev = float(prev)
         timestamp = _utc_naive()
 
         if allow_long and long_level is not None and not self.alerted[symbol]["long"]:
@@ -186,7 +195,15 @@ class LevelCrossMonitor:
             and prev > long_level
             and current_price <= long_level
         ):
-            logger.info("LONG cross %s ignored: allow_long_entry=False", symbol)
+            # ДОБАВЛЕНО ЛОГИРОВАНИЕ для отладки
+            logger.info("LONG cross DETECTED but blocked: %s prev=%.4f level=%.4f current=%.4f allow_long=%s",
+                        symbol, prev, long_level, current_price, allow_long)
+            if st.LEVEL_CROSS_TELEGRAM and st.LEVEL_CROSS_TELEGRAM_CROSSINGS:
+                msg = f"⚠️ Пересечение LONG заблокировано: {symbol} цена {current_price} <= {long_level}"
+                get_telegram_notifier().send_message(
+                    f"<pre>{escape_html_telegram(msg)}</pre>",
+                    parse_mode="HTML",
+                )
 
         if allow_short and short_level is not None and not self.alerted[symbol]["short"]:
             if prev < short_level and current_price >= short_level:
@@ -222,7 +239,15 @@ class LevelCrossMonitor:
             and prev < short_level
             and current_price >= short_level
         ):
-            logger.info("SHORT cross %s ignored: allow_short_entry=False", symbol)
+            # ДОБАВЛЕНО ЛОГИРОВАНИЕ для отладки
+            logger.info("SHORT cross DETECTED but blocked: %s prev=%.4f level=%.4f current=%.4f allow_short=%s",
+                        symbol, prev, short_level, current_price, allow_short)
+            if st.LEVEL_CROSS_TELEGRAM and st.LEVEL_CROSS_TELEGRAM_CROSSINGS:
+                msg = f"⚠️ Пересечение SHORT заблокировано: {symbol} цена {current_price} >= {short_level}"
+                get_telegram_notifier().send_message(
+                    f"<pre>{escape_html_telegram(msg)}</pre>",
+                    parse_mode="HTML",
+                )
 
         self.prev_prices[symbol] = current_price
 
@@ -252,51 +277,81 @@ class LevelCrossMonitor:
         min_n = int(st.LEVEL_CROSS_MIN_ALERTS_COUNT)
         timeout_min = float(st.LEVEL_CROSS_ALERT_TIMEOUT_MINUTES)
 
+        # Проверяем текущее состояние позиции из БД
+        pos_row = cur.execute("""
+            SELECT position_state FROM trading_state WHERE id = 1
+        """).fetchone()
+        current_pos_state = str(pos_row['position_state']) if pos_row else 'none'
+
         if self.long_window_start:
             long_count = len(self.long_alerts)
             time_diff = (current_time - self.long_window_start).total_seconds() / 60.0
             if long_count >= min_n and time_diff >= timeout_min:
-                logger.info("V3: entry signal LONG (group)")
-                if st.LEVEL_CROSS_TELEGRAM:
-                    get_telegram_notifier().send_message(
-                        f"<pre>{escape_html_telegram('Сигнал на вход в сделку LONG')}</pre>",
-                        parse_mode="HTML",
+                # БЛОКИРОВКА: если уже есть LONG позиция
+                if current_pos_state == 'long':
+                    logger.info("V3: LONG сигнал ИГНОРИРОВАН - уже есть LONG позиция")
+                    # Очищаем окно, чтобы не повторять проверку каждый тик
+                    self.long_alerts.clear()
+                    self.long_window_start = None
+                else:
+                    logger.info("V3: entry signal LONG (group)")
+                    if st.LEVEL_CROSS_TELEGRAM:
+                        # Добавляем список символов в уведомление
+                        symbols_list = ', '.join(list(self.long_alerts.keys())[:5])
+                        if len(self.long_alerts) > 5:
+                            symbols_list += f" и ещё {len(self.long_alerts)-5}"
+                        msg = f"🟢 СИГНАЛ LONG: {len(self.long_alerts)} монет пересекли уровни\n{symbols_list}"
+                        get_telegram_notifier().send_message(
+                            f"<pre>{escape_html_telegram(msg)}</pre>",
+                            parse_mode="HTML",
+                        )
+                    _log_v3_event(
+                        cur,
+                        cycle_id=self.cycle_id,
+                        structural_cycle_id=self.structural_cycle_id,
+                        event_type="v3_entry_signal_long",
+                        symbol=None,
+                        price=None,
+                        meta={"symbols": list(self.long_alerts.keys()), "count": long_count},
                     )
-                _log_v3_event(
-                    cur,
-                    cycle_id=self.cycle_id,
-                    structural_cycle_id=self.structural_cycle_id,
-                    event_type="v3_entry_signal_long",
-                    symbol=None,
-                    price=None,
-                    meta={"symbols": list(self.long_alerts.keys()), "count": long_count},
-                )
-                out.append("LONG")
-                self.long_alerts.clear()
-                self.long_window_start = None
+                    out.append("LONG")
+                    self.long_alerts.clear()
+                    self.long_window_start = None
 
         if self.short_window_start:
             short_count = len(self.short_alerts)
             time_diff = (current_time - self.short_window_start).total_seconds() / 60.0
             if short_count >= min_n and time_diff >= timeout_min:
-                logger.info("V3: entry signal SHORT (group)")
-                if st.LEVEL_CROSS_TELEGRAM:
-                    get_telegram_notifier().send_message(
-                        f"<pre>{escape_html_telegram('Сигнал на вход в сделку SHORT')}</pre>",
-                        parse_mode="HTML",
+                # БЛОКИРОВКА: если уже есть SHORT позиция
+                if current_pos_state == 'short':
+                    logger.info("V3: SHORT сигнал ИГНОРИРОВАН - уже есть SHORT позиция")
+                    # Очищаем окно, чтобы не повторять проверку каждый тик
+                    self.short_alerts.clear()
+                    self.short_window_start = None
+                else:
+                    logger.info("V3: entry signal SHORT (group)")
+                    if st.LEVEL_CROSS_TELEGRAM:
+                        # Добавляем список символов в уведомление
+                        symbols_list = ', '.join(list(self.short_alerts.keys())[:5])
+                        if len(self.short_alerts) > 5:
+                            symbols_list += f" и ещё {len(self.short_alerts)-5}"
+                        msg = f"🔴 СИГНАЛ SHORT: {len(self.short_alerts)} монет пересекли уровни\n{symbols_list}"
+                        get_telegram_notifier().send_message(
+                            f"<pre>{escape_html_telegram(msg)}</pre>",
+                            parse_mode="HTML",
+                        )
+                    _log_v3_event(
+                        cur,
+                        cycle_id=self.cycle_id,
+                        structural_cycle_id=self.structural_cycle_id,
+                        event_type="v3_entry_signal_short",
+                        symbol=None,
+                        price=None,
+                        meta={"symbols": list(self.short_alerts.keys()), "count": short_count},
                     )
-                _log_v3_event(
-                    cur,
-                    cycle_id=self.cycle_id,
-                    structural_cycle_id=self.structural_cycle_id,
-                    event_type="v3_entry_signal_short",
-                    symbol=None,
-                    price=None,
-                    meta={"symbols": list(self.short_alerts.keys()), "count": short_count},
-                )
-                out.append("SHORT")
-                self.short_alerts.clear()
-                self.short_window_start = None
+                    out.append("SHORT")
+                    self.short_alerts.clear()
+                    self.short_window_start = None
 
         return out
 

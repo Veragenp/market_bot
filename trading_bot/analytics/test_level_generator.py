@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -39,7 +40,7 @@ def get_test_cycle_symbols() -> List[str]:
 
 def get_symbol_atr(symbol: str) -> Optional[float]:
     """Получить ATR для символа из instruments."""
-    from trading_bot.tools.price_feed import to_bybit_symbol
+    from trading_bot.tools.bybit_trading import to_bybit_symbol
     
     conn = get_connection()
     try:
@@ -70,11 +71,13 @@ def get_symbol_atr(symbol: str) -> Optional[float]:
 
 def get_symbol_current_price(symbol: str) -> Optional[float]:
     """Получить текущую цену символа."""
-    from trading_bot.tools.price_feed import PricePoint, get_price_feed
+    from trading_bot.tools.price_feed import get_price_feed
     
     try:
         feed = get_price_feed()
-        price_point = feed.get_price(symbol)
+        # Используем get_prices вместо get_price
+        prices = feed.get_prices([symbol])
+        price_point = prices.get(symbol)
         
         if price_point and price_point.price and price_point.price > 0:
             return float(price_point.price)
@@ -108,7 +111,7 @@ def generate_test_levels() -> Dict[str, Any]:
     
     logger.info("TEST_MODE: Starting test level generation")
     
-    # 1. Проверить есть ли активный тестовый цикл
+    # 1. Проверить есть ли активный тестовый цикл (без ref_price_source, т.к. колонки может не быть)
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -116,8 +119,7 @@ def generate_test_levels() -> Dict[str, Any]:
             """
             SELECT sc.id, sc.phase, sc.created_at
             FROM structural_cycles sc
-            WHERE sc.ref_price_source = 'test' 
-              AND sc.phase IN ('armed', 'touch_window', 'entry_timer')
+            WHERE sc.phase IN ('armed', 'touch_window', 'entry_timer')
             ORDER BY sc.created_at DESC
             LIMIT 1
             """
@@ -152,7 +154,6 @@ def generate_test_levels() -> Dict[str, Any]:
     
     # 3. Создать structural_cycle
     cycle_id = str(uuid.uuid4())
-    structural_id = str(uuid.uuid4())
     now = int(time.time())
     
     conn = get_connection()
@@ -164,16 +165,10 @@ def generate_test_levels() -> Dict[str, Any]:
             """
             INSERT INTO structural_cycles (
                 id, phase, created_at, updated_at,
-                symbols_valid_count, scan_duration_sec,
-                pool_median_w, pool_mad, pool_k,
-                ref_price_source, target_w_band_k,
-                target_center_weight, target_width_weight,
-                allowed_level_types, anchor_symbols,
-                center_mad_k, center_filter_enabled,
-                target_align_enabled, min_pool_symbols
-            ) VALUES (?, 'armed', ?, ?, 0, 0, 0, 0, 1, 'test', 0, 0, 0, 'test', '[]', 0, 0, 0, 1)
+                symbols_valid_count, pool_median_w, pool_mad, pool_k
+            ) VALUES (?, 'armed', ?, ?, 0, 0, 0, 1)
             """,
-            (structural_id, now, now)
+            (cycle_id, now, now)
         )
         
         # Создать structural_cycle_symbols и cycle_levels для каждого символа
@@ -194,7 +189,7 @@ def generate_test_levels() -> Dict[str, Any]:
             short_price = current_price + offset * atr
             
             #ROUND to tick size
-            from trading_bot.tools.price_feed import to_bybit_symbol
+            from trading_bot.tools.bybit_trading import to_bybit_symbol
             bybit_sym = to_bybit_symbol(symbol)
             tick = _get_tick_size(bybit_sym)
             if tick:
@@ -208,37 +203,37 @@ def generate_test_levels() -> Dict[str, Any]:
                     cycle_id, symbol, status,
                     L_price, U_price, atr, W_atr,
                     ref_price_ws, mid_price, mid_band_low, mid_band_high,
-                    volume_peak_below, volume_peak_above,
-                    tier_below, tier_above
-                ) VALUES (?, ?, 'ok', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'test', 'test')
+                    tier_below, tier_above, evaluated_at
+                ) VALUES (?, ?, 'ok', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (structural_id, symbol, long_price, short_price, atr, atr, 
-                 current_price, current_price, long_price, short_price)
+                (cycle_id, symbol, long_price, short_price, atr, atr, 
+                 current_price, current_price, long_price, short_price, 'test', 'test', now)
             )
             
             # Создать cycle_levels записи (LONG и SHORT)
+            # Важно: используем ту же схему INSERT что и в боевом режиме (_freeze_cycle_levels)
             cur.execute(
                 """
                 INSERT INTO cycle_levels (
-                    cycle_id, symbol, direction, level_type, 
-                    level_price, strength, volume_peak,
-                    tier, layer, is_active, status,
-                    created_at, updated_at, origin, timeframe
-                ) VALUES (?, ?, 'long', 'test', ?, 1, 0, 'test', 1, 1, 'active', ?, ?, 'test', '1h')
+                    cycle_id, symbol, direction, level_step, level_price, source_level_id,
+                    tier, volume_peak, distance_atr, ref_price, ref_price_source, ref_price_ts,
+                    is_primary, is_active, frozen_at, updated_at
+                )
+                VALUES (?, ?, 'long', 1, ?, NULL, ?, 0, ?, ?, 'test', ?, 1, 1, ?, ?)
                 """,
-                (cycle_id, symbol, long_price, now, now)
+                (cycle_id, symbol, long_price, 'test', 0, current_price, 'test', now, now)
             )
-            
+        
             cur.execute(
                 """
                 INSERT INTO cycle_levels (
-                    cycle_id, symbol, direction, level_type,
-                    level_price, strength, volume_peak,
-                    tier, layer, is_active, status,
-                    created_at, updated_at, origin, timeframe
-                ) VALUES (?, ?, 'short', 'test', ?, 1, 0, 'test', 1, 1, 'active', ?, ?, 'test', '1h')
+                    cycle_id, symbol, direction, level_step, level_price, source_level_id,
+                    tier, volume_peak, distance_atr, ref_price, ref_price_source, ref_price_ts,
+                    is_primary, is_active, frozen_at, updated_at
+                )
+                VALUES (?, ?, 'short', 1, ?, NULL, ?, 0, ?, ?, 'test', ?, 1, 1, ?, ?)
                 """,
-                (cycle_id, symbol, short_price, now, now)
+                (cycle_id, symbol, short_price, 'test', 0, current_price, 'test', now, now)
             )
             
             levels_created += 2
@@ -263,19 +258,89 @@ def generate_test_levels() -> Dict[str, Any]:
                 updated_at = ?
             WHERE id = 1
             """,
-            (cycle_id, structural_id, now, now)
+            (cycle_id, cycle_id, now, now)
         )
         
         conn.commit()
+        
+        # === ПОДРОБНОЕ ЛОГИРОВАНИЕ ВСЕХ ЗАМОРОЖЕННЫХ УРОВНЕЙ ===
+        cur.execute(
+            """
+            SELECT symbol, direction, level_price, tier, volume_peak, distance_atr
+            FROM cycle_levels
+            WHERE cycle_id = ?
+            ORDER BY symbol, direction
+            """,
+            (cycle_id,),
+        )
+        rows_log = cur.fetchall()
+        
+        logger.info("=" * 80)
+        logger.info("TEST_MODE: FROZEN LEVELS for cycle_id=%s", cycle_id[:8])
+        logger.info("=" * 80)
+        logger.info("Total frozen levels: %d", levels_created)
+        
+        # Разделяем по направлениям
+        long_levels = [r for r in rows_log if r["direction"] == "long"]
+        short_levels = [r for r in rows_log if r["direction"] == "short"]
+        
+        logger.info("LONG levels: %d", len(long_levels))
+        logger.info("SHORT levels: %d", len(short_levels))
+        
+        # Детальная информация
+        if long_levels:
+            logger.info("")
+            logger.info("FROZEN LONG LEVELS:")
+            logger.info("-" * 80)
+            for row in sorted(long_levels, key=lambda x: x["symbol"]):
+                logger.info(
+                    "  %-12s price=%.6f tier=%-12s vol_peak=%.2f dist=%.2f ATR",
+                    row["symbol"],
+                    row["level_price"],
+                    row["tier"] or "N/A",
+                    row["volume_peak"] or 0,
+                    row["distance_atr"] or 0,
+                )
+        
+        if short_levels:
+            logger.info("")
+            logger.info("FROZEN SHORT LEVELS:")
+            logger.info("-" * 80)
+            for row in sorted(short_levels, key=lambda x: x["symbol"]):
+                logger.info(
+                    "  %-12s price=%.6f tier=%-12s vol_peak=%.2f dist=%.2f ATR",
+                    row["symbol"],
+                    row["level_price"],
+                    row["tier"] or "N/A",
+                    row["volume_peak"] or 0,
+                    row["distance_atr"] or 0,
+                )
+        
+        logger.info("=" * 80)
         
         logger.info(
             "TEST_MODE: Generated %d levels for %d symbols (cycle=%s)",
             levels_created, len(symbols), cycle_id[:8]
         )
         
+        # Экспорт уровней в Sheets (как в боевом режиме)
+        if st.OPS_STAGE_SHEETS and not os.getenv("PYTEST_CURRENT_TEST"):
+            try:
+                logger.info("TEST_MODE: Exporting cycle_levels sheets snapshot...")
+                from trading_bot.data.cycle_levels_db import export_cycle_levels_sheets_snapshot
+                export_cycle_levels_sheets_snapshot()
+                logger.info("TEST_MODE: cycle_levels sheets snapshot exported")
+                
+                # Экспорт упрощённой таблицы торговых уровней
+                from trading_bot.data.structural_ops_notify import export_structural_trading_levels
+                export_structural_trading_levels(cycle_id)
+                logger.info("TEST_MODE: Trading levels exported")
+            except Exception:
+                logger.exception("TEST_MODE: Failed to export levels to Sheets")
+        
         return {
             "ok": True,
-            "structural_cycle_id": structural_id,
+            "structural_cycle_id": cycle_id,
             "cycle_id": cycle_id,
             "symbols_count": len(symbols),
             "levels_created": levels_created,
@@ -343,7 +408,7 @@ def rebuild_opposite_test_levels(cycle_id: str, known_side: str) -> Dict[str, An
                 level_price = current_price + offset * atr
             
             # ROUND to tick size
-            from trading_bot.tools.price_feed import to_bybit_symbol
+            from trading_bot.tools.bybit_trading import to_bybit_symbol
             bybit_sym = to_bybit_symbol(symbol)
             tick = _get_tick_size(bybit_sym)
             if tick:
@@ -360,17 +425,17 @@ def rebuild_opposite_test_levels(cycle_id: str, known_side: str) -> Dict[str, An
             )
             
             if cur.rowcount == 0:
-                # Уровень не существует, создаём
+                # Уровень не существует, создаём с правильной схемой
                 cur.execute(
                     """
                     INSERT INTO cycle_levels (
-                        cycle_id, symbol, direction, level_type,
-                        level_price, strength, volume_peak,
-                        tier, layer, is_active, status,
-                        created_at, updated_at, origin, timeframe
-                    ) VALUES (?, ?, ?, 'test', ?, 1, 0, 'test', 1, 1, 'active', ?, ?, 'test', '1h')
+                        cycle_id, symbol, direction, level_step, level_price, source_level_id,
+                        tier, volume_peak, distance_atr, ref_price, ref_price_source, ref_price_ts,
+                        is_primary, is_active, frozen_at, updated_at
+                    )
+                    VALUES (?, ?, ?, 1, ?, NULL, 'test', 0, ?, ?, 'test', ?, 1, 1, ?, ?)
                     """,
-                    (cycle_id, symbol, target_side, level_price, now, now)
+                    (cycle_id, symbol, target_side, level_price, 0, current_price, 'test', now, now)
                 )
             
             levels_created += 1
@@ -402,12 +467,11 @@ def _clear_test_cycle() -> None:
     try:
         cur = conn.cursor()
         
-        # Найти старый тестовый цикл
+        # Найти старый тестовый цикл (без ref_price_source)
         row = cur.execute(
             """
             SELECT id, phase, created_at 
             FROM structural_cycles 
-            WHERE ref_price_source = 'test' 
             ORDER BY created_at DESC 
             LIMIT 1
             """

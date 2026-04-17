@@ -104,12 +104,7 @@ def run_entry_detector_tick() -> Dict[str, Any]:
             message="Entry detector tick started",
             started_at=int(started),
         )
-        if st.ENTRY_DETECTOR_TELEGRAM_START and not os.getenv("PYTEST_CURRENT_TEST"):
-            try:
-                start_msg = f"Модуль entry detector: тик (level cross + entry gate + reconcile). cycle_id={cycle_id or 'n/a'}"
-                get_telegram_notifier().send_message(f"<pre>{escape_html_telegram(start_msg)}</pre>", parse_mode="HTML")
-            except Exception:
-                logger.exception("entry_detector: telegram start notify failed")
+        # Убрал Telegram спам - уведомления только по важным событиям (см. level_cross_monitor, entry_gate)
         prices = _fetch_prices_for_cycle(cur)
         signals, summary = run_level_cross_tick(cur, prices=prices, monitor=mon)
         if summary.get("skipped"):
