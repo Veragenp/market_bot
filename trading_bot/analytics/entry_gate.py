@@ -659,6 +659,17 @@ def place_entry_order_for_symbol(
     if plan.qty_total <= 0:
         return {"ok": False, "error": "zero_qty", "plan": plan_to_dict(plan)}
 
+    # Округлить qty до step (lot_size_step) чтобы избежать float-артефактов
+    qty_raw = float(plan.qty_total)
+    qty_rounded = round(qty_raw / step) * step
+    # Убрать лишние знаки после запятой (макс 8 знаков для безопасности)
+    qty_decimals = min(8, max(1, len(str(step).split('.')[-1]) if '.' in str(step) else 1))
+    qty_final = round(qty_rounded, qty_decimals)
+    
+    # Логирование для отладки
+    if abs(qty_final - qty_raw) > 1e-10:
+        logger.info("Qty rounded for %s: %.10f → %.8f (step=%.8f)", sym_bybit, qty_raw, qty_final, step)
+
     # 3. Выставить лимитный ордер (со встроенным stopLoss)
     if not st.BYBIT_EXECUTION_ENABLED:
         return {"ok": False, "error": "execution_disabled", "plan": plan_to_dict(plan)}
@@ -669,7 +680,7 @@ def place_entry_order_for_symbol(
         order_resp = place_linear_limit_order(
             symbol_trade=sym_trade,
             side_buy=side_buy,
-            qty=float(plan.qty_total),
+            qty=qty_final,
             price=level_price,
             stop_loss=float(plan.stop_price),   # встроенный стоп-лосс
         )
@@ -713,7 +724,7 @@ def place_entry_order_for_symbol(
             "symbol": sym_bybit,
             "side": "Buy" if side_buy else "Sell",
             "order_type": "Limit",
-            "qty": float(plan.qty_total),
+            "qty": qty_final,
             "price": level_price,
             "status": "submitted",
             "exchange_status": "accepted",
@@ -751,7 +762,7 @@ def place_entry_order_for_symbol(
             "symbol": sym_trade,
             "side": side,
             "status": "pending",
-            "qty": float(plan.qty_total),
+            "qty": qty_final,
             "entry_price": level_price,
             "entry_price_fact": None,
             "filled_qty": None,
@@ -770,8 +781,8 @@ def place_entry_order_for_symbol(
 
     # Логирование успешного размещения ордера
     logger.info(
-        "✅ ORDER PLACED: %s %s | OrderID: %s | Qty: %.4f | Price: %.4f | Stop: %.4f",
-        sym_bybit, side.upper(), bybit_oid, float(plan.qty_total), level_price, float(plan.stop_price)
+        "✅ ORDER PLACED: %s %s | OrderID: %s | Qty: %.8f | Price: %.4f | Stop: %.4f",
+        sym_bybit, side.upper(), bybit_oid, qty_final, level_price, float(plan.stop_price)
     )
 
     return {
@@ -779,7 +790,7 @@ def place_entry_order_for_symbol(
         "symbol": sym_trade,
         "position_record_id": pos_id,
         "order_id": bybit_oid,
-        "qty": float(plan.qty_total),
+        "qty": qty_final,
         "price": level_price,
         "stop_price": float(plan.stop_price),
         "plan": plan_to_dict(plan),
