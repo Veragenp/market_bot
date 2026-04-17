@@ -446,7 +446,7 @@ def _rebuild_side_test_mode(
 
     try:
         # Получить offset из настроек
-        offset = st.TEST_OPPOSITE_OFFSET_ATR
+        offset = settings_pkg.TEST_OPPOSITE_OFFSET_ATR
         
         # Получить символы цикла
         srows = cur.execute(
@@ -557,7 +557,7 @@ def rebuild_side_on_cursor(
         return False
 
     # TEST MODE: использовать упрощённый алгоритм
-    if st.TEST_MODE:
+    if settings_pkg.TEST_MODE:
         return _rebuild_side_test_mode(cur, cycle_id, target_direction, prices)
 
     cur.execute("SAVEPOINT sp_rebuild_side")

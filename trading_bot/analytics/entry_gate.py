@@ -839,7 +839,8 @@ def process_v4_signal(
         if not flip_out.get("ok"):
             return {"ok": False, "error": "flip_close_failed", "flip_close": flip_out}
         # rebuild противоположной стороны (для будущего флипа)
-        rebuild_ok = rebuild_side_on_cursor(cur, scid, target_direction=incoming_dir, prices=prices)
+        opposite_direction = "long" if incoming_dir == "short" else "short"
+        rebuild_ok = rebuild_side_on_cursor(cur, scid, target_direction=opposite_direction, prices=prices)
         if not rebuild_ok:
             return {"ok": False, "error": "rebuild_side_failed", "flip_close": flip_out}
         refresh_cycle_levels_from_structural(cur, scid)
