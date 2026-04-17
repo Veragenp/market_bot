@@ -881,15 +881,17 @@ def process_v4_signal(
             rejected.append(symbol)
             continue
         logger.debug("Checking %s: price=%s level=%s atr=%s", symbol, current_price, level_price, atr)
-        # Проверка условия (как в старой entry_gate)
+        # Проверка условия: цена не должна уйти слишком далеко от уровня
         if signal_type == "LONG":
+            # LONG: цена не ниже уровня минус порог (защита от слишком раннего входа)
             threshold = long_pct / 100.0 * atr
             condition_met = float(current_price) >= level_price - threshold
             logger.debug("EntryGate LONG %s price=%s level=%s atr=%s thr=%s ok=%s",
                          symbol, current_price, level_price, atr, threshold, condition_met)
         else:  # SHORT
+            # SHORT: цена не выше уровня плюс порог (защита от слишком раннего входа)
             threshold = short_pct / 100.0 * atr
-            condition_met = float(current_price) < level_price - threshold
+            condition_met = float(current_price) <= level_price + threshold
             logger.debug("EntryGate SHORT %s price=%s level=%s atr=%s thr=%s ok=%s",
                          symbol, current_price, level_price, atr, threshold, condition_met)
 
