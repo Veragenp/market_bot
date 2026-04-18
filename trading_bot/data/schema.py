@@ -1529,5 +1529,25 @@ def run_migrations() -> None:
         )
         conn.commit()
 
+    # Migration v24: Ensure structural_cycle_symbols.status column exists
+    if current_version < 24:
+        scs_cols = _column_names(cursor, "structural_cycle_symbols")
+        if scs_cols:
+            if "status" not in scs_cols:
+                cursor.execute("ALTER TABLE structural_cycle_symbols ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'")
+                logger.info("Migration v24: Added status column to structural_cycle_symbols")
+            if "evaluated_at" not in scs_cols:
+                cursor.execute("ALTER TABLE structural_cycle_symbols ADD COLUMN evaluated_at INTEGER DEFAULT 0")
+                logger.info("Migration v24: Added evaluated_at column to structural_cycle_symbols")
+        
+        # Ensure existing rows have status='ok'
+        cursor.execute("UPDATE structural_cycle_symbols SET status = 'ok' WHERE status IS NULL")
+        
+        cursor.execute(
+            "INSERT INTO db_version (version, applied_at) VALUES (24, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+
     conn.close()
 

@@ -6,6 +6,7 @@ Structural cycle – независимые наборы long/short уровне
 from __future__ import annotations
 
 import logging
+import sqlite3
 import statistics
 import time
 from dataclasses import dataclass
@@ -448,15 +449,31 @@ def _rebuild_side_test_mode(
         # Получить offset из настроек
         offset = settings_pkg.TEST_OPPOSITE_OFFSET_ATR
         
-        # Получить символы цикла
-        srows = cur.execute(
-            """
-            SELECT symbol, atr
-            FROM structural_cycle_symbols
-            WHERE cycle_id = ? AND status = 'ok'
-            """,
-            (cycle_id,),
-        ).fetchall()
+        # Получить символы цикла (проверка наличия колонки status для устойчивости)
+        try:
+            cur.execute("SELECT status FROM structural_cycle_symbols LIMIT 1")
+            has_status = True
+        except sqlite3.OperationalError:
+            has_status = False
+        
+        if has_status:
+            srows = cur.execute(
+                """
+                SELECT symbol, atr
+                FROM structural_cycle_symbols
+                WHERE cycle_id = ? AND status = 'ok'
+                """,
+                (cycle_id,),
+            ).fetchall()
+        else:
+            srows = cur.execute(
+                """
+                SELECT symbol, atr
+                FROM structural_cycle_symbols
+                WHERE cycle_id = ?
+                """,
+                (cycle_id,),
+            ).fetchall()
         
         if not srows:
             logger.warning("TEST rebuild: no symbols for cycle %s", cycle_id)
