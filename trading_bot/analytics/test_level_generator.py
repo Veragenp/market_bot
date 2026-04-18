@@ -128,9 +128,20 @@ def generate_test_levels() -> Dict[str, Any]:
         if active_cycle:
             cycle_id = active_cycle["id"]
             phase = active_cycle["phase"]
+            
+            # Проверить количество уровней
+            levels_row = cur.execute(
+                "SELECT COUNT(*) as cnt FROM cycle_levels WHERE cycle_id = ?",
+                (cycle_id,)
+            ).fetchone()
+            levels_count = int(levels_row["cnt"] or 0)
+            
+            created_at = active_cycle.get("created_at", 0)
+            age_hours = (int(time.time()) - created_at) / 3600 if created_at else 0
+            
             logger.info(
-                "TEST_MODE: Active test cycle exists (id=%s phase=%s), skipping regeneration",
-                cycle_id[:8], phase
+                "TEST_MODE: Active test cycle exists (id=%s phase=%s age=%.1fh levels=%d), skipping regeneration",
+                cycle_id[:8], phase, age_hours, levels_count
             )
             conn.close()
             return {
@@ -139,6 +150,12 @@ def generate_test_levels() -> Dict[str, Any]:
                 "symbols_count": 0,
                 "levels_created": 0,
                 "skipped": True,
+                "existing_cycle": {
+                    "id": cycle_id,
+                    "phase": phase,
+                    "age_hours": round(age_hours, 1),
+                    "levels_count": levels_count
+                }
             }
     finally:
         conn.close()
@@ -459,15 +476,17 @@ def rebuild_opposite_test_levels(cycle_id: str, known_side: str) -> Dict[str, An
 
 def _clear_test_cycle() -> None:
     """
-    Очистить старый тестовый цикл ТОЛЬКО если:
-    - фаза 'closed' (цикл завершён)
-    - или прошло >24 часа с создания
+    Очистить старый тестовый цикл. Удаление происходит если:
+    1. фаза 'closed' (цикл завершён)
+    2. прошло >24 часов с создания (старый цикл)
+    3. фаза 'armed' и прошло >1 часа (зависший цикл)
+    4. нет уровней в cycle_levels (битый цикл)
     """
     conn = get_connection()
     try:
         cur = conn.cursor()
         
-        # Найти старый тестовый цикл (без ref_price_source)
+        # Найти старый тестовый цикл
         row = cur.execute(
             """
             SELECT id, phase, created_at 
@@ -477,28 +496,55 @@ def _clear_test_cycle() -> None:
             """
         ).fetchone()
         
-        if row:
-            old_id = row["id"]
-            phase = row["phase"]
-            created_at = row["created_at"]
-            now = int(time.time())
-            
-            # Удаляем только если цикл закрыт или старее 24 часов
-            should_delete = (phase == 'closed') or (now - created_at > 86400)
-            
-            if should_delete:
-                cur.execute("DELETE FROM cycle_levels WHERE cycle_id = ?", (old_id,))
-                cur.execute("DELETE FROM structural_cycle_symbols WHERE cycle_id = ?", (old_id,))
-                cur.execute("DELETE FROM structural_cycles WHERE id = ?", (old_id,))
-                logger.info(
-                    "TEST_MODE: Cleared old test cycle %s (phase=%s, age=%dh)",
-                    old_id[:8], phase, (now - created_at) // 3600
-                )
-            else:
-                logger.info(
-                    "TEST_MODE: Keeping active test cycle %s (phase=%s)",
-                    old_id[:8], phase
-                )
+        if not row:
+            logger.info("TEST_MODE: No existing test cycles found")
+            return
+        
+        old_id = row["id"]
+        phase = row["phase"]
+        created_at = row["created_at"]
+        now = int(time.time())
+        age_hours = (now - created_at) / 3600
+        
+        # Проверить количество уровней
+        levels_row = cur.execute(
+            "SELECT COUNT(*) as cnt FROM cycle_levels WHERE cycle_id = ?",
+            (old_id,)
+        ).fetchone()
+        levels_count = int(levels_row["cnt"] or 0)
+        
+        # Определение условий для удаления
+        is_closed = (phase == 'closed')
+        is_old = (age_hours > 24)
+        is_stuck_armed = (phase == 'armed' and age_hours > 1)
+        is_broken = (levels_count == 0)
+        
+        should_delete = is_closed or is_old or is_stuck_armed or is_broken
+        
+        delete_reason = None
+        if is_closed:
+            delete_reason = "cycle completed (phase=closed)"
+        elif is_old:
+            delete_reason = f"cycle too old (age={age_hours:.1f}h > 24h)"
+        elif is_stuck_armed:
+            delete_reason = f"cycle stuck in armed phase (age={age_hours:.1f}h > 1h)"
+        elif is_broken:
+            delete_reason = f"cycle has no levels (count={levels_count})"
+        
+        if should_delete:
+            # Удалить уровни и символы
+            cur.execute("DELETE FROM cycle_levels WHERE cycle_id = ?", (old_id,))
+            cur.execute("DELETE FROM structural_cycle_symbols WHERE cycle_id = ?", (old_id,))
+            cur.execute("DELETE FROM structural_cycles WHERE id = ?", (old_id,))
+            logger.info(
+                "TEST_MODE: Cleared old test cycle %s (%s, age=%.1fh, levels=%d)",
+                old_id[:8], delete_reason, age_hours, levels_count
+            )
+        else:
+            logger.info(
+                "TEST_MODE: Keeping active test cycle %s (phase=%s, age=%.1fh, levels=%d)",
+                old_id[:8], phase, age_hours, levels_count
+            )
         
         conn.commit()
     finally:
