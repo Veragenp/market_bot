@@ -136,7 +136,7 @@ def generate_test_levels() -> Dict[str, Any]:
             ).fetchone()
             levels_count = int(levels_row["cnt"] or 0)
             
-            created_at = active_cycle.get("created_at", 0)
+            created_at = active_cycle["created_at"] or 0
             age_hours = (int(time.time()) - created_at) / 3600 if created_at else 0
             
             logger.info(
