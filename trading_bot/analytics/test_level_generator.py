@@ -138,6 +138,23 @@ def generate_test_levels() -> Dict[str, Any]:
             
             created_at = active_cycle["created_at"] or 0
             age_hours = (int(time.time()) - created_at) / 3600 if created_at else 0
+            now = int(time.time())
+            
+            # Обновить trading_state если нужно
+            cur.execute(
+                """
+                UPDATE trading_state
+                SET
+                    cycle_phase = ?,
+                    levels_frozen = 1,
+                    cycle_id = ?,
+                    structural_cycle_id = ?,
+                    updated_at = ?
+                WHERE id = 1
+                """,
+                (phase, cycle_id, cycle_id, now)
+            )
+            conn.commit()
             
             logger.info(
                 "TEST_MODE: Active test cycle exists (id=%s phase=%s age=%.1fh levels=%d), skipping regeneration",
