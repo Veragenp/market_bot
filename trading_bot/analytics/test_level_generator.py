@@ -126,54 +126,68 @@ def generate_test_levels() -> Dict[str, Any]:
         ).fetchone()
         
         if active_cycle:
-            cycle_id = active_cycle["id"]
-            phase = active_cycle["phase"]
-            
-            # Проверить количество уровней
-            levels_row = cur.execute(
-                "SELECT COUNT(*) as cnt FROM cycle_levels WHERE cycle_id = ?",
-                (cycle_id,)
+            # Проверить trading_state: если цикл закрыт, игнорировать старый structural_cycle
+            state_row = cur.execute(
+                "SELECT cycle_phase, cycle_id FROM trading_state WHERE id = 1"
             ).fetchone()
-            levels_count = int(levels_row["cnt"] or 0)
             
-            created_at = active_cycle["created_at"] or 0
-            age_hours = (int(time.time()) - created_at) / 3600 if created_at else 0
-            now = int(time.time())
+            trading_state_closed = state_row and str(state_row["cycle_phase"] or "") == "closed"
             
-            # Обновить trading_state если нужно
-            cur.execute(
-                """
-                UPDATE trading_state
-                SET
-                    cycle_phase = 'arming',
-                    levels_frozen = 1,
-                    cycle_id = ?,
-                    structural_cycle_id = ?,
-                    updated_at = ?
-                WHERE id = 1
-                """,
-                (cycle_id, cycle_id, now)
-            )
-            conn.commit()
+            if trading_state_closed:
+                logger.info(
+                    "TEST_MODE: trading_state cycle is closed (cycle_id=%s), ignoring stale structural_cycle=%s, will create new",
+                    state_row["cycle_id"][:8] if state_row["cycle_id"] else None,
+                    active_cycle["id"][:8]
+                )
+            else:
+                cycle_id = active_cycle["id"]
+                phase = active_cycle["phase"]
+                
+                # Проверить количество уровней
+                levels_row = cur.execute(
+                    "SELECT COUNT(*) as cnt FROM cycle_levels WHERE cycle_id = ?",
+                    (cycle_id,)
+                ).fetchone()
+                levels_count = int(levels_row["cnt"] or 0)
+                
+                created_at = active_cycle["created_at"] or 0
+                age_hours = (int(time.time()) - created_at) / 3600 if created_at else 0
+                now = int(time.time())
+                
+                # Обновить trading_state если нужно
+                cur.execute(
+                    """
+                    UPDATE trading_state
+                    SET
+                        cycle_phase = 'arming',
+                        levels_frozen = 1,
+                        cycle_id = ?,
+                        structural_cycle_id = ?,
+                        updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (cycle_id, cycle_id, now)
+                )
+                conn.commit()
             
-            logger.info(
-                "TEST_MODE: Active test cycle exists (id=%s phase=%s age=%.1fh levels=%d), skipping regeneration",
-                cycle_id[:8], phase, age_hours, levels_count
-            )
-            conn.close()
-            return {
-                "ok": True,
-                "structural_cycle_id": cycle_id,
-                "symbols_count": 0,
-                "levels_created": 0,
-                "skipped": True,
-                "existing_cycle": {
-                    "id": cycle_id,
-                    "phase": phase,
-                    "age_hours": round(age_hours, 1),
-                    "levels_count": levels_count
+                logger.info(
+                    "TEST_MODE: Active test cycle exists (id=%s phase=%s age=%.1fh levels=%d), skipping regeneration",
+                    cycle_id[:8], phase, age_hours, levels_count
+                )
+                conn.close()
+                return {
+                    "ok": True,
+                    "structural_cycle_id": cycle_id,
+                    "symbols_count": 0,
+                    "levels_created": 0,
+                    "skipped": True,
+                    "existing_cycle": {
+                        "id": cycle_id,
+                        "phase": phase,
+                        "age_hours": round(age_hours, 1),
+                        "levels_count": levels_count
+                    }
                 }
-            }
     finally:
         conn.close()
 
