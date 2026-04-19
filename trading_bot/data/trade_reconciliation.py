@@ -12,6 +12,7 @@ from trading_bot.data.bybit_close_reason import (
     resolve_close_reason,
 )
 from trading_bot.tools import bybit_trading as bt
+from trading_bot.tools.bybit_trading import get_linear_positions, linear_position_sizes_by_symbol, to_bybit_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -388,6 +389,144 @@ def _refresh_position_from_orders(cur, *, position_record_id: int) -> None:
         logger.info("LEVEL_CROSS_TELEGRAM is disabled, skipping close notification")
 
 
+def _sync_positions_from_exchange(cur, cycle_id: str) -> Dict[str, Any]:
+    """
+    Синхронизирует статус позиций с биржей: если позиция закрыта на бирже (size=0),
+    но в БД статус 'open', то обновляем статус на 'closed' с соответствующей причиной.
+    
+    Это решает проблему, когда позиции закрылись автоматически биржей по стопу,
+    но у нас нет filled stop_exec_order в БД.
+    """
+    if not st.BYBIT_EXECUTION_ENABLED:
+        return {"ok": True, "skipped": "execution_disabled"}
+    
+    resp = get_linear_positions()
+    if not resp:
+        return {"ok": False, "error": "bybit_positions_unavailable"}
+    
+    exchange_sizes = linear_position_sizes_by_symbol(resp)
+    
+    # Найти все open позиции этого цикла
+    rows = cur.execute("""
+        SELECT id, symbol, side, qty, status, stop_exec_order_id
+        FROM position_records 
+        WHERE cycle_id = ? AND status = 'open'
+    """, (cycle_id,)).fetchall()
+    
+    if not rows:
+        return {"ok": True, "positions_checked": 0, "positions_closed": 0}
+    
+    now = int(time.time())
+    closed_count = 0
+    positions_synced = []
+    
+    for r in rows:
+        rid = int(r["id"])
+        sym = str(r["symbol"])
+        sym_bybit = to_bybit_symbol(sym)
+        db_qty = float(r["qty"] or 0.0)
+        actual_size = exchange_sizes.get(sym_bybit, 0.0)
+        stop_oid = r["stop_exec_order_id"] if r["stop_exec_order_id"] else None
+        
+        # Если на бирже позиция = 0, а в БД open → закрываем
+        if actual_size == 0.0 and db_qty > 0:
+            # Определяем причину: если был stop_exec_order, то stop_loss, иначе exchange_close
+            close_reason = "stop_loss" if stop_oid else "exchange_close"
+            
+            cur.execute("""
+                UPDATE position_records
+                SET status = 'closed',
+                    close_reason = ?,
+                    closed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+            """, (close_reason, now, now, rid))
+            
+            closed_count += 1
+            positions_synced.append({
+                "position_id": rid,
+                "symbol": sym,
+                "side": str(r["side"]),
+                "close_reason": close_reason
+            })
+            
+            logger.info(
+                "Position %s synced to closed: symbol=%s %s, exchange_size=%.4f, db_qty=%.4f, reason=%s",
+                rid, sym, str(r["side"]).upper(), actual_size, db_qty, close_reason
+            )
+            
+            # Telegram уведомление о закрытии
+            if st.LEVEL_CROSS_TELEGRAM:
+                try:
+                    from trading_bot.tools.telegram_notify import escape_html_telegram, get_telegram_notifier
+                    
+                    pos_info = cur.execute("""
+                        SELECT symbol, side, qty, entry_price_fact, exit_price_fact, close_reason
+                        FROM position_records WHERE id = ?
+                    """, (rid,)).fetchone()
+                    
+                    if pos_info:
+                        symbol = str(pos_info['symbol'])
+                        side = str(pos_info['side']).upper()
+                        qty = float(pos_info['qty'] or 0)
+                        entry_price = pos_info['entry_price_fact']
+                        exit_price = pos_info['exit_price_fact']
+                        raw_reason = str(pos_info['close_reason'] or 'unknown')
+                        
+                        # Маппинг причин
+                        reason_map = {
+                            'stop_loss': '❌ STOP LOSS',
+                            'exchange_close': '🏢 БИРЖА (техн.)',
+                            'flip': '🔄 FLIP',
+                        }
+                        display_reason = reason_map.get(raw_reason, raw_reason.upper())
+                        
+                        # PnL расчёт (только если есть цены)
+                        pnl_pct = None
+                        pnl_usdt = None
+                        pnl_str = "?"
+                        pnl_usdt_str = ""
+                        result_icon = "⚪"
+                        
+                        if entry_price is not None and exit_price is not None:
+                            try:
+                                if side == 'SELL':
+                                    pnl_pct = (entry_price - exit_price) / entry_price * 100
+                                else:
+                                    pnl_pct = (exit_price - entry_price) / entry_price * 100
+                                pnl_usdt = pnl_pct * qty * entry_price / 100
+                                
+                                pnl_str = f"{pnl_pct:+.2f}%"
+                                pnl_usdt_str = f" (~{pnl_usdt:+.2f} USDT)"
+                                result_icon = "✅" if pnl_pct > 0 else "❌" if pnl_pct < 0 else "⚪"
+                            except Exception:
+                                logger.exception("PnL calculation failed for position %s", rid)
+                        
+                        msg = (
+                            f"{result_icon} 🔴 ЗАКРЫТИЕ позиции: {symbol} {side}\n"
+                            f"Причина: {display_reason}"
+                        )
+                        
+                        # Добавляем цены только если они есть
+                        if entry_price is not None and exit_price is not None:
+                            msg += f"\nЦена: {entry_price:.4f} → {exit_price:.4f}"
+                        
+                        if pnl_str != "?":
+                            msg += f"\nPnL: {pnl_str}{pnl_usdt_str}"
+                        
+                        get_telegram_notifier().send_message(f"<pre>{escape_html_telegram(msg)}</pre>", parse_mode="HTML")
+                        logger.info("Telegram: Position close notification sent for %s %s (sync)", symbol, side)
+                except Exception:
+                    logger.exception("position close telegram failed (sync)")
+    
+    return {
+        "ok": True,
+        "positions_checked": len(rows),
+        "positions_closed": closed_count,
+        "positions_synced": positions_synced
+    }
+
+
 def reconcile_recent_exec_orders(cur, *, lookback_hours: int = 24) -> Dict[str, Any]:
     """
     Сверка локальных exec_orders с фактическими сделками Bybit (fills).
@@ -406,11 +545,15 @@ def reconcile_recent_exec_orders(cur, *, lookback_hours: int = 24) -> Dict[str, 
 
     fills_upserted = 0
     checked = 0
+    cycle_id: Optional[str] = None
     for o in orders:
         checked += 1
         symbol_trade = str(o.get("symbol") or "")
         symbol_trade = symbol_trade if "/" in symbol_trade else symbol_trade.replace("USDT", "/USDT")
         bybit_oid = str(o.get("bybit_order_id") or "")
+        # Сохраняем cycle_id для последующей синхронизации
+        if not cycle_id and o.get("cycle_id"):
+            cycle_id = str(o["cycle_id"])
         try:
             ex_resp = bt._session().get_executions(
                 category="linear",
@@ -440,10 +583,21 @@ def reconcile_recent_exec_orders(cur, *, lookback_hours: int = 24) -> Dict[str, 
         if pid:
             _refresh_position_from_orders(cur, position_record_id=int(pid))
 
+    # Синхронизация позиций с биржей после обычной reconcile
+    sync_result = {"positions_synced": 0}
+    if cycle_id:
+        sync_result = _sync_positions_from_exchange(cur, cycle_id)
+        if sync_result.get("positions_closed", 0) > 0:
+            logger.info(
+                "Position sync completed: cycle=%s, checked=%s, closed=%s",
+                cycle_id, sync_result.get("positions_checked", 0), sync_result.get("positions_closed", 0)
+            )
+
     return {
         "ok": True,
         "orders_checked": checked,
         "fills_upserted": fills_upserted,
+        "positions_synced": sync_result,
     }
 
 

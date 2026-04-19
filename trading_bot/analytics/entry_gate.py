@@ -302,6 +302,80 @@ def maybe_transition_arming_after_package_all_flat(cur) -> Dict[str, Any]:
         (cycle_id,),
     ).fetchone()
     n_open = int(open_row["c"] if open_row else 0)
+    
+    # НОВЫЙ КОД: если есть open позиции в БД, проверяем биржу на синхронизацию
+    if n_open > 0 and (st.ENTRY_PACKAGE_FLAT_USE_BYBIT_POSITIONS or st.BYBIT_EXECUTION_ENABLED):
+        resp = get_linear_positions()
+        if resp:
+            exchange_sizes = linear_position_sizes_by_symbol(resp)
+            all_exchange_flat = True
+            non_zero_symbols = []
+            
+            for sym in pool:
+                sym_bybit = to_bybit_symbol(sym)
+                if exchange_sizes.get(sym_bybit, 0.0) != 0.0:
+                    all_exchange_flat = False
+                    non_zero_symbols.append(sym_bybit)
+            
+            # Если все позиции закрыты на бирже, но статус в БД не обновился
+            if all_exchange_flat:
+                logger.info(
+                    "Position sync detected: cycle=%s has %s open in DB but all flat on exchange",
+                    cycle_id, n_open
+                )
+                
+                # Обновляем все open позиции на closed
+                # Определяем причину по последним закрытым позициям
+                reasons_rows = cur.execute("""
+                    SELECT close_reason FROM position_records
+                    WHERE cycle_id = ? AND status = 'closed'
+                    ORDER BY closed_at DESC LIMIT 8
+                """, (cycle_id,)).fetchall()
+                reason_list = [str(r["close_reason"]) for r in reasons_rows if r["close_reason"]]
+                pkg_reason = _infer_last_package_exit_reason_from_db(reason_list) if reason_list else "stop_loss"
+                
+                cur.execute("""
+                    UPDATE position_records
+                    SET status = 'closed',
+                        close_reason = COALESCE(close_reason, ?),
+                        closed_at = ?,
+                        updated_at = ?
+                    WHERE cycle_id = ? AND status = 'open'
+                """, (pkg_reason, now, now, cycle_id))
+                
+                updated_count = cur.execute(
+                    "SELECT changes() AS c"
+                ).fetchone()["c"]
+                
+                logger.info(
+                    "Position sync applied: cycle=%s, updated %s positions to closed, reason=%s",
+                    cycle_id, updated_count, pkg_reason
+                )
+                
+                # Теперь закрываем эпоху
+                _apply_closed_after_package_flat(
+                    cur,
+                    cycle_id=cycle_id,
+                    structural_cycle_id=scid,
+                    now=now,
+                    last_package_exit_reason=pkg_reason,
+                    meta={
+                        "source": "exchange_sync",
+                        "position_records": n_open,
+                        "positions_updated": updated_count,
+                        "recent_close_reasons": reason_list
+                    },
+                )
+                return {
+                    "ok": True,
+                    "transitioned": True,
+                    "cycle_phase": "closed",
+                    "position_records_seen": n_open,
+                    "positions_synced": updated_count,
+                    "source": "exchange_sync",
+                    "last_package_exit_reason": pkg_reason
+                }
+
     if n_open > 0:
         return {"ok": True, "skipped": "positions_open_or_pending", "n_open": n_open}
 
@@ -383,6 +457,16 @@ def _flip_close_opposite_if_needed(
         return out
 
     opposite = "short" if incoming_direction == "long" else "long"
+    
+    # --- НОВЫЙ КОД: получить актуальные позиции с биржи один раз ---
+    exchange_positions = get_linear_positions()
+    exchange_sizes = {}
+    if exchange_positions:
+        exchange_sizes = linear_position_sizes_by_symbol(exchange_positions)
+    else:
+        logger.warning("flip: cannot get exchange positions, skipping reduce checks")
+    # --------------------------------------------------------------
+
     rows = cur.execute(
         """
         SELECT id, symbol, side, status, qty, filled_qty,
@@ -484,12 +568,34 @@ def _flip_close_opposite_if_needed(
             qty_close = fq if fq > 0 else qty_total
             if qty_close <= 0:
                 continue
+            
+            # --- НОВАЯ ПРОВЕРКА: есть ли реальная позиция на бирже ---
+            sym_bybit = to_bybit_symbol(sym_trade)
+            actual_size = exchange_sizes.get(sym_bybit, 0.0)
+            
+            # Если actual_size == 0, позиции нет на бирже
+            if actual_size == 0:
+                # Позиция уже закрыта на бирже – синхронизируем БД
+                cur.execute(
+                    "UPDATE position_records SET status = 'closed', closed_at = ?, updated_at = ? WHERE id = ?",
+                    (now, now, rid),
+                )
+                out["actions"].append({"position_record_id": rid, "action": "mark_closed_db_only",
+                                       "reason": "exchange_size_zero"})
+                continue
+            
+            # Корректируем количество, чтобы не пытаться закрыть больше, чем есть
+            qty_to_close = min(qty_close, actual_size)
+            if qty_to_close <= 0:
+                continue
+            # ---------------------------------------------------------
+            
             side_buy_close = opposite == "short"
             try:
                 resp = place_linear_market_order(
                     symbol_trade=sym_trade,
                     side_buy=side_buy_close,
-                    qty=qty_close,
+                    qty=qty_to_close,
                     reduce_only=True,
                 )
                 rc = resp.get("retCode")
@@ -498,11 +604,32 @@ def _flip_close_opposite_if_needed(
                     out["ok"] = False
                     out["errors"].append({"position_record_id": rid, "step": "reduce_market",
                                           "retCode": rc, "retMsg": resp.get("retMsg")})
-                out["actions"].append({"position_record_id": rid, "action": "reduce_market",
-                                       "qty": qty_close, "retCode": rc})
+                else:
+                    out["actions"].append({"position_record_id": rid, "action": "reduce_market",
+                                           "qty": qty_to_close, "retCode": rc})
+                    # ---- ОЖИДАНИЕ ЗАКРЫТИЯ ЭТОЙ ПОЗИЦИИ ----
+                    wait_start = time.time()
+                    while time.time() - wait_start < 5.0:
+                        cur.execute("SELECT status FROM position_records WHERE id = ?", (rid,))
+                        st_row = cur.fetchone()
+                        if st_row and st_row["status"] in ("closed", "cancelled"):
+                            break
+                        time.sleep(0.3)
+                    # ---------------------------------------
             except Exception as e:
+                error_msg = str(e)
+                # Обработка ошибки 110017 - позиция уже ноль
+                if "110017" in error_msg or "current position is zero" in error_msg:
+                    # Позиция уже ноль – синхронизируем БД и считаем успехом
+                    cur.execute(
+                        "UPDATE position_records SET status = 'closed', closed_at = ?, updated_at = ? WHERE id = ?",
+                        (now, now, rid),
+                    )
+                    out["actions"].append({"position_record_id": rid, "action": "mark_closed_db_only",
+                                           "reason": "exchange_zero_exception"})
+                    continue
                 logger.exception("flip: market close position_record_id=%s", rid)
-                out["errors"].append({"position_record_id": rid, "step": "reduce_market", "error": str(e)})
+                out["errors"].append({"position_record_id": rid, "step": "reduce_market", "error": error_msg})
                 out["ok"] = False
 
     # Проверяем, остались ли ещё открытые/ожидающие позиции противоположной стороны
@@ -618,6 +745,15 @@ def place_entry_order_for_symbol(
     sym_trade = symbol
     sym_bybit = to_bybit_symbol(sym_trade)
     side: str = direction   # "long" или "short"
+
+    # Проверим, нет ли открытой позиции противоположной стороны в этом цикле
+    cur.execute(
+        "SELECT COUNT(*) AS c FROM position_records WHERE cycle_id = ? AND side != ? AND status = 'open'",
+        (cycle_id, direction),
+    )
+    if cur.fetchone()["c"] > 0:
+        logger.warning("Flip race: opposite position still open for cycle %s, aborting entry", cycle_id)
+        return {"ok": False, "error": "opposite_position_still_open"}
 
     # 1. Получить ATR и параметры инструмента
     inst = _load_instrument(cur, sym_bybit)
