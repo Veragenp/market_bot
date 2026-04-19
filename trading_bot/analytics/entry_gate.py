@@ -952,12 +952,17 @@ def process_v4_signal(
     # 1. Чтение состояния
     row = cur.execute(
         "SELECT cycle_id, structural_cycle_id, COALESCE(position_state, 'none') AS position_state, "
-        "levels_frozen FROM trading_state WHERE id = 1"
+        "levels_frozen, cycle_phase FROM trading_state WHERE id = 1"
     ).fetchone()
     if not row or not row["cycle_id"]:
         return {"ok": False, "error": "no_cycle"}
     if not int(row["levels_frozen"] or 0):
         return {"ok": False, "error": "levels_not_frozen"}
+
+    # Проверка: если цикл закрыт, не открывать новые позиции
+    cycle_phase = str(row["cycle_phase"] or "")
+    if cycle_phase == "closed":
+        return {"ok": False, "error": "cycle_closed", "hint": "supervisor_will_create_new_cycle"}
 
     cycle_id = str(row["cycle_id"])
     scid = row["structural_cycle_id"]

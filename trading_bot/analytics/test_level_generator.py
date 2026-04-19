@@ -145,14 +145,14 @@ def generate_test_levels() -> Dict[str, Any]:
                 """
                 UPDATE trading_state
                 SET
-                    cycle_phase = ?,
+                    cycle_phase = 'arming',
                     levels_frozen = 1,
                     cycle_id = ?,
                     structural_cycle_id = ?,
                     updated_at = ?
                 WHERE id = 1
                 """,
-                (phase, cycle_id, cycle_id, now)
+                (cycle_id, cycle_id, now)
             )
             conn.commit()
             
